@@ -318,6 +318,9 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 // It defines the endpoints and associates them with their respective handlers.
 func (s *Server) setupRoutes() {
 	s.engine.GET("/management.html", s.serveManagementControlPanel)
+	s.engine.GET("/management-auth.html", s.serveBuiltinAuthManagementPage)
+	s.engine.GET("/management-logs.html", s.serveBuiltinLogsManagementPage)
+	s.engine.GET("/usage.html", s.serveUsageStatisticsPage)
 	openaiHandlers := openai.NewOpenAIAPIHandler(s.handlers)
 	geminiHandlers := gemini.NewGeminiAPIHandler(s.handlers)
 	geminiCLIHandlers := gemini.NewGeminiCLIAPIHandler(s.handlers)
@@ -540,6 +543,8 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.DELETE("/gemini-api-key", s.mgmt.DeleteGeminiKey)
 
 		mgmt.GET("/logs", s.mgmt.GetLogs)
+		mgmt.GET("/log-files", s.mgmt.GetLogFiles)
+		mgmt.GET("/log-files/:name", s.mgmt.DownloadLogFile)
 		mgmt.DELETE("/logs", s.mgmt.DeleteLogs)
 		mgmt.GET("/request-error-logs", s.mgmt.GetRequestErrorLogs)
 		mgmt.GET("/request-error-logs/:name", s.mgmt.DownloadRequestErrorLog)
@@ -653,34 +658,126 @@ func (s *Server) managementAvailabilityMiddleware() gin.HandlerFunc {
 	}
 }
 
+func isTruthyQueryFlag(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *Server) serveManagementControlPanel(c *gin.Context) {
 	cfg := s.cfg
 	if cfg == nil || cfg.RemoteManagement.DisableControlPanel {
 		c.AbortWithStatus(http.StatusNotFound)
 		return
 	}
+	c.Header("Cache-Control", "no-store")
+
+	builtinRequested := isTruthyQueryFlag(c.Query("builtin"))
+	externalRequested := isTruthyQueryFlag(c.Query("external"))
+	if builtinRequested || !externalRequested {
+		s.serveBuiltinAuthManagementPage(c)
+		return
+	}
+
 	filePath := managementasset.FilePath(s.configFilePath)
-	if strings.TrimSpace(filePath) == "" {
+	if strings.TrimSpace(filePath) != "" {
+		if _, err := os.Stat(filePath); err != nil {
+			if os.IsNotExist(err) {
+				if !cfg.RemoteManagement.DisablePanelRemoteUpdate {
+					_ = managementasset.EnsureLatestManagementHTML(
+						context.Background(),
+						managementasset.StaticDir(s.configFilePath),
+						cfg.ProxyURL,
+						cfg.RemoteManagement.PanelGitHubRepository,
+					)
+				}
+			} else {
+				log.WithError(err).Error("failed to stat management control panel asset")
+				c.AbortWithStatus(http.StatusInternalServerError)
+				return
+			}
+		}
+	}
+
+	for _, candidate := range []string{filePath, "assets/management.html", "./assets/management.html"} {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		if _, err := os.Stat(candidate); err == nil {
+			c.File(candidate)
+			return
+		} else if !os.IsNotExist(err) {
+			log.WithError(err).Warnf("failed to stat management control panel asset candidate %s", candidate)
+		}
+	}
+
+	s.serveBuiltinAuthManagementPage(c)
+}
+
+func (s *Server) serveBuiltinAuthManagementPage(c *gin.Context) {
+	cfg := s.cfg
+	if cfg == nil || cfg.RemoteManagement.DisableControlPanel {
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
+	c.Header("Cache-Control", "no-store")
+
+	page := managementasset.BuiltinAuthManagementHTML()
+	if strings.TrimSpace(page) == "" {
 		c.AbortWithStatus(http.StatusNotFound)
 		return
 	}
 
-	if _, err := os.Stat(filePath); err != nil {
-		if os.IsNotExist(err) {
-			// Synchronously ensure management.html is available with a detached context.
-			// Control panel bootstrap should not be canceled by client disconnects.
-			if !managementasset.EnsureLatestManagementHTML(context.Background(), managementasset.StaticDir(s.configFilePath), cfg.ProxyURL, cfg.RemoteManagement.PanelGitHubRepository) {
-				c.AbortWithStatus(http.StatusNotFound)
-				return
-			}
-		} else {
-			log.WithError(err).Error("failed to stat management control panel asset")
-			c.AbortWithStatus(http.StatusInternalServerError)
+	c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(page))
+}
+
+func (s *Server) serveBuiltinLogsManagementPage(c *gin.Context) {
+	cfg := s.cfg
+	if cfg == nil || cfg.RemoteManagement.DisableControlPanel {
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
+
+	page := managementasset.BuiltinLogsManagementHTML()
+	if strings.TrimSpace(page) == "" {
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
+
+	c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(page))
+}
+
+func (s *Server) serveUsageStatisticsPage(c *gin.Context) {
+	cfg := s.cfg
+	if cfg == nil || cfg.RemoteManagement.DisableControlPanel {
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
+
+	possiblePaths := []string{
+		filepath.Join(managementasset.StaticDir(s.configFilePath), "usage.html"),
+		"assets/usage.html",
+		"./assets/usage.html",
+	}
+
+	for _, path := range possiblePaths {
+		if path == "" {
+			continue
+		}
+		if _, err := os.Stat(path); err == nil {
+			c.File(path)
 			return
 		}
 	}
 
-	c.File(filePath)
+	c.Header("Content-Type", "text/html; charset=utf-8")
+	c.String(http.StatusOK, `<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Usage Statistics</title></head>
+<body><h1>Usage Statistics</h1><p>API endpoint available at <a href="/v0/management/usage">/v0/management/usage</a></p></body></html>`)
 }
 
 func (s *Server) enableKeepAlive(timeout time.Duration, onTimeout func()) {

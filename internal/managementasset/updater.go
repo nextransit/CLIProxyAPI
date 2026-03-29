@@ -88,6 +88,10 @@ func runAutoUpdater(ctx context.Context) {
 			log.Debug("management asset auto-updater skipped: control panel disabled")
 			return
 		}
+		if cfg.RemoteManagement.DisablePanelRemoteUpdate {
+			log.Debug("management asset auto-updater skipped: remote panel update disabled")
+			return
+		}
 
 		configPath, _ := schedulerConfigPath.Load().(string)
 		staticDir := StaticDir(configPath)
@@ -217,6 +221,13 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 		}
 
 		releaseURL := resolveReleaseURL(panelRepository)
+		if releaseURL == "" {
+			log.Debugf(
+				"management asset sync skipped: unsupported panel repository %q, keeping local asset",
+				strings.TrimSpace(panelRepository),
+			)
+			return nil, nil
+		}
 		client := newHTTPClient(proxyURL)
 
 		localHash, err := fileSHA256(localPath)
@@ -320,7 +331,7 @@ func resolveReleaseURL(repo string) string {
 		}
 	}
 
-	return defaultManagementReleaseURL
+	return ""
 }
 
 func fetchLatestAsset(ctx context.Context, client *http.Client, releaseURL string) (*releaseAsset, string, error) {

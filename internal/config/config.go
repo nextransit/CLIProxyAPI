@@ -20,7 +20,10 @@ import (
 
 const (
 	DefaultPanelGitHubRepository = "https://github.com/router-for-me/Cli-Proxy-API-Management-Center"
-	DefaultPprofAddr             = "127.0.0.1:8316"
+	// DefaultDisablePanelRemoteUpdate disables remote panel update by default.
+	// Custom/local dashboard users can keep full control unless they opt in.
+	DefaultDisablePanelRemoteUpdate = true
+	DefaultPprofAddr                = "127.0.0.1:8316"
 )
 
 // Config represents the application's configuration, loaded from a YAML file.
@@ -171,6 +174,9 @@ type RemoteManagement struct {
 	SecretKey string `yaml:"secret-key"`
 	// DisableControlPanel skips serving and syncing the bundled management UI when true.
 	DisableControlPanel bool `yaml:"disable-control-panel"`
+	// DisablePanelRemoteUpdate skips fetching management panel from remote repositories when true.
+	// Local/bundled panel serving remains available.
+	DisablePanelRemoteUpdate bool `yaml:"disable-panel-remote-update"`
 	// PanelGitHubRepository overrides the GitHub repository used to fetch the management panel asset.
 	// Accepts either a repository URL (https://github.com/org/repo) or an API releases endpoint.
 	PanelGitHubRepository string `yaml:"panel-github-repository"`
@@ -557,6 +563,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.Pprof.Enable = false
 	cfg.Pprof.Addr = DefaultPprofAddr
 	cfg.AmpCode.RestrictManagementToLocalhost = false // Default to false: API key auth is sufficient
+	cfg.RemoteManagement.DisablePanelRemoteUpdate = DefaultDisablePanelRemoteUpdate
 	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
 	if err = yaml.Unmarshal(data, &cfg); err != nil {
 		if optional {
@@ -1278,6 +1285,14 @@ func isKnownDefaultValue(path []string, node *yaml.Node) bool {
 		switch fullPath {
 		case "error-logs-max-files":
 			return node.Value == "10"
+		}
+	}
+
+	// Check boolean defaults
+	if node.Kind == yaml.ScalarNode && node.Tag == "!!bool" {
+		switch fullPath {
+		case "remote-management.disable-panel-remote-update":
+			return strings.EqualFold(node.Value, "true")
 		}
 	}
 
