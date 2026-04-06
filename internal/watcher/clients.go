@@ -148,11 +148,15 @@ func (w *Watcher) addOrUpdateClient(path string) {
 	curHash := hex.EncodeToString(sum[:])
 	normalized := w.normalizeAuthPath(path)
 
-	// Parse new auth content for diff comparison
-	var newAuth coreauth.Auth
-	if errParse := json.Unmarshal(data, &newAuth); errParse != nil {
-		log.Errorf("failed to parse auth file %s: %v", filepath.Base(path), errParse)
-		return
+	// Parse structured auth content for diff comparison when possible.
+	// Some provider files intentionally use custom JSON formats that are still
+	// supported by synthesizer logic, so parse failures here should not block reload.
+	var parsedAuth *coreauth.Auth
+	var parsedValue coreauth.Auth
+	if errParse := json.Unmarshal(data, &parsedValue); errParse != nil {
+		log.Debugf("auth file %s is not in core auth JSON format, continuing with synthesizer: %v", filepath.Base(path), errParse)
+	} else {
+		parsedAuth = &parsedValue
 	}
 
 	w.clientsMutex.Lock()
@@ -177,10 +181,12 @@ func (w *Watcher) addOrUpdateClient(path string) {
 	}
 
 	// Compute and log field changes
-	if changes := diff.BuildAuthChangeDetails(oldAuth, &newAuth); len(changes) > 0 {
-		log.Debugf("auth field changes for %s:", filepath.Base(path))
-		for _, c := range changes {
-			log.Debugf("  %s", c)
+	if parsedAuth != nil {
+		if changes := diff.BuildAuthChangeDetails(oldAuth, parsedAuth); len(changes) > 0 {
+			log.Debugf("auth field changes for %s:", filepath.Base(path))
+			for _, c := range changes {
+				log.Debugf("  %s", c)
+			}
 		}
 	}
 
@@ -189,7 +195,11 @@ func (w *Watcher) addOrUpdateClient(path string) {
 	if w.lastAuthContents == nil {
 		w.lastAuthContents = make(map[string]*coreauth.Auth)
 	}
-	w.lastAuthContents[normalized] = &newAuth
+	if parsedAuth != nil {
+		w.lastAuthContents[normalized] = parsedAuth
+	} else {
+		delete(w.lastAuthContents, normalized)
+	}
 
 	oldByID := make(map[string]*coreauth.Auth, len(w.fileAuthsByPath[normalized]))
 	for id, a := range w.fileAuthsByPath[normalized] {

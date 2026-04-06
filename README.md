@@ -64,6 +64,15 @@ CLIProxyAPI Guides: [https://help.router-for.me/](https://help.router-for.me/)
 
 see [MANAGEMENT_API.md](https://help.router-for.me/management/api)
 
+Quick local management notes:
+
+- Built-in auth/log console: `/management-auth.html`
+- Force the built-in console even when an external panel is configured: `/management.html?builtin=1`
+- Auth file pagination: `/v0/management/auth-files?page=1&page_size=100`
+- Auth file page size is capped at `100`
+- Log keyword search: `/v0/management/logs?search=token_invalidated`
+- `q` is accepted as an alias for the `search` query parameter
+
 ## Amp CLI Support
 
 CLIProxyAPI includes integrated support for [Amp CLI](https://ampcode.com) and Amp IDE extensions, enabling you to use your Google/ChatGPT/Claude OAuth subscriptions with Amp's coding tools:

@@ -1588,6 +1588,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 
 	shouldResumeModel := false
 	shouldSuspendModel := false
+	shouldUnregisterClient := false
 	suspendReason := ""
 	clearModelQuota := false
 	setModelQuota := false
@@ -1634,6 +1635,21 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 					suspendReason = "unauthorized"
 					shouldSuspendModel = true
 				case 402, 403:
+					if shouldAutoDisableDuomiClaudeOnInsufficientBalance(auth, result.Error) {
+						state.Status = StatusDisabled
+						state.Unavailable = true
+						state.StatusMessage = "insufficient account balance"
+						state.NextRetryAfter = time.Time{}
+						state.Quota = QuotaState{}
+						auth.Disabled = true
+						auth.Unavailable = true
+						auth.Status = StatusDisabled
+						auth.StatusMessage = "insufficient account balance"
+						auth.NextRetryAfter = time.Time{}
+						auth.Quota = QuotaState{}
+						shouldUnregisterClient = true
+						break
+					}
 					next := now.Add(30 * time.Minute)
 					state.NextRetryAfter = next
 					suspendReason = "payment_required"
@@ -1676,9 +1692,13 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 					state.NextRetryAfter = time.Time{}
 				}
 
-				auth.Status = StatusError
+				if !auth.Disabled {
+					auth.Status = StatusError
+				}
 				auth.UpdatedAt = now
-				updateAggregatedAvailability(auth, now)
+				if !auth.Disabled {
+					updateAggregatedAvailability(auth, now)
+				}
 			} else {
 				applyAuthFailureState(auth, result.Error, result.RetryAfter, now)
 			}
@@ -1697,6 +1717,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	}
 	if setModelQuota && result.Model != "" {
 		registry.GetGlobalRegistry().SetModelQuotaExceeded(result.AuthID, result.Model)
+	}
+	if shouldUnregisterClient {
+		registry.GetGlobalRegistry().UnregisterClient(result.AuthID)
 	}
 	if shouldResumeModel {
 		registry.GetGlobalRegistry().ResumeClientModel(result.AuthID, result.Model)
@@ -1881,6 +1904,56 @@ func statusCodeFromResult(err *Error) int {
 		return 0
 	}
 	return err.StatusCode()
+}
+
+func shouldAutoDisableDuomiClaudeOnInsufficientBalance(auth *Auth, resultErr *Error) bool {
+	if auth == nil || resultErr == nil {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "claude") {
+		return false
+	}
+	statusCode := resultErr.StatusCode()
+	if statusCode != http.StatusForbidden && statusCode != http.StatusPaymentRequired {
+		return false
+	}
+	if !isDuomiClaudeBaseURL(auth) {
+		return false
+	}
+	return containsInsufficientBalanceMessage(resultErr.Message)
+}
+
+func isDuomiClaudeBaseURL(auth *Auth) bool {
+	if auth == nil || auth.Attributes == nil {
+		return false
+	}
+	baseURL := strings.ToLower(strings.TrimSpace(auth.Attributes["base_url"]))
+	if baseURL == "" {
+		return false
+	}
+	return strings.Contains(baseURL, "duomi.uk") || strings.Contains(baseURL, "duo.uk")
+}
+
+func containsInsufficientBalanceMessage(message string) bool {
+	msg := strings.ToLower(strings.TrimSpace(message))
+	if msg == "" {
+		return false
+	}
+	patterns := []string{
+		"insufficient account balance",
+		"insufficient balance",
+		"not enough balance",
+		"insufficient credits",
+		"credit insufficient",
+		"余额不足",
+		"账户余额不足",
+	}
+	for _, pattern := range patterns {
+		if strings.Contains(msg, pattern) {
+			return true
+		}
+	}
+	return false
 }
 
 // isRequestInvalidError returns true if the error represents a client request
@@ -2641,16 +2714,25 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	log.Debugf("refreshed %s, %s, %v", auth.Provider, auth.ID, err)
 	now := time.Now()
 	if err != nil {
-		m.mu.Lock()
-		if current := m.auths[id]; current != nil {
-			current.NextRefreshAfter = now.Add(refreshFailureBackoff)
-			current.LastError = &Error{Message: err.Error()}
-			m.auths[id] = current
-			if m.scheduler != nil {
-				m.scheduler.upsertAuth(current.Clone())
-			}
+		m.mu.RLock()
+		current := m.auths[id]
+		m.mu.RUnlock()
+		if current == nil {
+			return
 		}
-		m.mu.Unlock()
+
+		failed := current.Clone()
+		failed.LastError = &Error{Message: err.Error()}
+		failed.UpdatedAt = now
+		if isFatalRefreshError(err) {
+			failed.Disabled = true
+			failed.Status = StatusDisabled
+			failed.StatusMessage = "refresh token invalid, please sign in again"
+			failed.NextRefreshAfter = time.Time{}
+		} else {
+			failed.NextRefreshAfter = now.Add(refreshFailureBackoff)
+		}
+		_, _ = m.Update(ctx, failed)
 		return
 	}
 	if updated == nil {
@@ -2666,6 +2748,18 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	updated.LastError = nil
 	updated.UpdatedAt = now
 	_, _ = m.Update(ctx, updated)
+}
+
+func isFatalRefreshError(err error) bool {
+	if err == nil {
+		return false
+	}
+	raw := strings.ToLower(strings.TrimSpace(err.Error()))
+	if raw == "" {
+		return false
+	}
+	return strings.Contains(raw, "refresh_token_reused") ||
+		(strings.Contains(raw, "refresh token") && strings.Contains(raw, "sign in again"))
 }
 
 func (m *Manager) executorFor(provider string) ProviderExecutor {
@@ -2740,12 +2834,18 @@ func debugLogAuthSelection(entry *log.Entry, auth *Auth, provider string, model 
 	if proxyInfo != "" {
 		suffix = " " + proxyInfo
 	}
+	authIdentifier := ""
+	if authID := strings.TrimSpace(auth.ID); authID != "" {
+		authIdentifier = " [auth=" + authID + "]"
+	} else if authIndex := strings.TrimSpace(auth.EnsureIndex()); authIndex != "" {
+		authIdentifier = " [auth=" + authIndex + "]"
+	}
 	switch accountType {
 	case "api_key":
-		entry.Debugf("Use API key %s for model %s%s", util.HideAPIKey(accountInfo), model, suffix)
+		entry.Debugf("Use API key %s%s for model %s%s", util.HideAPIKey(accountInfo), authIdentifier, model, suffix)
 	case "oauth":
 		ident := formatOauthIdentity(auth, provider, accountInfo)
-		entry.Debugf("Use OAuth %s for model %s%s", ident, model, suffix)
+		entry.Debugf("Use OAuth %s%s for model %s%s", ident, authIdentifier, model, suffix)
 	}
 }
 

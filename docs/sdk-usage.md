@@ -75,6 +75,10 @@ These options mirror the internals used by the CLI server.
 - Management endpoints are mounted only when `remote-management.secret-key` is set in `config.yaml`.
 - Remote access additionally requires `remote-management.allow-remote: true`.
 - See MANAGEMENT_API.md for endpoints. Your embedded server exposes them under `/v0/management` on the configured port.
+- Built-in auth/log troubleshooting page is available at `/management-auth.html`.
+- `/management.html?builtin=1` forces the built-in page instead of any external panel asset.
+- Auth file listing supports `page` and `page_size`; `page_size` is capped at `100`.
+- Log listing supports keyword search through `search` (or `q`) in addition to `after` and `limit`.
 
 ## Using the Core Auth Manager
 

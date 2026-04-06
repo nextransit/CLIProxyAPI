@@ -208,3 +208,93 @@ func TestDefaultRequestLoggerFactory_UsesResolvedLogDirectory(t *testing.T) {
 		}
 	}
 }
+
+func TestBuiltinAuthManagementPageRoute(t *testing.T) {
+	server := newTestServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/management-auth.html", nil)
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("unexpected status code: got %d want %d; body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, "认证文件与日志排障台") {
+		t.Fatalf("response body missing builtin page marker: %s", body)
+	}
+}
+
+func TestBuiltinLogsManagementPageRoute(t *testing.T) {
+	server := newTestServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/management-logs.html", nil)
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("unexpected status code: got %d want %d; body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, "日志检索与日志文件搜索") {
+		t.Fatalf("response body missing builtin logs page marker: %s", body)
+	}
+}
+
+func TestManagementControlPanelDefaultServesBuiltinPageWhenPresent(t *testing.T) {
+	server := newTestServer(t)
+
+	staticDir := filepath.Join(filepath.Dir(server.configFilePath), "static")
+	if err := os.MkdirAll(staticDir, 0o755); err != nil {
+		t.Fatalf("failed to create static dir: %v", err)
+	}
+	const marker = "external-management-panel-marker"
+	if err := os.WriteFile(filepath.Join(staticDir, "management.html"), []byte(marker), 0o644); err != nil {
+		t.Fatalf("failed to write external management asset: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/management.html", nil)
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("unexpected status code: got %d want %d; body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	if cacheControl := rr.Header().Get("Cache-Control"); cacheControl != "no-store" {
+		t.Fatalf("Cache-Control = %q, want %q", cacheControl, "no-store")
+	}
+	body := rr.Body.String()
+	if strings.Contains(body, marker) {
+		t.Fatalf("default page should not serve external asset marker: %s", body)
+	}
+	if !strings.Contains(body, "认证文件与日志排障台") {
+		t.Fatalf("response body missing builtin page marker: %s", body)
+	}
+}
+
+func TestManagementControlPanelExternalQueryServesExternalAssetWhenRequested(t *testing.T) {
+	server := newTestServer(t)
+
+	staticDir := filepath.Join(filepath.Dir(server.configFilePath), "static")
+	if err := os.MkdirAll(staticDir, 0o755); err != nil {
+		t.Fatalf("failed to create static dir: %v", err)
+	}
+	const marker = "external-management-panel-marker"
+	if err := os.WriteFile(filepath.Join(staticDir, "management.html"), []byte(marker), 0o644); err != nil {
+		t.Fatalf("failed to write external management asset: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/management.html?external=1", nil)
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("unexpected status code: got %d want %d; body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	if cacheControl := rr.Header().Get("Cache-Control"); cacheControl != "no-store" {
+		t.Fatalf("Cache-Control = %q, want %q", cacheControl, "no-store")
+	}
+	if body := rr.Body.String(); !strings.Contains(body, marker) {
+		t.Fatalf("response body missing external asset marker: %s", body)
+	}
+}

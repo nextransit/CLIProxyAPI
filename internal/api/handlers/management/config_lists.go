@@ -6,8 +6,61 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/access/apikeypolicy"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 )
+
+type apiKeyEntriesPayload struct {
+	Items    []json.RawMessage `json:"items"`
+	Value    []json.RawMessage `json:"value"`
+	APIKeys  []json.RawMessage `json:"api-keys"`
+	APIKeys2 []json.RawMessage `json:"apiKeys"`
+}
+
+func decodeAPIKeyEntry(raw json.RawMessage) (config.APIKeyEntry, error) {
+	var key string
+	if err := json.Unmarshal(raw, &key); err == nil {
+		return config.APIKeyEntry{Key: key}, nil
+	}
+
+	var entry config.APIKeyEntry
+	if err := json.Unmarshal(raw, &entry); err != nil {
+		return config.APIKeyEntry{}, err
+	}
+	return entry, nil
+}
+
+func decodeAPIKeyEntries(raw []byte) ([]config.APIKeyEntry, error) {
+	var list []json.RawMessage
+	if err := json.Unmarshal(raw, &list); err != nil {
+		var payload apiKeyEntriesPayload
+		if errObj := json.Unmarshal(raw, &payload); errObj != nil {
+			return nil, err
+		}
+		switch {
+		case payload.Items != nil:
+			list = payload.Items
+		case payload.Value != nil:
+			list = payload.Value
+		case payload.APIKeys != nil:
+			list = payload.APIKeys
+		case payload.APIKeys2 != nil:
+			list = payload.APIKeys2
+		default:
+			return nil, fmt.Errorf("missing items")
+		}
+	}
+
+	entries := make([]config.APIKeyEntry, 0, len(list))
+	for _, item := range list {
+		entry, err := decodeAPIKeyEntry(item)
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, entry)
+	}
+	return entries, nil
+}
 
 // Generic helpers for list[string]
 func (h *Handler) putStringList(c *gin.Context, set func([]string), after func()) {
@@ -105,17 +158,161 @@ func (h *Handler) deleteFromStringList(c *gin.Context, target *[]string, after f
 }
 
 // api-keys
-func (h *Handler) GetAPIKeys(c *gin.Context) { c.JSON(200, gin.H{"api-keys": h.cfg.APIKeys}) }
+func (h *Handler) GetAPIKeys(c *gin.Context) {
+	if h == nil || h.cfg == nil || len(h.cfg.APIKeyEntries) == 0 {
+		c.JSON(200, gin.H{"api-keys": []config.APIKeyEntry{}})
+		return
+	}
+	c.JSON(200, gin.H{"api-keys": h.cfg.APIKeyEntries})
+}
+
 func (h *Handler) PutAPIKeys(c *gin.Context) {
-	h.putStringList(c, func(v []string) {
-		h.cfg.APIKeys = append([]string(nil), v...)
-	}, nil)
+	data, err := c.GetRawData()
+	if err != nil {
+		c.JSON(400, gin.H{"error": "failed to read body"})
+		return
+	}
+	entries, err := decodeAPIKeyEntries(data)
+	if err != nil {
+		c.JSON(400, gin.H{"error": "invalid body"})
+		return
+	}
+	h.cfg.APIKeyEntries = append([]config.APIKeyEntry(nil), entries...)
+	h.cfg.SanitizeAPIKeyEntries()
+	h.persist(c)
 }
+
 func (h *Handler) PatchAPIKeys(c *gin.Context) {
-	h.patchStringList(c, &h.cfg.APIKeys, func() {})
+	var body struct {
+		Old   *string         `json:"old"`
+		New   json.RawMessage `json:"new"`
+		Key   *string         `json:"key"`
+		Match *string         `json:"match"`
+		Index *int            `json:"index"`
+		Value json.RawMessage `json:"value"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(400, gin.H{"error": "invalid body"})
+		return
+	}
+
+	if body.Index != nil && *body.Index >= 0 && *body.Index < len(h.cfg.APIKeyEntries) && len(body.Value) > 0 {
+		entry, err := decodeAPIKeyEntry(body.Value)
+		if err != nil {
+			c.JSON(400, gin.H{"error": "invalid value"})
+			return
+		}
+		h.cfg.APIKeyEntries[*body.Index] = entry
+		h.cfg.SanitizeAPIKeyEntries()
+		h.persist(c)
+		return
+	}
+
+	targetKey := ""
+	switch {
+	case body.Key != nil:
+		targetKey = strings.TrimSpace(*body.Key)
+	case body.Match != nil:
+		targetKey = strings.TrimSpace(*body.Match)
+	case body.Old != nil:
+		targetKey = strings.TrimSpace(*body.Old)
+	}
+	newValue := body.Value
+	if len(newValue) == 0 {
+		newValue = body.New
+	}
+	if targetKey != "" && len(newValue) > 0 {
+		entry, err := decodeAPIKeyEntry(newValue)
+		if err != nil {
+			c.JSON(400, gin.H{"error": "invalid value"})
+			return
+		}
+		updated := false
+		for i := range h.cfg.APIKeyEntries {
+			if h.cfg.APIKeyEntries[i].Key != targetKey {
+				continue
+			}
+			h.cfg.APIKeyEntries[i] = entry
+			updated = true
+			break
+		}
+		if !updated {
+			h.cfg.APIKeyEntries = append(h.cfg.APIKeyEntries, entry)
+		}
+		h.cfg.SanitizeAPIKeyEntries()
+		h.persist(c)
+		return
+	}
+
+	c.JSON(400, gin.H{"error": "missing fields"})
 }
+
 func (h *Handler) DeleteAPIKeys(c *gin.Context) {
-	h.deleteFromStringList(c, &h.cfg.APIKeys, func() {})
+	if idxStr := c.Query("index"); idxStr != "" {
+		var idx int
+		_, err := fmt.Sscanf(idxStr, "%d", &idx)
+		if err == nil && idx >= 0 && idx < len(h.cfg.APIKeyEntries) {
+			h.cfg.APIKeyEntries = append(h.cfg.APIKeyEntries[:idx], h.cfg.APIKeyEntries[idx+1:]...)
+			h.cfg.SanitizeAPIKeyEntries()
+			h.persist(c)
+			return
+		}
+	}
+
+	key := strings.TrimSpace(c.Query("key"))
+	if key == "" {
+		key = strings.TrimSpace(c.Query("value"))
+	}
+	if key != "" {
+		out := make([]config.APIKeyEntry, 0, len(h.cfg.APIKeyEntries))
+		for _, entry := range h.cfg.APIKeyEntries {
+			if strings.TrimSpace(entry.Key) != key {
+				out = append(out, entry)
+			}
+		}
+		h.cfg.APIKeyEntries = out
+		h.cfg.SanitizeAPIKeyEntries()
+		h.persist(c)
+		return
+	}
+
+	c.JSON(400, gin.H{"error": "missing index or key"})
+}
+
+func (h *Handler) GetAPIKeysRuntime(c *gin.Context) {
+	if h == nil || h.apiKeyPolicyManager == nil {
+		c.JSON(200, gin.H{"items": []apikeypolicy.RuntimeEntry{}})
+		return
+	}
+	c.JSON(200, gin.H{"items": h.apiKeyPolicyManager.Snapshot()})
+}
+
+func (h *Handler) ResetAPIKeyTokens(c *gin.Context) {
+	if h == nil || h.apiKeyPolicyManager == nil {
+		c.JSON(200, gin.H{"status": "ok"})
+		return
+	}
+
+	var body struct {
+		Key    *string `json:"key"`
+		APIKey *string `json:"api-key"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		// Empty/invalid body falls back to global reset for backwards compatibility.
+		h.apiKeyPolicyManager.ResetTokenUsage("")
+		c.JSON(200, gin.H{"status": "ok"})
+		return
+	}
+
+	key := ""
+	switch {
+	case body.Key != nil:
+		key = strings.TrimSpace(*body.Key)
+	case body.APIKey != nil:
+		key = strings.TrimSpace(*body.APIKey)
+	}
+	h.apiKeyPolicyManager.ResetTokenUsage(key)
+	c.JSON(200, gin.H{"status": "ok"})
 }
 
 // gemini-api-key: []GeminiKey

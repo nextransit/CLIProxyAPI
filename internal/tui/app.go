@@ -181,6 +181,16 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return a, cmdLogs
 
+	case openLogsSearchMsg:
+		if !a.authenticated || !a.logsEnabled {
+			return a, nil
+		}
+		a.activeTab = tabLogs
+		a.initialized[tabLogs] = true
+		var cmd tea.Cmd
+		a.logs, cmd = a.logs.Update(setLogsSearchMsg{query: msg.query})
+		return a, cmd
+
 	case tea.KeyMsg:
 		if !a.authenticated {
 			switch msg.String() {

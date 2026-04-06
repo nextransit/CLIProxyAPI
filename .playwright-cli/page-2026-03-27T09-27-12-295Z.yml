@@ -1,0 +1,127 @@
+- generic [ref=e2]:
+  - generic [ref=e40]:
+    - generic [ref=e41]: Connected
+    - button "Close" [ref=e42] [cursor=pointer]:
+      - img [ref=e43]
+  - generic [ref=e46]:
+    - banner [ref=e47]:
+      - generic [ref=e48]:
+        - button "收起" [ref=e49] [cursor=pointer]:
+          - img [ref=e50]
+        - img "CPAMC logo" [ref=e52]
+        - generic [ref=e53] [cursor=pointer]:
+          - generic [ref=e54]: CLI Proxy API Management Center
+          - generic: CPAMC
+      - generic [ref=e55]:
+        - generic [ref=e56]:
+          - generic [ref=e57]: Connected
+          - generic [ref=e58]: http://localhost:8317
+        - generic [ref=e59]:
+          - button "Refresh All" [ref=e60] [cursor=pointer]:
+            - img [ref=e62]
+          - button "Check for updates" [ref=e65] [cursor=pointer]:
+            - img [ref=e67]
+          - button "Language" [ref=e70] [cursor=pointer]:
+            - img [ref=e72]
+          - button "Theme" [ref=e75] [cursor=pointer]:
+            - img [ref=e77]
+          - button "Logout" [ref=e84] [cursor=pointer]:
+            - img [ref=e86]
+    - generic [ref=e89]:
+      - complementary [ref=e90]:
+        - generic [ref=e91]:
+          - link "Dashboard" [ref=e92] [cursor=pointer]:
+            - /url: "#/"
+            - img [ref=e94]
+            - generic [ref=e99]: Dashboard
+          - link "Config Panel" [ref=e100] [cursor=pointer]:
+            - /url: "#/config"
+            - img [ref=e102]
+            - generic [ref=e105]: Config Panel
+          - link "AI Providers" [ref=e106] [cursor=pointer]:
+            - /url: "#/ai-providers"
+            - img [ref=e108]
+            - generic [ref=e111]: AI Providers
+          - link "Auth Files" [ref=e112] [cursor=pointer]:
+            - /url: "#/auth-files"
+            - img [ref=e114]
+            - generic [ref=e117]: Auth Files
+          - link "OAuth Login" [ref=e118] [cursor=pointer]:
+            - /url: "#/oauth"
+            - img [ref=e120]
+            - generic [ref=e122]: OAuth Login
+          - link "Quota Management" [ref=e123] [cursor=pointer]:
+            - /url: "#/quota"
+            - img [ref=e125]
+            - generic [ref=e128]: Quota Management
+          - link "Usage Statistics" [ref=e129] [cursor=pointer]:
+            - /url: "#/usage"
+            - img [ref=e131]
+            - generic [ref=e134]: Usage Statistics
+          - link "Management Center Info" [ref=e135] [cursor=pointer]:
+            - /url: "#/system"
+            - img [ref=e137]
+            - generic [ref=e139]: Management Center Info
+      - main [ref=e141]:
+        - generic [ref=e144]:
+          - generic [ref=e145]:
+            - heading "Dashboard" [level=1] [ref=e146]
+            - paragraph [ref=e147]: Welcome to CLI Proxy API Management Center
+          - generic [ref=e148]:
+            - generic [ref=e151]: Connected
+            - generic [ref=e152]:
+              - generic [ref=e153]: http://localhost:8317
+              - generic [ref=e154]: vdev
+              - generic [ref=e155]: Invalid Date
+          - generic [ref=e156]:
+            - link "4 Management Keys Config Panel" [ref=e157] [cursor=pointer]:
+              - /url: "#/config"
+              - img [ref=e159]
+              - generic [ref=e163]:
+                - generic [ref=e164]: "4"
+                - generic [ref=e165]: Management Keys
+                - generic [ref=e166]: Config Panel
+            - link "11 AI Providers G:0 C:6 Cl:0 O:5" [ref=e167] [cursor=pointer]:
+              - /url: "#/ai-providers"
+              - img [ref=e169]
+              - generic [ref=e172]:
+                - generic [ref=e173]: "11"
+                - generic [ref=e174]: AI Providers
+                - generic [ref=e175]: G:0 C:6 Cl:0 O:5
+            - link "1516 Auth Files OAuth Credentials" [ref=e176] [cursor=pointer]:
+              - /url: "#/auth-files"
+              - img [ref=e178]
+              - generic [ref=e181]:
+                - generic [ref=e182]: "1516"
+                - generic [ref=e183]: Auth Files
+                - generic [ref=e184]: OAuth Credentials
+            - link "39 Available Models Total models from all providers" [ref=e185] [cursor=pointer]:
+              - /url: "#/system"
+              - img [ref=e187]
+              - generic [ref=e193]:
+                - generic [ref=e194]: "39"
+                - generic [ref=e195]: Available Models
+                - generic [ref=e196]: Total models from all providers
+          - generic [ref=e197]:
+            - heading "Current Configuration" [level=2] [ref=e198]
+            - generic [ref=e199]:
+              - generic [ref=e200]:
+                - generic [ref=e201]: Enable Debug Mode
+                - generic [ref=e202]: "Yes"
+              - generic [ref=e203]:
+                - generic [ref=e204]: Enable usage statistics
+                - generic [ref=e205]: "Yes"
+              - generic [ref=e206]:
+                - generic [ref=e207]: Enable logging to file
+                - generic [ref=e208]: "Yes"
+              - generic [ref=e209]:
+                - generic [ref=e210]: "Retry Count:"
+                - generic [ref=e211]: "3"
+              - generic [ref=e212]:
+                - generic [ref=e213]: Require auth for /ws/*
+                - generic [ref=e214]: "No"
+              - generic [ref=e215]:
+                - generic [ref=e216]: Routing Strategy
+                - generic [ref=e217]: round-robin (cycle)
+            - link "Edit Settings →" [ref=e218] [cursor=pointer]:
+              - /url: "#/config"

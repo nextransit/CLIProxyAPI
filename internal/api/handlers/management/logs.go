@@ -22,6 +22,24 @@ const (
 	logScannerMaxBuffer     = 8 * 1024 * 1024
 )
 
+var logSearchAliases = map[string][]string{
+	"usage_limit_reached": {
+		"quota exceeded",
+		": quota",
+	},
+	"token_invalidated": {
+		"invalidated",
+		"invalid_request_error",
+	},
+}
+
+type logFileDescriptor struct {
+	Name     string `json:"name"`
+	Size     int64  `json:"size"`
+	Modified int64  `json:"modified"`
+	Type     string `json:"type"`
+}
+
 // GetLogs returns log lines with optional incremental loading.
 func (h *Handler) GetLogs(c *gin.Context) {
 	if h == nil {
@@ -65,7 +83,8 @@ func (h *Handler) GetLogs(c *gin.Context) {
 	}
 
 	cutoff := parseCutoff(c.Query("after"))
-	acc := newLogAccumulator(cutoff, limit)
+	search := parseLogSearch(c)
+	acc := newLogAccumulator(cutoff, limit, search)
 	for i := range files {
 		if errProcess := acc.consumeFile(files[i]); errProcess != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to read log file %s: %v", files[i], errProcess)})
@@ -82,6 +101,99 @@ func (h *Handler) GetLogs(c *gin.Context) {
 		"line-count":       total,
 		"latest-timestamp": latest,
 	})
+}
+
+// GetLogFiles lists searchable log files from the configured log directory.
+func (h *Handler) GetLogFiles(c *gin.Context) {
+	if h == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler unavailable"})
+		return
+	}
+	if h.cfg == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
+		return
+	}
+
+	logDir := h.logDirectory()
+	if strings.TrimSpace(logDir) == "" {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "log directory not configured"})
+		return
+	}
+
+	files, err := h.collectManagedLogFiles(logDir, c.Query("search"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			c.JSON(http.StatusOK, gin.H{"files": []logFileDescriptor{}, "total": 0})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to list log files: %v", err)})
+		return
+	}
+
+	limit, errLimit := parseLimit(c.Query("limit"))
+	if errLimit != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid limit: %v", errLimit)})
+		return
+	}
+	total := len(files)
+	if limit > 0 && len(files) > limit {
+		files = files[:limit]
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"files": files,
+		"total": total,
+	})
+}
+
+// DownloadLogFile downloads a specific managed log file by name.
+func (h *Handler) DownloadLogFile(c *gin.Context) {
+	if h == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler unavailable"})
+		return
+	}
+	if h.cfg == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
+		return
+	}
+
+	dir := h.logDirectory()
+	if strings.TrimSpace(dir) == "" {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "log directory not configured"})
+		return
+	}
+
+	name := strings.TrimSpace(c.Param("name"))
+	if !isManagedLogFileName(name) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "log file not found"})
+		return
+	}
+
+	fullPath, err := resolveManagedLogFilePath(dir, name)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if strings.Contains(err.Error(), "invalid") {
+			status = http.StatusBadRequest
+		}
+		c.JSON(status, gin.H{"error": err.Error()})
+		return
+	}
+
+	info, errStat := os.Stat(fullPath)
+	if errStat != nil {
+		if os.IsNotExist(errStat) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "log file not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to read log file: %v", errStat)})
+		return
+	}
+	if info.IsDir() {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid log file"})
+		return
+	}
+
+	c.FileAttachment(fullPath, name)
 }
 
 // DeleteLogs removes all rotated log files and truncates the active log.
@@ -397,16 +509,59 @@ func (h *Handler) collectLogFiles(dir string) ([]string, error) {
 	return paths, nil
 }
 
+func (h *Handler) collectManagedLogFiles(dir string, search string) ([]logFileDescriptor, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	filter := strings.ToLower(strings.TrimSpace(search))
+	files := make([]logFileDescriptor, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		name := entry.Name()
+		if !isManagedLogFileName(name) {
+			continue
+		}
+		if filter != "" && !strings.Contains(strings.ToLower(name), filter) {
+			continue
+		}
+
+		info, errInfo := entry.Info()
+		if errInfo != nil {
+			return nil, errInfo
+		}
+		files = append(files, logFileDescriptor{
+			Name:     name,
+			Size:     info.Size(),
+			Modified: info.ModTime().Unix(),
+			Type:     classifyManagedLogFile(name),
+		})
+	}
+
+	sort.Slice(files, func(i, j int) bool {
+		if files[i].Modified == files[j].Modified {
+			return files[i].Name < files[j].Name
+		}
+		return files[i].Modified > files[j].Modified
+	})
+	return files, nil
+}
+
 type logAccumulator struct {
 	cutoff  int64
 	limit   int
+	search  []string
 	lines   []string
 	total   int
 	latest  int64
 	include bool
 }
 
-func newLogAccumulator(cutoff int64, limit int) *logAccumulator {
+func newLogAccumulator(cutoff int64, limit int, search string) *logAccumulator {
 	capacity := 256
 	if limit > 0 && limit < capacity {
 		capacity = limit
@@ -414,6 +569,7 @@ func newLogAccumulator(cutoff int64, limit int) *logAccumulator {
 	return &logAccumulator{
 		cutoff: cutoff,
 		limit:  limit,
+		search: expandLogSearchTerms(search),
 		lines:  make([]string, 0, capacity),
 	}
 }
@@ -444,7 +600,6 @@ func (acc *logAccumulator) consumeFile(path string) error {
 
 func (acc *logAccumulator) addLine(raw string) {
 	line := strings.TrimRight(raw, "\r")
-	acc.total++
 	ts := parseTimestamp(line)
 	if ts > acc.latest {
 		acc.latest = ts
@@ -462,6 +617,10 @@ func (acc *logAccumulator) addLine(raw string) {
 }
 
 func (acc *logAccumulator) append(line string) {
+	if !matchesLogSearch(strings.ToLower(line), acc.search) {
+		return
+	}
+	acc.total++
 	acc.lines = append(acc.lines, line)
 	if acc.limit > 0 && len(acc.lines) > acc.limit {
 		acc.lines = acc.lines[len(acc.lines)-acc.limit:]
@@ -485,6 +644,77 @@ func parseCutoff(raw string) int64 {
 		return 0
 	}
 	return ts
+}
+
+func parseLogSearch(c *gin.Context) string {
+	if c == nil {
+		return ""
+	}
+	for _, key := range []string{"search", "q"} {
+		if value := strings.TrimSpace(c.Query(key)); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func expandLogSearchTerms(search string) []string {
+	normalized := strings.ToLower(strings.TrimSpace(search))
+	if normalized == "" {
+		return nil
+	}
+
+	terms := []string{normalized}
+	compact := strings.NewReplacer(" ", "", "_", "", "-", "").Replace(normalized)
+	if compact != "" && compact != normalized {
+		terms = append(terms, compact)
+	}
+
+	replaced := strings.NewReplacer("_", " ", "-", " ").Replace(normalized)
+	if replaced != "" && replaced != normalized {
+		terms = append(terms, replaced)
+	}
+
+	for key, aliases := range logSearchAliases {
+		if normalized != key && compact != strings.NewReplacer(" ", "", "_", "", "-", "").Replace(key) {
+			continue
+		}
+		terms = append(terms, aliases...)
+	}
+
+	return dedupeSearchTerms(terms)
+}
+
+func dedupeSearchTerms(terms []string) []string {
+	if len(terms) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(terms))
+	result := make([]string, 0, len(terms))
+	for _, term := range terms {
+		term = strings.ToLower(strings.TrimSpace(term))
+		if term == "" {
+			continue
+		}
+		if _, ok := seen[term]; ok {
+			continue
+		}
+		seen[term] = struct{}{}
+		result = append(result, term)
+	}
+	return result
+}
+
+func matchesLogSearch(line string, terms []string) bool {
+	if len(terms) == 0 {
+		return true
+	}
+	for _, term := range terms {
+		if strings.Contains(line, term) {
+			return true
+		}
+	}
+	return false
 }
 
 func parseLimit(raw string) (int, error) {
@@ -580,4 +810,55 @@ func timestampRotationOrder(name string) (int64, bool) {
 		return 0, false
 	}
 	return math.MaxInt64 - parsed.Unix(), true
+}
+
+func isManagedLogFileName(name string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" || strings.Contains(name, "/") || strings.Contains(name, "\\") {
+		return false
+	}
+	switch {
+	case name == defaultLogFileName:
+		return true
+	case isRotatedLogFile(name):
+		return true
+	case strings.HasSuffix(name, ".log"):
+		return true
+	case strings.HasSuffix(name, ".log.gz"):
+		return true
+	default:
+		return false
+	}
+}
+
+func classifyManagedLogFile(name string) string {
+	switch {
+	case name == defaultLogFileName:
+		return "main"
+	case strings.HasPrefix(name, "error-"):
+		return "request-error"
+	case isRotatedLogFile(name):
+		return "rotated"
+	default:
+		return "request"
+	}
+}
+
+func resolveManagedLogFilePath(dir string, name string) (string, error) {
+	if !isManagedLogFileName(name) {
+		return "", fmt.Errorf("invalid log file name")
+	}
+
+	dirAbs, errAbs := filepath.Abs(dir)
+	if errAbs != nil {
+		return "", fmt.Errorf("failed to resolve log directory: %v", errAbs)
+	}
+
+	fullPath := filepath.Clean(filepath.Join(dirAbs, name))
+	prefix := dirAbs + string(os.PathSeparator)
+	if fullPath != dirAbs && !strings.HasPrefix(fullPath, prefix) {
+		return "", fmt.Errorf("invalid log file path")
+	}
+
+	return fullPath, nil
 }

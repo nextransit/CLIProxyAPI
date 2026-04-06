@@ -18,6 +18,14 @@ type Client struct {
 	http      *http.Client
 }
 
+type AuthFilesPage struct {
+	Files      []map[string]any
+	Page       int
+	PageSize   int
+	Total      int
+	TotalPages int
+}
+
 // NewClient creates a new management API client.
 func NewClient(port int, secretKey string) *Client {
 	return &Client{
@@ -155,6 +163,59 @@ func (c *Client) GetAuthFiles() ([]map[string]any, error) {
 	return extractList(wrapper, "files")
 }
 
+func (c *Client) GetAuthFilesPage(page, pageSize int) (AuthFilesPage, error) {
+	query := url.Values{}
+	if page > 0 {
+		query.Set("page", strconv.Itoa(page))
+	}
+	if pageSize > 0 {
+		query.Set("page_size", strconv.Itoa(pageSize))
+	}
+
+	path := "/v0/management/auth-files"
+	if encoded := query.Encode(); encoded != "" {
+		path += "?" + encoded
+	}
+
+	wrapper, err := c.getJSON(path)
+	if err != nil {
+		return AuthFilesPage{}, err
+	}
+
+	files, err := extractList(wrapper, "files")
+	if err != nil {
+		return AuthFilesPage{}, err
+	}
+
+	result := AuthFilesPage{
+		Files:    files,
+		Page:     page,
+		PageSize: pageSize,
+	}
+	if result.Page == 0 {
+		result.Page = 1
+	}
+	if result.PageSize == 0 {
+		result.PageSize = len(files)
+	}
+	if value, ok := intFromAny(wrapper["page"]); ok {
+		result.Page = value
+	}
+	if value, ok := intFromAny(wrapper["page_size"]); ok {
+		result.PageSize = value
+	}
+	if value, ok := intFromAny(wrapper["total"]); ok {
+		result.Total = value
+	} else {
+		result.Total = len(files)
+	}
+	if value, ok := intFromAny(wrapper["total_pages"]); ok {
+		result.TotalPages = value
+	}
+
+	return result, nil
+}
+
 // DeleteAuthFile deletes a single auth file by name.
 func (c *Client) DeleteAuthFile(name string) error {
 	query := url.Values{}
@@ -187,12 +248,19 @@ func (c *Client) PatchAuthFileFields(name string, fields map[string]any) error {
 
 // GetLogs fetches log lines from the server.
 func (c *Client) GetLogs(after int64, limit int) ([]string, int64, error) {
+	return c.GetLogsFiltered(after, limit, "")
+}
+
+func (c *Client) GetLogsFiltered(after int64, limit int, search string) ([]string, int64, error) {
 	query := url.Values{}
 	if limit > 0 {
 		query.Set("limit", strconv.Itoa(limit))
 	}
 	if after > 0 {
 		query.Set("after", strconv.FormatInt(after, 10))
+	}
+	if trimmed := strings.TrimSpace(search); trimmed != "" {
+		query.Set("search", trimmed)
 	}
 
 	path := "/v0/management/logs"
@@ -237,6 +305,25 @@ func (c *Client) GetLogs(after int64, limit int) ([]string, int64, error) {
 	}
 
 	return lines, latest, nil
+}
+
+func intFromAny(value any) (int, bool) {
+	switch v := value.(type) {
+	case float64:
+		return int(v), true
+	case int:
+		return v, true
+	case int64:
+		return int(v), true
+	case json.Number:
+		parsed, err := v.Int64()
+		if err != nil {
+			return 0, false
+		}
+		return int(parsed), true
+	default:
+		return 0, false
+	}
 }
 
 // GetAPIKeys fetches the list of API keys.

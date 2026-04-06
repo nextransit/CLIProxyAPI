@@ -16,7 +16,7 @@ func Register(cfg *sdkconfig.SDKConfig) {
 		return
 	}
 
-	keys := normalizeKeys(cfg.APIKeys)
+	keys := normalizeConfigKeys(cfg)
 	if len(keys) == 0 {
 		sdkaccess.UnregisterProvider(sdkaccess.AccessProviderTypeConfigAPIKey)
 		return
@@ -138,4 +138,18 @@ func normalizeKeys(keys []string) []string {
 		return nil
 	}
 	return normalized
+}
+
+func normalizeConfigKeys(cfg *sdkconfig.SDKConfig) []string {
+	if cfg == nil {
+		return nil
+	}
+
+	keys := make([]string, 0, len(cfg.APIKeys)+len(cfg.APIKeyEntries))
+	keys = append(keys, cfg.APIKeys...)
+	for _, entry := range cfg.APIKeyEntries {
+		keys = append(keys, entry.Key)
+	}
+
+	return normalizeKeys(keys)
 }

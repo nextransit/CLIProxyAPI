@@ -75,14 +75,18 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 	if errUnmarshal := json.Unmarshal(data, &metadata); errUnmarshal != nil {
 		return nil
 	}
-	t, _ := metadata["type"].(string)
-	if t == "" {
+	provider := detectAuthProvider(metadata)
+	if provider == "" {
 		return nil
 	}
-	provider := strings.ToLower(t)
 	if provider == "gemini" {
 		provider = "gemini-cli"
 	}
+	if _, exists := metadata["type"]; !exists {
+		metadata["type"] = provider
+	}
+	normalizeLegacyCodexMetadata(provider, metadata)
+	autoDisabledReason := applyLegacyCodexTokenPolicy(provider, metadata)
 	label := provider
 	if email, _ := metadata["email"].(string); email != "" {
 		label = email
@@ -117,6 +121,13 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 	if disabled {
 		status = coreauth.StatusDisabled
 	}
+	statusMessage := ""
+	if rawStatusMessage, ok := metadata["status_message"].(string); ok {
+		statusMessage = strings.TrimSpace(rawStatusMessage)
+	}
+	if statusMessage == "" && autoDisabledReason != "" {
+		statusMessage = autoDisabledReason
+	}
 
 	// Read per-account excluded models from the OAuth JSON file.
 	perAccountExcluded := extractExcludedModelsFromMetadata(metadata)
@@ -127,6 +138,7 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 		Label:    label,
 		Prefix:   prefix,
 		Status:   status,
+		StatusMessage: statusMessage,
 		Disabled: disabled,
 		Attributes: map[string]string{
 			"source": fullPath,
@@ -180,6 +192,58 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 		}
 	}
 	return []*coreauth.Auth{a}
+}
+
+func detectAuthProvider(metadata map[string]any) string {
+	if metadata == nil {
+		return ""
+	}
+	if t, _ := metadata["type"].(string); strings.TrimSpace(t) != "" {
+		return strings.ToLower(strings.TrimSpace(t))
+	}
+	// Backward compatibility for legacy Codex credential files exported by
+	// third-party tools: they may use `openai_token` without a `type` field.
+	if token, _ := metadata["openai_token"].(string); strings.TrimSpace(token) != "" {
+		return "codex"
+	}
+	return ""
+}
+
+func normalizeLegacyCodexMetadata(provider string, metadata map[string]any) {
+	if provider != "codex" || metadata == nil {
+		return
+	}
+	if accessToken, _ := metadata["access_token"].(string); strings.TrimSpace(accessToken) != "" {
+		return
+	}
+	if legacyToken, _ := metadata["openai_token"].(string); strings.TrimSpace(legacyToken) != "" {
+		metadata["access_token"] = strings.TrimSpace(legacyToken)
+	}
+}
+
+const legacyCodexOAStatusMessage = "legacy oa_token is incompatible with Codex API; disabled automatically"
+
+func applyLegacyCodexTokenPolicy(provider string, metadata map[string]any) string {
+	if provider != "codex" || metadata == nil {
+		return ""
+	}
+
+	token := ""
+	if accessToken, _ := metadata["access_token"].(string); strings.TrimSpace(accessToken) != "" {
+		token = strings.TrimSpace(accessToken)
+	} else if legacyToken, _ := metadata["openai_token"].(string); strings.TrimSpace(legacyToken) != "" {
+		token = strings.TrimSpace(legacyToken)
+	}
+	if token == "" || !strings.HasPrefix(strings.ToLower(token), "oa_token_") {
+		return ""
+	}
+
+	metadata["disabled"] = true
+	metadata["status"] = string(coreauth.StatusDisabled)
+	if rawStatusMessage, ok := metadata["status_message"].(string); !ok || strings.TrimSpace(rawStatusMessage) == "" {
+		metadata["status_message"] = legacyCodexOAStatusMessage
+	}
+	return legacyCodexOAStatusMessage
 }
 
 // SynthesizeGeminiVirtualAuths creates virtual Auth entries for multi-project Gemini credentials.

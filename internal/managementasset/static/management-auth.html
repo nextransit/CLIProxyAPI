@@ -1,0 +1,1414 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CLIProxyAPI Auth Console</title>
+    <style>
+        :root {
+            --bg: #f3efe7;
+            --panel: #fffdf8;
+            --ink: #1f2933;
+            --muted: #5d6975;
+            --line: #d9d0c3;
+            --accent: #b45309;
+            --accent-strong: #8a3c00;
+            --accent-soft: #f7e5cf;
+            --ok: #18794e;
+            --warn: #b45309;
+            --danger: #b42318;
+            --shadow: 0 18px 50px rgba(45, 33, 18, 0.09);
+            --radius: 18px;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            min-height: 100vh;
+            font-family: "Avenir Next", "Segoe UI Variable", "PingFang SC", "Hiragino Sans GB", sans-serif;
+            color: var(--ink);
+            background:
+                radial-gradient(circle at top left, rgba(180, 83, 9, 0.08), transparent 28%),
+                linear-gradient(180deg, #fbf8f2 0%, var(--bg) 100%);
+        }
+
+        .shell {
+            max-width: 1480px;
+            margin: 0 auto;
+            padding: 28px 20px 48px;
+        }
+
+        .hero {
+            display: grid;
+            grid-template-columns: minmax(0, 1.6fr) minmax(320px, 0.9fr);
+            gap: 18px;
+            margin-bottom: 18px;
+        }
+
+        .hero-main,
+        .hero-side,
+        .panel {
+            background: color-mix(in oklab, var(--panel) 94%, white 6%);
+            border: 1px solid var(--line);
+            border-radius: var(--radius);
+            box-shadow: var(--shadow);
+        }
+
+        .hero-main {
+            padding: 26px 28px 24px;
+        }
+
+        .eyebrow {
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+            padding: 6px 12px;
+            border-radius: 999px;
+            background: var(--accent-soft);
+            color: var(--accent-strong);
+            font-size: 12px;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            font-weight: 700;
+        }
+
+        h1 {
+            margin: 18px 0 10px;
+            font-size: clamp(2rem, 4vw, 3.65rem);
+            line-height: 0.98;
+            letter-spacing: -0.05em;
+        }
+
+        .hero-copy {
+            max-width: 54rem;
+            color: var(--muted);
+            font-size: 15px;
+            line-height: 1.7;
+        }
+
+        .hero-grid {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 14px;
+            margin-top: 22px;
+        }
+
+        .mini-stat {
+            padding: 14px 16px;
+            border-radius: 14px;
+            background: linear-gradient(180deg, rgba(180, 83, 9, 0.06), rgba(180, 83, 9, 0.02));
+            border: 1px solid rgba(180, 83, 9, 0.15);
+        }
+
+        .mini-stat .label {
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: var(--muted);
+        }
+
+        .mini-stat .value {
+            margin-top: 8px;
+            font-size: 28px;
+            font-weight: 800;
+            letter-spacing: -0.04em;
+        }
+
+        .hero-side {
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+        }
+
+        .key-panel-title {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+        }
+
+        .status-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 7px 12px;
+            border-radius: 999px;
+            background: #f4efe6;
+            color: var(--muted);
+            font-size: 13px;
+            font-weight: 700;
+        }
+
+        .status-pill .dot {
+            width: 9px;
+            height: 9px;
+            border-radius: 50%;
+            background: #b8b1a7;
+        }
+
+        .status-pill.connected .dot {
+            background: var(--ok);
+            box-shadow: 0 0 0 6px rgba(24, 121, 78, 0.12);
+        }
+
+        .field-stack {
+            display: grid;
+            gap: 10px;
+        }
+
+        .field-stack label {
+            font-size: 13px;
+            font-weight: 700;
+            color: var(--muted);
+        }
+
+        input,
+        select,
+        button,
+        textarea {
+            font: inherit;
+        }
+
+        input,
+        select,
+        textarea {
+            width: 100%;
+            border: 1px solid color-mix(in oklab, var(--line) 76%, var(--accent) 24%);
+            background: #fffdfa;
+            color: var(--ink);
+            border-radius: 12px;
+            padding: 12px 14px;
+            outline: none;
+            transition: border-color 0.18s ease, box-shadow 0.18s ease;
+        }
+
+        input:focus,
+        select:focus,
+        textarea:focus {
+            border-color: color-mix(in oklab, var(--accent) 68%, black 32%);
+            box-shadow: 0 0 0 4px rgba(180, 83, 9, 0.12);
+        }
+
+        button {
+            border: 0;
+            border-radius: 12px;
+            padding: 11px 14px;
+            cursor: pointer;
+            transition: transform 0.16s ease, opacity 0.16s ease, background 0.16s ease;
+        }
+
+        button:hover {
+            transform: translateY(-1px);
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, var(--accent) 0%, var(--accent-strong) 100%);
+            color: #fffaf0;
+            font-weight: 700;
+        }
+
+        .btn-secondary {
+            background: #efe7db;
+            color: var(--ink);
+            font-weight: 600;
+        }
+
+        .btn-ghost {
+            background: transparent;
+            color: var(--muted);
+            border: 1px solid var(--line);
+            font-weight: 600;
+        }
+
+        .btn-danger {
+            background: #fff1f1;
+            color: var(--danger);
+            font-weight: 700;
+        }
+
+        .btn-ok {
+            background: #ecfdf3;
+            color: var(--ok);
+            font-weight: 700;
+        }
+
+        .button-row {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+
+        .notice {
+            min-height: 22px;
+            font-size: 13px;
+            color: var(--muted);
+        }
+
+        .notice.error {
+            color: var(--danger);
+        }
+
+        .notice.success {
+            color: var(--ok);
+        }
+
+        .workspace {
+            display: grid;
+            grid-template-columns: minmax(0, 1.15fr) minmax(360px, 0.85fr);
+            gap: 18px;
+        }
+
+        .panel {
+            padding: 20px;
+        }
+
+        .panel-head {
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            gap: 16px;
+            margin-bottom: 14px;
+        }
+
+        .panel-title {
+            display: grid;
+            gap: 4px;
+        }
+
+        .panel-title h2 {
+            margin: 0;
+            font-size: 24px;
+            letter-spacing: -0.04em;
+        }
+
+        .panel-title p {
+            margin: 0;
+            color: var(--muted);
+            line-height: 1.6;
+            font-size: 14px;
+        }
+
+        .segmented {
+            display: inline-flex;
+            gap: 8px;
+            padding: 6px;
+            border-radius: 999px;
+            background: #f3ece2;
+        }
+
+        .segmented button {
+            border-radius: 999px;
+            padding: 9px 14px;
+            background: transparent;
+            color: var(--muted);
+            font-weight: 700;
+        }
+
+        .segmented button.active {
+            background: var(--ink);
+            color: #fffdfa;
+        }
+
+        .toolbar {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 14px;
+        }
+
+        .toolbar-group {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            align-items: center;
+        }
+
+        .metric-ribbon {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 12px;
+            margin-bottom: 16px;
+        }
+
+        .metric-box {
+            padding: 14px 16px;
+            border-radius: 14px;
+            background: #faf5ec;
+            border: 1px solid #e5d9c8;
+        }
+
+        .metric-box .label {
+            color: var(--muted);
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+        }
+
+        .metric-box .value {
+            margin-top: 8px;
+            font-size: 24px;
+            font-weight: 800;
+            letter-spacing: -0.04em;
+        }
+
+        .auth-table-wrap {
+            overflow: auto;
+            border-radius: 16px;
+            border: 1px solid var(--line);
+            background: #fffdf8;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            min-width: 980px;
+        }
+
+        th,
+        td {
+            padding: 14px 16px;
+            border-bottom: 1px solid #ece4d8;
+            text-align: left;
+            vertical-align: top;
+        }
+
+        th {
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: var(--muted);
+            background: #faf5ec;
+        }
+
+        tbody tr:hover {
+            background: #fffcf7;
+        }
+
+        .status-tag {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 10px;
+            border-radius: 999px;
+            font-size: 12px;
+            font-weight: 700;
+        }
+
+        .status-tag.active {
+            background: #ecfdf3;
+            color: var(--ok);
+        }
+
+        .status-tag.disabled {
+            background: #efebe7;
+            color: var(--muted);
+        }
+
+        .muted {
+            color: var(--muted);
+        }
+
+        .mono {
+            font-family: ui-monospace, "SFMono-Regular", Menlo, Monaco, Consolas, monospace;
+            word-break: break-word;
+        }
+
+        .auth-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(290px, 1fr));
+            gap: 14px;
+        }
+
+        .auth-card {
+            display: grid;
+            gap: 14px;
+            padding: 18px;
+            border-radius: 18px;
+            border: 1px solid var(--line);
+            background:
+                linear-gradient(180deg, rgba(180, 83, 9, 0.05), rgba(255, 255, 255, 0) 42%),
+                #fffdf8;
+        }
+
+        .auth-card-top {
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            gap: 10px;
+        }
+
+        .auth-card-top h3 {
+            margin: 0 0 6px;
+            font-size: 18px;
+            line-height: 1.2;
+        }
+
+        .auth-card-meta {
+            display: grid;
+            gap: 8px;
+            font-size: 14px;
+        }
+
+        .auth-card-meta strong {
+            display: inline-block;
+            min-width: 74px;
+            color: var(--muted);
+            font-weight: 700;
+        }
+
+        .auth-card-actions,
+        .row-actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+
+        .row-actions button,
+        .auth-card-actions button {
+            padding: 8px 10px;
+            border-radius: 10px;
+            font-size: 12px;
+        }
+
+        .log-shell {
+            display: grid;
+            gap: 14px;
+        }
+
+        .log-toolbar {
+            display: grid;
+            gap: 10px;
+        }
+
+        .log-output {
+            min-height: 480px;
+            max-height: 72vh;
+            overflow: auto;
+            padding: 16px;
+            border-radius: 18px;
+            background: #1f2428;
+            color: #e7ecef;
+            border: 1px solid #2e353b;
+            box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.03);
+        }
+
+        .log-output pre {
+            margin: 0;
+            white-space: pre-wrap;
+            word-break: break-word;
+            line-height: 1.6;
+            font-family: ui-monospace, "SFMono-Regular", Menlo, Monaco, Consolas, monospace;
+            font-size: 13px;
+        }
+
+        .empty {
+            padding: 26px 18px;
+            border-radius: 16px;
+            border: 1px dashed #d8ccb9;
+            background: #fbf8f1;
+            color: var(--muted);
+        }
+
+        .dialog-backdrop {
+            position: fixed;
+            inset: 0;
+            background: rgba(28, 22, 15, 0.32);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+            z-index: 30;
+        }
+
+        .dialog-backdrop.open {
+            display: flex;
+        }
+
+        .dialog {
+            width: min(560px, 100%);
+            border-radius: 22px;
+            background: #fffdf8;
+            border: 1px solid var(--line);
+            box-shadow: 0 28px 80px rgba(31, 41, 51, 0.2);
+            padding: 22px;
+            display: grid;
+            gap: 16px;
+        }
+
+        .dialog h3 {
+            margin: 0;
+            font-size: 24px;
+            letter-spacing: -0.04em;
+        }
+
+        .dialog p {
+            margin: 0;
+            color: var(--muted);
+            line-height: 1.6;
+        }
+
+        @media (max-width: 1100px) {
+            .hero,
+            .workspace {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        @media (max-width: 720px) {
+            .shell {
+                padding-inline: 14px;
+            }
+
+            .hero-main,
+            .hero-side,
+            .panel {
+                padding: 18px;
+            }
+
+            .hero-grid,
+            .metric-ribbon {
+                grid-template-columns: 1fr;
+            }
+
+            h1 {
+                line-height: 1.02;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="shell">
+        <section class="hero">
+            <div class="hero-main">
+                <div class="eyebrow">CLIProxyAPI Built-in Console</div>
+                <h1>认证文件与日志排障台</h1>
+                <p class="hero-copy">
+                    这个内置页面专门覆盖认证文件管理和日志排障两个高频场景。它支持认证文件分页、每页最多 100 条、列表 / 卡片切换、启用 / 禁用过滤，以及直接按错误文本搜索日志。
+                </p>
+                <div class="hero-grid">
+                    <div class="mini-stat">
+                        <div class="label">Auth Files</div>
+                        <div class="value" id="heroAuthTotal">-</div>
+                    </div>
+                    <div class="mini-stat">
+                        <div class="label">Active</div>
+                        <div class="value" id="heroAuthActive">-</div>
+                    </div>
+                    <div class="mini-stat">
+                        <div class="label">Log Matches</div>
+                        <div class="value" id="heroLogCount">-</div>
+                    </div>
+                </div>
+            </div>
+            <aside class="hero-side">
+                <div class="key-panel-title">
+                    <div>
+                        <strong>管理密钥</strong>
+                        <div class="muted" style="margin-top: 6px; font-size: 13px;">仅保存在当前浏览器的本地存储中。</div>
+                    </div>
+                    <div class="status-pill" id="connectionStatus">
+                        <span class="dot"></span>
+                        <span>Not connected</span>
+                    </div>
+                </div>
+                <div class="field-stack">
+                    <label for="managementKey">Management Key</label>
+                    <input id="managementKey" type="password" autocomplete="off" placeholder="Bearer / X-Management-Key">
+                </div>
+                <div class="button-row">
+                    <button class="btn-primary" id="saveKeyBtn">保存并验证</button>
+                    <button class="btn-secondary" id="clearKeyBtn">清空</button>
+                    <button class="btn-ghost" id="reloadAllBtn">刷新全部</button>
+                </div>
+                <div class="notice" id="globalNotice"></div>
+            </aside>
+        </section>
+
+        <section class="workspace">
+            <section class="panel">
+                <div class="panel-head">
+                    <div class="panel-title">
+                        <h2>认证文件</h2>
+                        <p>支持分页、列表 / 卡片切换、启停、下载、删除，以及 `prefix / proxy_url / priority` 三个字段编辑。</p>
+                    </div>
+                    <div class="segmented" id="viewSwitcher">
+                        <button type="button" data-view="list" class="active">列表</button>
+                        <button type="button" data-view="card">卡片</button>
+                    </div>
+                </div>
+
+                <div class="toolbar">
+                    <div class="toolbar-group">
+                        <button class="btn-secondary" id="refreshAuthBtn">刷新</button>
+                        <button class="btn-ghost" id="prevPageBtn">上一页</button>
+                        <button class="btn-ghost" id="nextPageBtn">下一页</button>
+                        <span class="muted" id="pageInfo">-</span>
+                    </div>
+                    <div class="toolbar-group">
+                        <label class="muted" for="pageSizeSelect">每页</label>
+                        <select id="pageSizeSelect" style="width: auto;">
+                            <option value="20">20</option>
+                            <option value="50">50</option>
+                            <option value="100">100</option>
+                        </select>
+                        <label class="muted" for="authStatusFilter">状态</label>
+                        <select id="authStatusFilter" style="width: auto;">
+                            <option value="all">全部</option>
+                            <option value="enabled">仅启用</option>
+                            <option value="disabled">仅禁用</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div class="metric-ribbon">
+                    <div class="metric-box">
+                        <div class="label">当前页</div>
+                        <div class="value" id="authCurrentPage">-</div>
+                    </div>
+                    <div class="metric-box">
+                        <div class="label">总页数</div>
+                        <div class="value" id="authTotalPages">-</div>
+                    </div>
+                    <div class="metric-box">
+                        <div class="label">总文件数</div>
+                        <div class="value" id="authTotalCount">-</div>
+                    </div>
+                </div>
+
+                <div id="authContainer"></div>
+            </section>
+
+            <section class="panel">
+                <div class="panel-head">
+                    <div class="panel-title">
+                        <h2>日志检索</h2>
+                        <p>直接按错误码、消息文本或返回体片段搜索日志。适合检索 `token_invalidated`、`invalid_request_error` 这类认证异常。</p>
+                    </div>
+                </div>
+
+                <div class="log-shell">
+                    <div class="log-toolbar">
+                        <div class="field-stack">
+                            <label for="logSearchInput">日志关键字</label>
+                            <input id="logSearchInput" type="text" autocomplete="off" placeholder="例如 token_invalidated / invalid_request_error / 401">
+                        </div>
+                        <div class="toolbar">
+                            <div class="toolbar-group">
+                                <button class="btn-primary" id="searchLogsBtn">搜索日志</button>
+                                <button class="btn-secondary" id="clearLogsSearchBtn">清除搜索</button>
+                            </div>
+                            <div class="toolbar-group">
+                                <label class="muted" for="logLimitSelect">返回行数</label>
+                                <select id="logLimitSelect" style="width: auto;">
+                                    <option value="100">100</option>
+                                    <option value="200" selected>200</option>
+                                    <option value="500">500</option>
+                                </select>
+                                <label class="muted" style="display:flex; align-items:center; gap:8px;">
+                                    <input id="autoRefreshLogs" type="checkbox" style="width:auto; padding:0; margin:0;">
+                                    自动刷新
+                                </label>
+                            </div>
+                        </div>
+                        <div class="notice" id="logsNotice"></div>
+                    </div>
+                    <div class="log-output" id="logOutput"><pre>暂无日志结果。</pre></div>
+                </div>
+            </section>
+        </section>
+    </div>
+
+    <div class="dialog-backdrop" id="editBackdrop">
+        <div class="dialog">
+            <div>
+                <h3 id="editTitle">编辑认证文件</h3>
+                <p id="editSubtitle">更新可编辑字段后保存。</p>
+            </div>
+            <div class="field-stack">
+                <label for="editPrefix">Prefix</label>
+                <input id="editPrefix" type="text" autocomplete="off">
+            </div>
+            <div class="field-stack">
+                <label for="editProxyUrl">Proxy URL</label>
+                <input id="editProxyUrl" type="text" autocomplete="off">
+            </div>
+            <div class="field-stack">
+                <label for="editPriority">Priority</label>
+                <input id="editPriority" type="number" step="1">
+            </div>
+            <div class="button-row">
+                <button class="btn-primary" id="saveEditBtn">保存</button>
+                <button class="btn-ghost" id="cancelEditBtn">取消</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const state = {
+            key: localStorage.getItem("cliproxyapi.managementKey") || "",
+            authPage: 1,
+            authPageSize: Number(localStorage.getItem("cliproxyapi.authPageSize") || "100"),
+            authView: localStorage.getItem("cliproxyapi.authView") || "list",
+            authStatusFilter: localStorage.getItem("cliproxyapi.authStatusFilter") || "all",
+            authCatalog: [],
+            authFiles: [],
+            authTotal: 0,
+            authTotalPages: 1,
+            authMatchedNames: [],
+            logsSearch: "",
+            logLimit: 200,
+            logLines: [],
+            autoRefreshLogs: false,
+            editingAuth: null,
+            logsTimer: null,
+        };
+
+        const logSearchAliases = {
+            usage_limit_reached: ["quota exceeded", ": quota", "quota"],
+            token_invalidated: ["invalidated", "invalid_request_error"],
+        };
+
+        const els = {
+            managementKey: document.getElementById("managementKey"),
+            saveKeyBtn: document.getElementById("saveKeyBtn"),
+            clearKeyBtn: document.getElementById("clearKeyBtn"),
+            reloadAllBtn: document.getElementById("reloadAllBtn"),
+            globalNotice: document.getElementById("globalNotice"),
+            connectionStatus: document.getElementById("connectionStatus"),
+            pageSizeSelect: document.getElementById("pageSizeSelect"),
+            authStatusFilter: document.getElementById("authStatusFilter"),
+            pageInfo: document.getElementById("pageInfo"),
+            prevPageBtn: document.getElementById("prevPageBtn"),
+            nextPageBtn: document.getElementById("nextPageBtn"),
+            refreshAuthBtn: document.getElementById("refreshAuthBtn"),
+            authContainer: document.getElementById("authContainer"),
+            authCurrentPage: document.getElementById("authCurrentPage"),
+            authTotalPages: document.getElementById("authTotalPages"),
+            authTotalCount: document.getElementById("authTotalCount"),
+            heroAuthTotal: document.getElementById("heroAuthTotal"),
+            heroAuthActive: document.getElementById("heroAuthActive"),
+            heroLogCount: document.getElementById("heroLogCount"),
+            viewSwitcher: document.getElementById("viewSwitcher"),
+            logSearchInput: document.getElementById("logSearchInput"),
+            searchLogsBtn: document.getElementById("searchLogsBtn"),
+            clearLogsSearchBtn: document.getElementById("clearLogsSearchBtn"),
+            logLimitSelect: document.getElementById("logLimitSelect"),
+            autoRefreshLogs: document.getElementById("autoRefreshLogs"),
+            logsNotice: document.getElementById("logsNotice"),
+            logOutput: document.getElementById("logOutput"),
+            editBackdrop: document.getElementById("editBackdrop"),
+            editTitle: document.getElementById("editTitle"),
+            editSubtitle: document.getElementById("editSubtitle"),
+            editPrefix: document.getElementById("editPrefix"),
+            editProxyUrl: document.getElementById("editProxyUrl"),
+            editPriority: document.getElementById("editPriority"),
+            saveEditBtn: document.getElementById("saveEditBtn"),
+            cancelEditBtn: document.getElementById("cancelEditBtn"),
+        };
+
+        function setNotice(target, message, type = "") {
+            target.textContent = message || "";
+            target.className = "notice" + (type ? " " + type : "");
+        }
+
+        function setConnection(connected, message) {
+            els.connectionStatus.classList.toggle("connected", connected);
+            els.connectionStatus.querySelector("span:last-child").textContent = message;
+        }
+
+        async function api(path, options = {}) {
+            const headers = new Headers(options.headers || {});
+            headers.set("Content-Type", "application/json");
+            if (state.key) {
+                headers.set("Authorization", "Bearer " + state.key);
+            }
+            const response = await fetch(path, {
+                ...options,
+                headers,
+            });
+
+            const contentType = response.headers.get("content-type") || "";
+            const isJSON = contentType.includes("application/json");
+            const payload = isJSON ? await response.json() : await response.text();
+            if (!response.ok) {
+                const message = typeof payload === "string"
+                    ? payload
+                    : payload && payload.error
+                        ? payload.error
+                        : "Request failed";
+                throw new Error(message);
+            }
+            return payload;
+        }
+
+        async function verifyKey() {
+            try {
+                await api("/v0/management/auth-files?page=1&page_size=1");
+                setConnection(true, "Connected");
+                setNotice(els.globalNotice, "管理密钥可用。", "success");
+                return true;
+            } catch (error) {
+                setConnection(false, "Auth failed");
+                setNotice(els.globalNotice, error.message, "error");
+                return false;
+            }
+        }
+
+        function rememberState() {
+            localStorage.setItem("cliproxyapi.managementKey", state.key);
+            localStorage.setItem("cliproxyapi.authPageSize", String(state.authPageSize));
+            localStorage.setItem("cliproxyapi.authView", state.authView);
+            localStorage.setItem("cliproxyapi.authStatusFilter", state.authStatusFilter);
+        }
+
+        function updateHeroStats() {
+            const catalog = state.authCatalog.length ? state.authCatalog : state.authFiles;
+            const active = catalog.filter((item) => !item.disabled).length;
+            const logMetric = state.logsSearch ? state.authMatchedNames.length : state.logLines.length;
+            els.heroAuthTotal.textContent = String(catalog.length || 0);
+            els.heroAuthActive.textContent = String(active);
+            els.heroLogCount.textContent = String(logMetric);
+        }
+
+        function dedupeTerms(terms) {
+            const seen = new Set();
+            return terms.filter((term) => {
+                if (!term || seen.has(term)) {
+                    return false;
+                }
+                seen.add(term);
+                return true;
+            });
+        }
+
+        function expandLogSearchTerms(query) {
+            const normalized = String(query || "").trim().toLowerCase();
+            if (!normalized) {
+                return [];
+            }
+
+            const compact = normalized.replace(/[\s_-]+/g, "");
+            const spaced = normalized.replace(/[_-]+/g, " ");
+            const aliases = logSearchAliases[normalized] || logSearchAliases[compact] || [];
+            return dedupeTerms([normalized, compact, spaced, ...aliases].map((term) => String(term || "").trim().toLowerCase()));
+        }
+
+        function authFieldValues(item) {
+            return [
+                item?.name,
+                item?.id,
+                item?.email,
+                item?.provider,
+                item?.type,
+                item?.status_message,
+                item?.prefix,
+                item?.proxy_url,
+                item?.label,
+                item?.note,
+            ].map((value) => String(value || "").toLowerCase()).filter(Boolean);
+        }
+
+        function authMatchesTerms(item, terms) {
+            if (!terms.length) {
+                return false;
+            }
+            const fields = authFieldValues(item);
+            return terms.some((term) => fields.some((field) => field.includes(term)));
+        }
+
+        function rebuildAuthMatches() {
+            if (!state.logsSearch || !state.authCatalog.length) {
+                state.authMatchedNames = [];
+                return;
+            }
+
+            const terms = expandLogSearchTerms(state.logsSearch);
+            const lines = state.logLines.map((line) => String(line || "").toLowerCase());
+            const matched = new Set();
+
+            state.authCatalog.forEach((item) => {
+                const name = String(item?.name || "").trim();
+                if (!name) {
+                    return;
+                }
+                const nameLower = name.toLowerCase();
+                const emailLower = String(item?.email || "").toLowerCase();
+                const idLower = String(item?.id || "").toLowerCase();
+                const lineMatched = lines.some((line) =>
+                    line.includes(nameLower) ||
+                    (emailLower && line.includes(emailLower)) ||
+                    (idLower && line.includes(idLower)),
+                );
+                if (lineMatched || authMatchesTerms(item, terms)) {
+                    matched.add(name);
+                }
+            });
+
+            state.authMatchedNames = Array.from(matched).sort((left, right) => left.localeCompare(right));
+        }
+
+        function visibleAuthCatalog() {
+            let catalog = state.authCatalog;
+            if (state.authStatusFilter === "enabled") {
+                catalog = catalog.filter((item) => !item.disabled);
+            } else if (state.authStatusFilter === "disabled") {
+                catalog = catalog.filter((item) => !!item.disabled);
+            }
+            if (!state.logsSearch) {
+                return catalog;
+            }
+            if (!state.authMatchedNames.length) {
+                return [];
+            }
+            const matched = new Set(state.authMatchedNames);
+            return catalog.filter((item) => matched.has(item.name));
+        }
+
+        function renderAuthFiles() {
+            const catalog = visibleAuthCatalog();
+            const total = catalog.length;
+            const totalPages = Math.max(1, Math.ceil(total / Math.max(1, state.authPageSize)));
+            if (state.authPage > totalPages) {
+                state.authPage = totalPages;
+            }
+            if (state.authPage < 1) {
+                state.authPage = 1;
+            }
+
+            const start = (state.authPage - 1) * state.authPageSize;
+            const currentPageItems = catalog.slice(start, start + state.authPageSize);
+            state.authFiles = currentPageItems;
+            state.authTotal = total;
+            state.authTotalPages = totalPages;
+
+            els.authCurrentPage.textContent = String(state.authPage);
+            els.authTotalPages.textContent = String(totalPages);
+            els.authTotalCount.textContent = String(total);
+            els.pageInfo.textContent = `第 ${state.authPage} / ${state.authTotalPages || 1} 页`;
+            updateHeroStats();
+
+            [...els.viewSwitcher.querySelectorAll("button")].forEach((button) => {
+                button.classList.toggle("active", button.dataset.view === state.authView);
+            });
+
+            els.pageInfo.textContent = `第 ${state.authPage} / ${totalPages} 页`;
+
+            if (!currentPageItems.length) {
+                const emptyCopy = state.logsSearch
+                    ? "没有找到匹配该日志搜索条件的认证文件。"
+                    : "当前页没有认证文件。";
+                els.authContainer.innerHTML = `<div class="empty">${emptyCopy}</div>`;
+                return;
+            }
+
+            if (state.authView === "card") {
+                els.authContainer.innerHTML = `
+                    <div class="auth-grid">
+                        ${currentPageItems.map(renderAuthCard).join("")}
+                    </div>
+                `;
+                return;
+            }
+
+            els.authContainer.innerHTML = `
+                <div class="auth-table-wrap">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Name</th>
+                                <th>Provider</th>
+                                <th>Email</th>
+                                <th>Status</th>
+                                <th>Message</th>
+                                <th>Prefix / Proxy / Priority</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${currentPageItems.map(renderAuthRow).join("")}
+                        </tbody>
+                    </table>
+                </div>
+            `;
+        }
+
+        function authStatusTag(item) {
+            const active = !item.disabled;
+            const label = active ? "Active" : "Disabled";
+            const klass = active ? "active" : "disabled";
+            return `<span class="status-tag ${klass}">${label}</span>`;
+        }
+
+        function escapeHTML(value) {
+            return String(value ?? "")
+                .replaceAll("&", "&amp;")
+                .replaceAll("<", "&lt;")
+                .replaceAll(">", "&gt;")
+                .replaceAll('"', "&quot;");
+        }
+
+        function actionButtons(item) {
+            const searchSeed = item.status_message || item.email || item.name || "";
+            return `
+                <div class="row-actions">
+                    <button class="${item.disabled ? "btn-ok" : "btn-secondary"}" data-action="toggle" data-name="${encodeURIComponent(item.name)}" data-disabled="${item.disabled ? "1" : "0"}">
+                        ${item.disabled ? "启用" : "停用"}
+                    </button>
+                    <button class="btn-ghost" data-action="edit" data-name="${encodeURIComponent(item.name)}">编辑</button>
+                    <button class="btn-ghost" data-action="download" data-name="${encodeURIComponent(item.name)}">下载</button>
+                    <button class="btn-ghost" data-action="logs" data-query="${encodeURIComponent(searchSeed)}">查日志</button>
+                    <button class="btn-danger" data-action="delete" data-name="${encodeURIComponent(item.name)}">删除</button>
+                </div>
+            `;
+        }
+
+        function fieldSummary(item) {
+            const prefix = item.prefix || "-";
+            const proxy = item.proxy_url || "-";
+            const priority = item.priority ?? "-";
+            return `
+                <div><strong>Prefix:</strong> <span class="mono">${escapeHTML(prefix)}</span></div>
+                <div><strong>Proxy:</strong> <span class="mono">${escapeHTML(proxy)}</span></div>
+                <div><strong>Priority:</strong> <span class="mono">${escapeHTML(priority)}</span></div>
+            `;
+        }
+
+        function renderAuthRow(item) {
+            return `
+                <tr>
+                    <td class="mono">${escapeHTML(item.name || "-")}</td>
+                    <td>${escapeHTML(item.provider || item.type || "-")}</td>
+                    <td>${escapeHTML(item.email || "-")}</td>
+                    <td>${authStatusTag(item)}</td>
+                    <td class="mono">${escapeHTML(item.status_message || "-")}</td>
+                    <td class="auth-card-meta">${fieldSummary(item)}</td>
+                    <td>${actionButtons(item)}</td>
+                </tr>
+            `;
+        }
+
+        function renderAuthCard(item) {
+            return `
+                <article class="auth-card">
+                    <div class="auth-card-top">
+                        <div>
+                            <h3 class="mono">${escapeHTML(item.name || "-")}</h3>
+                            <div class="muted">${escapeHTML(item.provider || item.type || "-")}</div>
+                        </div>
+                        ${authStatusTag(item)}
+                    </div>
+                    <div class="auth-card-meta">
+                        <div><strong>Email</strong>${escapeHTML(item.email || "-")}</div>
+                        <div><strong>Message</strong><span class="mono">${escapeHTML(item.status_message || "-")}</span></div>
+                        <div>${fieldSummary(item)}</div>
+                    </div>
+                    <div class="auth-card-actions">
+                        ${actionButtons(item)}
+                    </div>
+                </article>
+            `;
+        }
+
+        async function fetchAuthFiles() {
+            try {
+                const payload = await api("/v0/management/auth-files");
+                state.authCatalog = Array.isArray(payload.files) ? payload.files : [];
+                rebuildAuthMatches();
+                renderAuthFiles();
+                setNotice(els.globalNotice, `已加载 ${state.authCatalog.length} 个认证文件。`, "success");
+            } catch (error) {
+                state.authCatalog = [];
+                state.authFiles = [];
+                state.authTotal = 0;
+                state.authTotalPages = 1;
+                state.authMatchedNames = [];
+                renderAuthFiles();
+                setNotice(els.globalNotice, error.message, "error");
+            }
+        }
+
+        function renderLogs() {
+            updateHeroStats();
+            if (!state.logLines.length) {
+                els.logOutput.innerHTML = "<pre>暂无匹配日志。</pre>";
+                return;
+            }
+            els.logOutput.innerHTML = `<pre>${escapeHTML(state.logLines.join("\n"))}</pre>`;
+        }
+
+        async function fetchLogs() {
+            const params = new URLSearchParams();
+            if (state.logsSearch) {
+                params.set("search", state.logsSearch);
+            }
+            if (state.logLimit > 0) {
+                params.set("limit", String(state.logLimit));
+            }
+            try {
+                const payload = await api(`/v0/management/logs?${params.toString()}`);
+                state.logLines = Array.isArray(payload.lines) ? payload.lines : [];
+                rebuildAuthMatches();
+                renderLogs();
+                renderAuthFiles();
+                const matchedCount = state.logsSearch ? state.authMatchedNames.length : 0;
+                const suffix = state.logsSearch ? `，匹配 ${matchedCount} 个认证文件。` : "。";
+                setNotice(els.logsNotice, `日志返回 ${state.logLines.length} 行${suffix}`, "success");
+            } catch (error) {
+                state.logLines = [];
+                state.authMatchedNames = [];
+                renderLogs();
+                renderAuthFiles();
+                setNotice(els.logsNotice, error.message, "error");
+            }
+        }
+
+        async function toggleAuth(name, disabledNow) {
+            await api("/v0/management/auth-files/status", {
+                method: "PATCH",
+                body: JSON.stringify({
+                    name,
+                    disabled: !disabledNow,
+                }),
+            });
+        }
+
+        async function deleteAuth(name) {
+            const response = await fetch(`/v0/management/auth-files?name=${encodeURIComponent(name)}`, {
+                method: "DELETE",
+                headers: state.key ? { Authorization: "Bearer " + state.key } : {},
+            });
+            if (!response.ok) {
+                const text = await response.text();
+                throw new Error(text || "Delete failed");
+            }
+        }
+
+        async function downloadAuth(name) {
+            const response = await fetch(`/v0/management/auth-files/download?name=${encodeURIComponent(name)}`, {
+                headers: state.key ? { Authorization: "Bearer " + state.key } : {},
+            });
+            if (!response.ok) {
+                throw new Error(await response.text() || "Download failed");
+            }
+            const blob = await response.blob();
+            const url = URL.createObjectURL(blob);
+            const anchor = document.createElement("a");
+            anchor.href = url;
+            anchor.download = name;
+            anchor.click();
+            URL.revokeObjectURL(url);
+        }
+
+        function openEditDialog(name) {
+            const item = state.authFiles.find((entry) => entry.name === name);
+            if (!item) {
+                return;
+            }
+            state.editingAuth = item;
+            els.editTitle.textContent = `编辑 ${name}`;
+            els.editSubtitle.textContent = `Provider: ${item.provider || item.type || "-"} · Email: ${item.email || "-"}`;
+            els.editPrefix.value = item.prefix || "";
+            els.editProxyUrl.value = item.proxy_url || "";
+            els.editPriority.value = item.priority ?? "";
+            els.editBackdrop.classList.add("open");
+        }
+
+        function closeEditDialog() {
+            state.editingAuth = null;
+            els.editBackdrop.classList.remove("open");
+        }
+
+        async function saveEditDialog() {
+            if (!state.editingAuth) {
+                return;
+            }
+            const payload = {
+                name: state.editingAuth.name,
+                prefix: els.editPrefix.value.trim(),
+                proxy_url: els.editProxyUrl.value.trim(),
+            };
+            const priorityRaw = els.editPriority.value.trim();
+            if (priorityRaw !== "") {
+                payload.priority = Number(priorityRaw);
+            }
+            await api("/v0/management/auth-files/fields", {
+                method: "PATCH",
+                body: JSON.stringify(payload),
+            });
+            closeEditDialog();
+            await fetchAuthFiles();
+        }
+
+        function setLogsSearch(query) {
+            state.logsSearch = (query || "").trim();
+            els.logSearchInput.value = state.logsSearch;
+            fetchLogs();
+        }
+
+        function setAutoRefresh(enabled) {
+            state.autoRefreshLogs = enabled;
+            if (state.logsTimer) {
+                clearInterval(state.logsTimer);
+                state.logsTimer = null;
+            }
+            if (enabled) {
+                state.logsTimer = setInterval(() => {
+                    fetchLogs();
+                }, 5000);
+            }
+        }
+
+        async function reloadAll() {
+            const verified = await verifyKey();
+            if (!verified) {
+                return;
+            }
+            await Promise.all([fetchAuthFiles(), fetchLogs()]);
+        }
+
+        function bindEvents() {
+            els.managementKey.value = state.key;
+            els.pageSizeSelect.value = String(state.authPageSize);
+            els.authStatusFilter.value = state.authStatusFilter;
+            els.logLimitSelect.value = String(state.logLimit);
+
+            els.saveKeyBtn.addEventListener("click", async () => {
+                state.key = els.managementKey.value.trim();
+                rememberState();
+                await reloadAll();
+            });
+
+            els.clearKeyBtn.addEventListener("click", () => {
+                state.key = "";
+                els.managementKey.value = "";
+                rememberState();
+                setConnection(false, "Not connected");
+                setNotice(els.globalNotice, "已清空本地管理密钥。");
+            });
+
+            els.reloadAllBtn.addEventListener("click", reloadAll);
+            els.refreshAuthBtn.addEventListener("click", fetchAuthFiles);
+
+            els.prevPageBtn.addEventListener("click", () => {
+                if (state.authPage > 1) {
+                    state.authPage -= 1;
+                    fetchAuthFiles();
+                }
+            });
+
+            els.nextPageBtn.addEventListener("click", () => {
+                if (state.authPage < state.authTotalPages) {
+                    state.authPage += 1;
+                    fetchAuthFiles();
+                }
+            });
+
+            els.pageSizeSelect.addEventListener("change", () => {
+                state.authPageSize = Number(els.pageSizeSelect.value || "100");
+                state.authPage = 1;
+                rememberState();
+                fetchAuthFiles();
+            });
+
+            els.authStatusFilter.addEventListener("change", () => {
+                state.authStatusFilter = els.authStatusFilter.value || "all";
+                state.authPage = 1;
+                rememberState();
+                renderAuthFiles();
+            });
+
+            els.viewSwitcher.addEventListener("click", (event) => {
+                const button = event.target.closest("button[data-view]");
+                if (!button) {
+                    return;
+                }
+                state.authView = button.dataset.view;
+                rememberState();
+                renderAuthFiles();
+            });
+
+            els.authContainer.addEventListener("click", async (event) => {
+                const button = event.target.closest("button[data-action]");
+                if (!button) {
+                    return;
+                }
+                const action = button.dataset.action;
+                const name = decodeURIComponent(button.dataset.name || "");
+                try {
+                    if (action === "toggle") {
+                        await toggleAuth(name, button.dataset.disabled === "1");
+                        await fetchAuthFiles();
+                        setNotice(els.globalNotice, `${name} 状态已更新。`, "success");
+                    } else if (action === "delete") {
+                        if (!window.confirm(`确认删除 ${name} 吗？`)) {
+                            return;
+                        }
+                        await deleteAuth(name);
+                        await fetchAuthFiles();
+                        setNotice(els.globalNotice, `${name} 已删除。`, "success");
+                    } else if (action === "download") {
+                        await downloadAuth(name);
+                        setNotice(els.globalNotice, `${name} 已开始下载。`, "success");
+                    } else if (action === "edit") {
+                        openEditDialog(name);
+                    } else if (action === "logs") {
+                        const query = decodeURIComponent(button.dataset.query || "");
+                        setLogsSearch(query);
+                        setNotice(els.logsNotice, `已按 "${query}" 搜索日志。`, "success");
+                    }
+                } catch (error) {
+                    setNotice(els.globalNotice, error.message, "error");
+                }
+            });
+
+            els.searchLogsBtn.addEventListener("click", () => {
+                state.logsSearch = els.logSearchInput.value.trim();
+                fetchLogs();
+            });
+
+            els.clearLogsSearchBtn.addEventListener("click", () => {
+                setLogsSearch("");
+                setNotice(els.logsNotice, "已清除日志搜索条件。");
+            });
+
+            els.logLimitSelect.addEventListener("change", () => {
+                state.logLimit = Number(els.logLimitSelect.value || "200");
+                fetchLogs();
+            });
+
+            els.autoRefreshLogs.addEventListener("change", () => {
+                setAutoRefresh(els.autoRefreshLogs.checked);
+            });
+
+            els.saveEditBtn.addEventListener("click", async () => {
+                try {
+                    await saveEditDialog();
+                    setNotice(els.globalNotice, "认证文件字段已保存。", "success");
+                } catch (error) {
+                    setNotice(els.globalNotice, error.message, "error");
+                }
+            });
+
+            els.cancelEditBtn.addEventListener("click", closeEditDialog);
+            els.editBackdrop.addEventListener("click", (event) => {
+                if (event.target === els.editBackdrop) {
+                    closeEditDialog();
+                }
+            });
+        }
+
+        bindEvents();
+        renderAuthFiles();
+        renderLogs();
+        if (state.key) {
+            reloadAll();
+        }
+    </script>
+</body>
+</html>

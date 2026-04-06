@@ -14,6 +14,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/access/apikeypolicy"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
@@ -259,6 +260,9 @@ type BaseAPIHandler struct {
 	// AuthManager manages auth lifecycle and execution in the new architecture.
 	AuthManager *coreauth.Manager
 
+	// APIKeyPolicyManager enforces per-client-key model/rate/concurrency quotas.
+	APIKeyPolicyManager *apikeypolicy.Manager
+
 	// Cfg holds the current application configuration.
 	Cfg *config.SDKConfig
 }
@@ -277,6 +281,14 @@ func NewBaseAPIHandlers(cfg *config.SDKConfig, authManager *coreauth.Manager) *B
 		Cfg:         cfg,
 		AuthManager: authManager,
 	}
+}
+
+// SetAPIKeyPolicyManager updates the API key policy manager reference.
+func (h *BaseAPIHandler) SetAPIKeyPolicyManager(manager *apikeypolicy.Manager) {
+	if h == nil {
+		return
+	}
+	h.APIKeyPolicyManager = manager
 }
 
 // UpdateClients updates the handlers' client list and configuration.
@@ -472,6 +484,13 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 	if errMsg != nil {
 		return nil, nil, errMsg
 	}
+	policyLease, policyErr := h.acquireAPIKeyPolicyLease(ctx, normalizedModel)
+	if policyErr != nil {
+		return nil, nil, policyErr
+	}
+	if policyLease != nil {
+		defer policyLease.Release()
+	}
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
 	payload := rawJSON
@@ -517,6 +536,13 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 	providers, normalizedModel, errMsg := h.getRequestDetails(modelName)
 	if errMsg != nil {
 		return nil, nil, errMsg
+	}
+	policyLease, policyErr := h.acquireAPIKeyPolicyLease(ctx, normalizedModel)
+	if policyErr != nil {
+		return nil, nil, policyErr
+	}
+	if policyLease != nil {
+		defer policyLease.Release()
 	}
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
@@ -568,6 +594,13 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 		close(errChan)
 		return nil, nil, errChan
 	}
+	policyLease, policyErr := h.acquireAPIKeyPolicyLease(ctx, normalizedModel)
+	if policyErr != nil {
+		errChan := make(chan *interfaces.ErrorMessage, 1)
+		errChan <- policyErr
+		close(errChan)
+		return nil, nil, errChan
+	}
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
 	payload := rawJSON
@@ -587,6 +620,9 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 	opts.Metadata = reqMeta
 	streamResult, err := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
 	if err != nil {
+		if policyLease != nil {
+			policyLease.Release()
+		}
 		errChan := make(chan *interfaces.ErrorMessage, 1)
 		status := http.StatusInternalServerError
 		if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
@@ -618,6 +654,9 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 	dataChan := make(chan []byte)
 	errChan := make(chan *interfaces.ErrorMessage, 1)
 	go func() {
+		if policyLease != nil {
+			defer policyLease.Release()
+		}
 		defer close(dataChan)
 		defer close(errChan)
 		sentPayload := false
@@ -731,6 +770,62 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 		}
 	}()
 	return dataChan, upstreamHeaders, errChan
+}
+
+func (h *BaseAPIHandler) acquireAPIKeyPolicyLease(ctx context.Context, modelName string) (apikeypolicy.Lease, *interfaces.ErrorMessage) {
+	if h == nil || h.APIKeyPolicyManager == nil {
+		return nil, nil
+	}
+	apiKey := apiKeyFromContext(ctx)
+	if apiKey == "" {
+		return nil, nil
+	}
+
+	lease, err := h.APIKeyPolicyManager.Acquire(ctx, apiKey, modelName)
+	if err == nil {
+		return lease, nil
+	}
+
+	status := http.StatusTooManyRequests
+	if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
+		if code := se.StatusCode(); code > 0 {
+			status = code
+		}
+	}
+	var addon http.Header
+	if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
+		if hdr := he.Headers(); hdr != nil {
+			addon = hdr.Clone()
+		}
+	}
+
+	return nil, &interfaces.ErrorMessage{
+		StatusCode: status,
+		Error:      err,
+		Addon:      addon,
+	}
+}
+
+func apiKeyFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	ginCtx, ok := ctx.Value("gin").(*gin.Context)
+	if !ok || ginCtx == nil {
+		return ""
+	}
+	raw, exists := ginCtx.Get("apiKey")
+	if !exists {
+		return ""
+	}
+	switch value := raw.(type) {
+	case string:
+		return strings.TrimSpace(value)
+	case fmt.Stringer:
+		return strings.TrimSpace(value.String())
+	default:
+		return strings.TrimSpace(fmt.Sprintf("%v", value))
+	}
 }
 
 func validateSSEDataJSON(chunk []byte) error {

@@ -1,0 +1,34 @@
+- generic [ref=e3]:
+  - generic [ref=e5]:
+    - generic [ref=e6]: CLI
+    - generic [ref=e7]: PROXY
+    - generic [ref=e8]: API
+  - generic [ref=e10]:
+    - img "Logo" [ref=e11]
+    - generic [ref=e12]:
+      - generic [ref=e13]:
+        - generic [ref=e14]:
+          - generic [ref=e15]: CLI Proxy API Management Center
+          - combobox "Language" [ref=e16] [cursor=pointer]:
+            - option "中文"
+            - option "English" [selected]
+            - option "Русский"
+        - generic [ref=e17]: Please enter connection information to access the management interface
+      - generic [ref=e18]:
+        - generic [ref=e19]: Current URL
+        - generic [ref=e20]: http://127.0.0.1:8317
+        - generic [ref=e21]: The system will automatically use the current URL for connection
+      - generic [ref=e22] [cursor=pointer]:
+        - checkbox "Custom Connection URL:" [ref=e23]
+        - generic [ref=e24]: "Custom Connection URL:"
+      - generic [ref=e25]:
+        - generic [ref=e26]: "Management Key:"
+        - generic [ref=e27]:
+          - textbox "Enter the management key" [active] [ref=e28]
+          - button "显示密钥" [ref=e30] [cursor=pointer]:
+            - img [ref=e31]
+      - generic [ref=e34] [cursor=pointer]:
+        - checkbox "Remember password" [ref=e35]
+        - generic [ref=e36]: Remember password
+      - button "Login" [ref=e37] [cursor=pointer]:
+        - generic [ref=e38]: Login

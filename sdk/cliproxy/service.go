@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -15,16 +16,19 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor"
-	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
+	internalusage "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/watcher"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/wsrelay"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
-	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
+	sdkusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 	log "github.com/sirupsen/logrus"
 )
+
+const usagePersistenceDirName = ".cliproxy-state"
 
 // Service wraps the proxy server lifecycle so external programs can embed the CLI proxy.
 // It manages the complete lifecycle including authentication, file watching, HTTP server,
@@ -96,8 +100,8 @@ type Service struct {
 //
 // Parameters:
 //   - plugin: The usage plugin to register
-func (s *Service) RegisterUsagePlugin(plugin usage.Plugin) {
-	usage.RegisterPlugin(plugin)
+func (s *Service) RegisterUsagePlugin(plugin sdkusage.Plugin) {
+	sdkusage.RegisterPlugin(plugin)
 }
 
 // newDefaultAuthManager creates a default authentication manager with all supported providers.
@@ -480,7 +484,8 @@ func (s *Service) Run(ctx context.Context) error {
 		ctx = context.Background()
 	}
 
-	usage.StartDefault(ctx)
+	internalusage.SetStatisticsEnabled(s.cfg.UsageStatisticsEnabled)
+	sdkusage.StartDefault(ctx)
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
@@ -493,6 +498,7 @@ func (s *Service) Run(ctx context.Context) error {
 	if err := s.ensureAuthDir(); err != nil {
 		return err
 	}
+	s.initializeUsagePersistence(s.cfg)
 
 	s.applyRetryConfig(s.cfg)
 
@@ -625,6 +631,7 @@ func (s *Service) Run(ctx context.Context) error {
 		if newCfg == nil {
 			return
 		}
+		s.initializeUsagePersistence(newCfg)
 
 		nextStrategy := strings.ToLower(strings.TrimSpace(newCfg.Routing.Strategy))
 		normalizeStrategy := func(strategy string) string {
@@ -663,7 +670,11 @@ func (s *Service) Run(ctx context.Context) error {
 		s.rebindExecutors()
 	}
 
-	watcherWrapper, err = s.watcherFactory(s.configPath, s.cfg.AuthDir, reloadCallback)
+	resolvedAuthDir, err := util.ResolveAuthDir(s.cfg.AuthDir)
+	if err != nil {
+		return fmt.Errorf("cliproxy: failed to resolve auth directory for watcher: %w", err)
+	}
+	watcherWrapper, err = s.watcherFactory(s.configPath, resolvedAuthDir, reloadCallback)
 	if err != nil {
 		return fmt.Errorf("cliproxy: failed to create watcher: %w", err)
 	}
@@ -763,25 +774,70 @@ func (s *Service) Shutdown(ctx context.Context) error {
 			}
 		}
 
-		usage.StopDefault()
+		sdkusage.StopDefault()
+		if internalusage.GetPersistentPlugin() != nil {
+			if err := internalusage.SaveStatistics(); err != nil {
+				log.Errorf("failed to save usage statistics: %v", err)
+				if shutdownErr == nil {
+					shutdownErr = err
+				}
+			}
+		}
 	})
 	return shutdownErr
 }
 
+func (s *Service) initializeUsagePersistence(cfg *config.Config) {
+	if cfg == nil || !cfg.UsageStatisticsEnabled {
+		return
+	}
+	if err := internalusage.InitializePersistence(resolveUsagePersistenceDir(cfg, s.configPath)); err != nil {
+		log.WithError(err).Warn("failed to initialize usage statistics persistence")
+	}
+}
+
+func resolveUsagePersistenceDir(cfg *config.Config, configPath string) string {
+	if writablePath := util.WritablePath(); writablePath != "" {
+		return filepath.Join(writablePath, usagePersistenceDirName)
+	}
+	if cfg != nil {
+		if authDir, err := util.ResolveAuthDir(cfg.AuthDir); err == nil && strings.TrimSpace(authDir) != "" {
+			return filepath.Join(authDir, usagePersistenceDirName)
+		}
+	}
+	if trimmedConfigPath := strings.TrimSpace(configPath); trimmedConfigPath != "" {
+		if absPath, err := filepath.Abs(trimmedConfigPath); err == nil {
+			trimmedConfigPath = absPath
+		}
+		return filepath.Join(filepath.Dir(trimmedConfigPath), usagePersistenceDirName)
+	}
+	if wd, err := os.Getwd(); err == nil && strings.TrimSpace(wd) != "" {
+		return filepath.Join(wd, usagePersistenceDirName)
+	}
+	return filepath.Join(os.TempDir(), usagePersistenceDirName)
+}
+
 func (s *Service) ensureAuthDir() error {
-	info, err := os.Stat(s.cfg.AuthDir)
+	authDir, err := util.ResolveAuthDir(s.cfg.AuthDir)
+	if err != nil {
+		return fmt.Errorf("cliproxy: failed to resolve auth directory %s: %w", s.cfg.AuthDir, err)
+	}
+	if strings.TrimSpace(authDir) == "" {
+		return fmt.Errorf("cliproxy: auth directory is empty or not configured")
+	}
+	info, err := os.Stat(authDir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			if mkErr := os.MkdirAll(s.cfg.AuthDir, 0o755); mkErr != nil {
-				return fmt.Errorf("cliproxy: failed to create auth directory %s: %w", s.cfg.AuthDir, mkErr)
+			if mkErr := os.MkdirAll(authDir, 0o755); mkErr != nil {
+				return fmt.Errorf("cliproxy: failed to create auth directory %s: %w", authDir, mkErr)
 			}
-			log.Infof("created missing auth directory: %s", s.cfg.AuthDir)
+			log.Infof("created missing auth directory: %s", authDir)
 			return nil
 		}
-		return fmt.Errorf("cliproxy: error checking auth directory %s: %w", s.cfg.AuthDir, err)
+		return fmt.Errorf("cliproxy: error checking auth directory %s: %w", authDir, err)
 	}
 	if !info.IsDir() {
-		return fmt.Errorf("cliproxy: auth path exists but is not a directory: %s", s.cfg.AuthDir)
+		return fmt.Errorf("cliproxy: auth path exists but is not a directory: %s", authDir)
 	}
 	return nil
 }

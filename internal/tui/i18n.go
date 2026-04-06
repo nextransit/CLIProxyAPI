@@ -136,8 +136,8 @@ var zhStrings = map[string]string{
 
 	// ── Auth Files ──
 	"auth_title":      "🔑 认证文件",
-	"auth_help1":      " [↑↓/jk] 导航 • [Enter] 展开 • [e] 启用/停用 • [d] 删除 • [r] 刷新",
-	"auth_help2":      " [1] 编辑 prefix • [2] 编辑 proxy_url • [3] 编辑 priority",
+	"auth_help1":      " [↑↓/jk] 导航 • [Enter] 展开 • [v] 列表/卡片 • [n/p] 翻页 • [r] 刷新",
+	"auth_help2":      " [e] 启用/停用 • [d] 删除 • [1/2/3] 编辑字段 • [s] 每页条数 • [l] 搜索日志",
 	"no_auth_files":   "  无认证文件",
 	"confirm_delete":  "⚠ 删除 %s? [y/n]",
 	"deleted":         "已删除 %s",
@@ -146,6 +146,12 @@ var zhStrings = map[string]string{
 	"updated_field":   "已更新 %s 的 %s",
 	"status_active":   "活跃",
 	"status_disabled": "已停用",
+	"view_mode":       "视图",
+	"view_list":       "列表",
+	"view_card":       "卡片",
+	"page_label":      "页码",
+	"page_size_label": "每页",
+	"total_label":     "总数",
 
 	// ── API Keys ──
 	"keys_title":         "🔐 API 密钥",
@@ -203,13 +209,15 @@ var zhStrings = map[string]string{
 	"usage_reasoning":     "思考",
 
 	// ── Logs ──
-	"logs_title":       "📋 日志",
-	"logs_auto_scroll": "● 自动滚动",
-	"logs_paused":      "○ 已暂停",
-	"logs_filter":      "过滤",
-	"logs_lines":       "行数",
-	"logs_help":        " [a] 自动滚动 • [c] 清除 • [1] 全部 [2] info+ [3] warn+ [4] error • [↑↓] 滚动",
-	"logs_waiting":     "  等待日志输出...",
+	"logs_title":         "📋 日志",
+	"logs_auto_scroll":   "● 自动滚动",
+	"logs_paused":        "○ 已暂停",
+	"logs_filter":        "过滤",
+	"logs_search":        "搜索",
+	"logs_lines":         "行数",
+	"logs_help":          " [/] 搜索 • [x] 清除搜索 • [a] 自动滚动 • [c] 清空缓存 • [1] 全部 [2] info+ [3] warn+ [4] error • [↑↓] 滚动",
+	"logs_search_submit": "Enter: 应用日志搜索 • Esc: 取消",
+	"logs_waiting":       "  等待日志输出...",
 }
 
 var enStrings = map[string]string{
@@ -287,8 +295,8 @@ var enStrings = map[string]string{
 
 	// ── Auth Files ──
 	"auth_title":      "🔑 Auth Files",
-	"auth_help1":      " [↑↓/jk] Navigate • [Enter] Expand • [e] Enable/Disable • [d] Delete • [r] Refresh",
-	"auth_help2":      " [1] Edit prefix • [2] Edit proxy_url • [3] Edit priority",
+	"auth_help1":      " [↑↓/jk] Navigate • [Enter] Expand • [v] List/Card • [n/p] Page • [r] Refresh",
+	"auth_help2":      " [e] Enable/Disable • [d] Delete • [1/2/3] Edit fields • [s] Page size • [l] Search logs",
 	"no_auth_files":   "  No auth files found",
 	"confirm_delete":  "⚠ Delete %s? [y/n]",
 	"deleted":         "Deleted %s",
@@ -297,6 +305,12 @@ var enStrings = map[string]string{
 	"updated_field":   "Updated %s on %s",
 	"status_active":   "active",
 	"status_disabled": "disabled",
+	"view_mode":       "View",
+	"view_list":       "List",
+	"view_card":       "Card",
+	"page_label":      "Page",
+	"page_size_label": "Per page",
+	"total_label":     "Total",
 
 	// ── API Keys ──
 	"keys_title":         "🔐 API Keys",
@@ -354,11 +368,13 @@ var enStrings = map[string]string{
 	"usage_reasoning":     "Reasoning",
 
 	// ── Logs ──
-	"logs_title":       "📋 Logs",
-	"logs_auto_scroll": "● AUTO-SCROLL",
-	"logs_paused":      "○ PAUSED",
-	"logs_filter":      "Filter",
-	"logs_lines":       "Lines",
-	"logs_help":        " [a] Auto-scroll • [c] Clear • [1] All [2] info+ [3] warn+ [4] error • [↑↓] Scroll",
-	"logs_waiting":     "  Waiting for log output...",
+	"logs_title":         "📋 Logs",
+	"logs_auto_scroll":   "● AUTO-SCROLL",
+	"logs_paused":        "○ PAUSED",
+	"logs_filter":        "Filter",
+	"logs_search":        "Search",
+	"logs_lines":         "Lines",
+	"logs_help":          " [/] Search • [x] Clear search • [a] Auto-scroll • [c] Clear buffer • [1] All [2] info+ [3] warn+ [4] error • [↑↓] Scroll",
+	"logs_search_submit": "Enter: apply log search • Esc: cancel",
+	"logs_waiting":       "  Waiting for log output...",
 }

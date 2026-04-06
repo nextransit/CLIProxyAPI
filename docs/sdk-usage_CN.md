@@ -75,6 +75,10 @@ svc, _ := cliproxy.NewBuilder().
 - 仅当 `config.yaml` 中设置了 `remote-management.secret-key` 时才会挂载管理端点。
 - 远程访问还需要 `remote-management.allow-remote: true`。
 - 具体端点见 MANAGEMENT_API_CN.md。内嵌服务器会在配置端口下暴露 `/v0/management`。
+- 内置认证文件/日志排障页位于 `/management-auth.html`。
+- `/management.html?builtin=1` 可强制使用内置页面，而不是外部管理面板资源。
+- 认证文件列表支持 `page` 和 `page_size` 分页，`page_size` 最大为 `100`。
+- 日志列表除 `after`、`limit` 外，还支持通过 `search`（或 `q`）做关键词搜索。
 
 ## 使用核心鉴权管理器
 
@@ -161,4 +165,3 @@ _ = svc.Shutdown(ctx)
 - 热更新：`config.yaml` 与 `auths/` 变化会被自动侦测并应用。
 - 请求日志可通过管理 API 在运行时开关。
 - `gemini-web.*` 相关配置在内嵌服务器中会被遵循。
-

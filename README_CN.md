@@ -64,6 +64,15 @@ CLIProxyAPI 用户手册： [https://help.router-for.me/](https://help.router-fo
 
 请参见 [MANAGEMENT_API_CN.md](https://help.router-for.me/cn/management/api)
 
+本地管理补充说明：
+
+- 内置认证文件/日志排障页：`/management-auth.html`
+- 即使配置了外部面板，也可强制打开内置页：`/management.html?builtin=1`
+- 认证文件分页：`/v0/management/auth-files?page=1&page_size=100`
+- 认证文件单页大小上限为 `100`
+- 日志关键词搜索：`/v0/management/logs?search=token_invalidated`
+- `q` 也可作为 `search` 查询参数的别名
+
 ## Amp CLI 支持
 
 CLIProxyAPI 已内置对 [Amp CLI](https://ampcode.com) 和 Amp IDE 扩展的支持，可让你使用自己的 Google/ChatGPT/Claude OAuth 订阅来配合 Amp 编码工具：

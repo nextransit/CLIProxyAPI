@@ -9,6 +9,13 @@ import internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 type SDKConfig = internalconfig.SDKConfig
 
 type Config = internalconfig.Config
+type APIKeyEntry = internalconfig.APIKeyEntry
+type APIKeyLimitSettings = internalconfig.APIKeyLimitSettings
+type APIKeyRateLimits = internalconfig.APIKeyRateLimits
+type APIKeyConcurrencyLimits = internalconfig.APIKeyConcurrencyLimits
+type APIKeyTokenLimits = internalconfig.APIKeyTokenLimits
+type APIKeyLifetimeTokenLimit = internalconfig.APIKeyLifetimeTokenLimit
+type APIKeyPeriodicTokenLimit = internalconfig.APIKeyPeriodicTokenLimit
 
 type StreamingConfig = internalconfig.StreamingConfig
 type TLSConfig = internalconfig.TLSConfig
@@ -33,6 +40,8 @@ type TLS = internalconfig.TLSConfig
 
 const (
 	DefaultPanelGitHubRepository = internalconfig.DefaultPanelGitHubRepository
+	APIKeyTokenWindowDay         = internalconfig.APIKeyTokenWindowDay
+	APIKeyTokenWindowMonth       = internalconfig.APIKeyTokenWindowMonth
 )
 
 func LoadConfig(configFile string) (*Config, error) { return internalconfig.LoadConfig(configFile) }

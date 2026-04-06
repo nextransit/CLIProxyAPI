@@ -24,6 +24,10 @@ type usageImportPayload struct {
 func (h *Handler) GetUsageStatistics(c *gin.Context) {
 	var snapshot usage.StatisticsSnapshot
 	if h != nil && h.usageStats != nil {
+		if _, err := usage.RestoreStatisticsIfEmpty(h.usageStats); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
 		snapshot = h.usageStats.Snapshot()
 	}
 	c.JSON(http.StatusOK, gin.H{
@@ -36,6 +40,10 @@ func (h *Handler) GetUsageStatistics(c *gin.Context) {
 func (h *Handler) ExportUsageStatistics(c *gin.Context) {
 	var snapshot usage.StatisticsSnapshot
 	if h != nil && h.usageStats != nil {
+		if _, err := usage.RestoreStatisticsIfEmpty(h.usageStats); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
 		snapshot = h.usageStats.Snapshot()
 	}
 	c.JSON(http.StatusOK, usageExportPayload{
@@ -70,10 +78,19 @@ func (h *Handler) ImportUsageStatistics(c *gin.Context) {
 
 	result := h.usageStats.MergeSnapshot(payload.Usage)
 	snapshot := h.usageStats.Snapshot()
-	c.JSON(http.StatusOK, gin.H{
+	response := gin.H{
 		"added":           result.Added,
 		"skipped":         result.Skipped,
 		"total_requests":  snapshot.TotalRequests,
 		"failed_requests": snapshot.FailureCount,
-	})
+	}
+	if usage.GetPersistentPlugin() != nil {
+		if err := usage.SaveStatistics(); err != nil {
+			response["persisted"] = false
+			response["persist_error"] = err.Error()
+		} else {
+			response["persisted"] = true
+		}
+	}
+	c.JSON(http.StatusOK, response)
 }

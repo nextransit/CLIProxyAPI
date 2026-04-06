@@ -5,24 +5,29 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 )
 
 // logsTabModel displays real-time log lines from hook/API source.
 type logsTabModel struct {
-	client     *Client
-	hook       *LogHook
-	viewport   viewport.Model
-	lines      []string
-	maxLines   int
-	autoScroll bool
-	width      int
-	height     int
-	ready      bool
-	filter     string // "", "debug", "info", "warn", "error"
-	after      int64
-	lastErr    error
+	client      *Client
+	hook        *LogHook
+	viewport    viewport.Model
+	lines       []string
+	maxLines    int
+	autoScroll  bool
+	width       int
+	height      int
+	ready       bool
+	filter      string // "", "debug", "info", "warn", "error"
+	search      string
+	searching   bool
+	searchInput textinput.Model
+	replaceNext bool
+	after       int64
+	lastErr     error
 }
 
 type logsPollMsg struct {
@@ -33,13 +38,19 @@ type logsPollMsg struct {
 
 type logsTickMsg struct{}
 type logLineMsg string
+type setLogsSearchMsg struct {
+	query string
+}
 
 func newLogsTabModel(client *Client, hook *LogHook) logsTabModel {
+	searchInput := textinput.New()
+	searchInput.CharLimit = 512
 	return logsTabModel{
-		client:     client,
-		hook:       hook,
-		maxLines:   5000,
-		autoScroll: true,
+		client:      client,
+		hook:        hook,
+		maxLines:    5000,
+		autoScroll:  true,
+		searchInput: searchInput,
 	}
 }
 
@@ -51,7 +62,7 @@ func (m logsTabModel) Init() tea.Cmd {
 }
 
 func (m logsTabModel) fetchLogs() tea.Msg {
-	lines, latest, err := m.client.GetLogs(m.after, 200)
+	lines, latest, err := m.client.GetLogsFiltered(m.after, 200, m.search)
 	return logsPollMsg{
 		lines:  lines,
 		latest: latest,
@@ -81,6 +92,20 @@ func (m logsTabModel) Update(msg tea.Msg) (logsTabModel, tea.Cmd) {
 	case localeChangedMsg:
 		m.viewport.SetContent(m.renderLogs())
 		return m, nil
+	case setLogsSearchMsg:
+		m.search = strings.TrimSpace(msg.query)
+		m.searching = false
+		m.searchInput.Blur()
+		m.lastErr = nil
+		m.after = 0
+		m.replaceNext = true
+		if m.hook == nil {
+			m.lines = nil
+			m.viewport.SetContent(m.renderLogs())
+			return m, m.fetchLogs
+		}
+		m.viewport.SetContent(m.renderLogs())
+		return m, nil
 	case logsTickMsg:
 		if m.hook != nil {
 			return m, nil
@@ -96,11 +121,16 @@ func (m logsTabModel) Update(msg tea.Msg) (logsTabModel, tea.Cmd) {
 			m.lastErr = nil
 			m.after = msg.latest
 			if len(msg.lines) > 0 {
-				m.lines = append(m.lines, msg.lines...)
+				if m.replaceNext {
+					m.lines = append([]string{}, msg.lines...)
+				} else {
+					m.lines = append(m.lines, msg.lines...)
+				}
 				if len(m.lines) > m.maxLines {
 					m.lines = m.lines[len(m.lines)-m.maxLines:]
 				}
 			}
+			m.replaceNext = false
 		}
 		m.viewport.SetContent(m.renderLogs())
 		if m.autoScroll {
@@ -119,6 +149,9 @@ func (m logsTabModel) Update(msg tea.Msg) (logsTabModel, tea.Cmd) {
 		return m, m.waitForLog
 
 	case tea.KeyMsg:
+		if m.searching {
+			return m.handleSearchInput(msg)
+		}
 		switch msg.String() {
 		case "a":
 			m.autoScroll = !m.autoScroll
@@ -131,6 +164,10 @@ func (m logsTabModel) Update(msg tea.Msg) (logsTabModel, tea.Cmd) {
 			m.lastErr = nil
 			m.viewport.SetContent(m.renderLogs())
 			return m, nil
+		case "/", "s":
+			return m.startSearch()
+		case "x":
+			return m, func() tea.Msg { return setLogsSearchMsg{query: ""} }
 		case "1":
 			m.filter = ""
 			m.viewport.SetContent(m.renderLogs())
@@ -171,6 +208,7 @@ func (m logsTabModel) Update(msg tea.Msg) (logsTabModel, tea.Cmd) {
 func (m *logsTabModel) SetSize(w, h int) {
 	m.width = w
 	m.height = h
+	m.searchInput.Width = w - 20
 	if !m.ready {
 		m.viewport = viewport.New(w, h)
 		m.viewport.SetContent(m.renderLogs())
@@ -199,15 +237,26 @@ func (m logsTabModel) renderLogs() string {
 	if m.filter != "" {
 		filterLabel = strings.ToUpper(m.filter) + "+"
 	}
+	searchLabel := T("not_set")
+	if m.search != "" {
+		searchLabel = m.search
+	}
 
-	header := fmt.Sprintf(" %s  %s  %s: %s  %s: %d",
-		T("logs_title"), scrollStatus, T("logs_filter"), filterLabel, T("logs_lines"), len(m.lines))
+	header := fmt.Sprintf(" %s  %s  %s: %s  %s: %s  %s: %d",
+		T("logs_title"), scrollStatus, T("logs_filter"), filterLabel, T("logs_search"), searchLabel, T("logs_lines"), len(m.lines))
 	sb.WriteString(titleStyle.Render(header))
 	sb.WriteString("\n")
 	sb.WriteString(helpStyle.Render(T("logs_help")))
 	sb.WriteString("\n")
 	sb.WriteString(strings.Repeat("─", m.width))
 	sb.WriteString("\n")
+
+	if m.searching {
+		sb.WriteString(m.searchInput.View())
+		sb.WriteString("\n")
+		sb.WriteString(helpStyle.Render("    " + T("logs_search_submit")))
+		sb.WriteString("\n")
+	}
 
 	if m.lastErr != nil {
 		sb.WriteString(errorStyle.Render("⚠ Error: " + m.lastErr.Error()))
@@ -220,7 +269,7 @@ func (m logsTabModel) renderLogs() string {
 	}
 
 	for _, line := range m.lines {
-		if m.filter != "" && !m.matchLevel(line) {
+		if !m.lineMatchesFilters(line) {
 			continue
 		}
 		styled := m.styleLine(line)
@@ -229,6 +278,43 @@ func (m logsTabModel) renderLogs() string {
 	}
 
 	return sb.String()
+}
+
+func (m logsTabModel) startSearch() (logsTabModel, tea.Cmd) {
+	m.searching = true
+	m.searchInput.Focus()
+	m.searchInput.Prompt = fmt.Sprintf("  %s: ", T("logs_search"))
+	m.searchInput.SetValue(m.search)
+	m.viewport.SetContent(m.renderLogs())
+	return m, textinput.Blink
+}
+
+func (m logsTabModel) handleSearchInput(msg tea.KeyMsg) (logsTabModel, tea.Cmd) {
+	switch msg.String() {
+	case "enter":
+		query := strings.TrimSpace(m.searchInput.Value())
+		return m, func() tea.Msg { return setLogsSearchMsg{query: query} }
+	case "esc":
+		m.searching = false
+		m.searchInput.Blur()
+		m.viewport.SetContent(m.renderLogs())
+		return m, nil
+	default:
+		var cmd tea.Cmd
+		m.searchInput, cmd = m.searchInput.Update(msg)
+		m.viewport.SetContent(m.renderLogs())
+		return m, cmd
+	}
+}
+
+func (m logsTabModel) lineMatchesFilters(line string) bool {
+	if m.search != "" && !strings.Contains(strings.ToLower(line), strings.ToLower(m.search)) {
+		return false
+	}
+	if m.filter != "" && !m.matchLevel(line) {
+		return false
+	}
+	return true
 }
 
 func (m logsTabModel) matchLevel(line string) bool {

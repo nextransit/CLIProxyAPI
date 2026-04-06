@@ -625,6 +625,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		cfg.MaxRetryCredentials = 0
 	}
 
+	// Sanitize client API key policy entries and derive the legacy flat key list.
+	cfg.SanitizeAPIKeyEntries()
+
 	// Sanitize Gemini API key configuration and migrate legacy entries.
 	cfg.SanitizeGeminiKeys()
 
@@ -669,6 +672,109 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Return the populated configuration struct.
 	return &cfg, nil
+}
+
+// SanitizeAPIKeyEntries normalizes top-level api-keys entries and derives the legacy flat key list.
+func (cfg *Config) SanitizeAPIKeyEntries() {
+	if cfg == nil {
+		return
+	}
+	if len(cfg.APIKeyEntries) == 0 {
+		cfg.APIKeys = nil
+		return
+	}
+
+	seen := make(map[string]struct{}, len(cfg.APIKeyEntries))
+	normalized := make([]APIKeyEntry, 0, len(cfg.APIKeyEntries))
+	keys := make([]string, 0, len(cfg.APIKeyEntries))
+	for _, entry := range cfg.APIKeyEntries {
+		entry.Key = strings.TrimSpace(entry.Key)
+		if entry.Key == "" {
+			continue
+		}
+		if _, exists := seen[entry.Key]; exists {
+			continue
+		}
+		seen[entry.Key] = struct{}{}
+
+		entry.Name = strings.TrimSpace(entry.Name)
+		entry.Description = strings.TrimSpace(entry.Description)
+		entry.Models = normalizeAPIKeyModelPatterns(entry.Models)
+		entry.Limits.Rate = sanitizeAPIKeyRateLimits(entry.Limits.Rate)
+		entry.Limits.Concurrency = sanitizeAPIKeyConcurrencyLimits(entry.Limits.Concurrency)
+		entry.Limits.Tokens = sanitizeAPIKeyTokenLimits(entry.Limits.Tokens)
+
+		normalized = append(normalized, entry)
+		keys = append(keys, entry.Key)
+	}
+
+	cfg.APIKeyEntries = normalized
+	cfg.APIKeys = keys
+}
+
+func normalizeAPIKeyModelPatterns(models []string) []string {
+	if len(models) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(models))
+	out := make([]string, 0, len(models))
+	for _, raw := range models {
+		trimmed := strings.ToLower(strings.TrimSpace(raw))
+		if trimmed == "" {
+			continue
+		}
+		if _, exists := seen[trimmed]; exists {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		out = append(out, trimmed)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func sanitizeAPIKeyRateLimits(limits APIKeyRateLimits) APIKeyRateLimits {
+	if limits.RPM < 0 {
+		limits.RPM = 0
+	}
+	if limits.QPS < 0 {
+		limits.QPS = 0
+	}
+	if limits.Burst < 0 {
+		limits.Burst = 0
+	}
+	return limits
+}
+
+func sanitizeAPIKeyConcurrencyLimits(limits APIKeyConcurrencyLimits) APIKeyConcurrencyLimits {
+	if limits.Max < 0 {
+		limits.Max = 0
+	}
+	if limits.QueueMax < 0 {
+		limits.QueueMax = 0
+	}
+	if limits.QueueTimeoutMS < 0 {
+		limits.QueueTimeoutMS = 0
+	}
+	return limits
+}
+
+func sanitizeAPIKeyTokenLimits(limits APIKeyTokenLimits) APIKeyTokenLimits {
+	if limits.Lifetime.Limit < 0 {
+		limits.Lifetime.Limit = 0
+	}
+	if limits.Periodic.Limit < 0 {
+		limits.Periodic.Limit = 0
+	}
+	limits.Periodic.Window = strings.ToLower(strings.TrimSpace(limits.Periodic.Window))
+	switch limits.Periodic.Window {
+	case "", APIKeyTokenWindowDay, APIKeyTokenWindowMonth:
+	default:
+		limits.Periodic.Window = ""
+	}
+	return limits
 }
 
 // SanitizePayloadRules validates raw JSON payload rule params and drops invalid rules.

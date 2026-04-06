@@ -230,3 +230,116 @@ func TestManager_MarkResult_RespectsAuthDisableCoolingOverride(t *testing.T) {
 		t.Fatalf("expected NextRetryAfter to be zero when disable_cooling=true, got %v", state.NextRetryAfter)
 	}
 }
+
+func TestManager_MarkResult_AutoDisablesDuomiClaudeOnInsufficientBalance(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	reg := registry.GetGlobalRegistry()
+
+	authID := "duomi-insufficient-" + uuid.NewString()
+	modelID := "duomi-model-" + uuid.NewString()
+	reg.RegisterClient(authID, "claude", []*registry.ModelInfo{{ID: modelID}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(authID)
+	})
+
+	auth := &Auth{
+		ID:       authID,
+		Provider: "claude",
+		Attributes: map[string]string{
+			"api_key":  "sk-test",
+			"base_url": "https://ai.duomi.uk",
+		},
+	}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	m.MarkResult(context.Background(), Result{
+		AuthID:   authID,
+		Provider: "claude",
+		Model:    modelID,
+		Success:  false,
+		Error: &Error{
+			HTTPStatus: http.StatusForbidden,
+			Message:    `{"error":{"message":"Insufficient account balance"}}`,
+		},
+	})
+
+	updated, ok := m.GetByID(authID)
+	if !ok || updated == nil {
+		t.Fatalf("expected auth to be present")
+	}
+	if !updated.Disabled {
+		t.Fatalf("expected auth.Disabled=true, got false")
+	}
+	if updated.Status != StatusDisabled {
+		t.Fatalf("expected auth.Status=%q, got %q", StatusDisabled, updated.Status)
+	}
+
+	state := updated.ModelStates[modelID]
+	if state == nil {
+		t.Fatalf("expected model state to be present")
+	}
+	if state.Status != StatusDisabled {
+		t.Fatalf("expected model state status=%q, got %q", StatusDisabled, state.Status)
+	}
+
+}
+
+func TestManager_MarkResult_DoesNotAutoDisableNonDuomiClaudeOnInsufficientBalance(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	reg := registry.GetGlobalRegistry()
+
+	authID := "anthropic-insufficient-" + uuid.NewString()
+	modelID := "anthropic-model-" + uuid.NewString()
+	reg.RegisterClient(authID, "claude", []*registry.ModelInfo{{ID: modelID}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(authID)
+	})
+
+	auth := &Auth{
+		ID:       authID,
+		Provider: "claude",
+		Attributes: map[string]string{
+			"api_key":  "sk-test",
+			"base_url": "https://api.anthropic.com",
+		},
+	}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	m.MarkResult(context.Background(), Result{
+		AuthID:   authID,
+		Provider: "claude",
+		Model:    modelID,
+		Success:  false,
+		Error: &Error{
+			HTTPStatus: http.StatusForbidden,
+			Message:    `{"error":{"message":"Insufficient account balance"}}`,
+		},
+	})
+
+	updated, ok := m.GetByID(authID)
+	if !ok || updated == nil {
+		t.Fatalf("expected auth to be present")
+	}
+	if updated.Disabled {
+		t.Fatalf("expected auth.Disabled=false for non-duomi endpoint")
+	}
+	if updated.Status != StatusError {
+		t.Fatalf("expected auth.Status=%q, got %q", StatusError, updated.Status)
+	}
+
+	state := updated.ModelStates[modelID]
+	if state == nil {
+		t.Fatalf("expected model state to be present")
+	}
+	if state.Status != StatusError {
+		t.Fatalf("expected model state status=%q, got %q", StatusError, state.Status)
+	}
+	if state.NextRetryAfter.IsZero() {
+		t.Fatalf("expected NextRetryAfter to be set for non-duomi 403 error")
+	}
+
+}

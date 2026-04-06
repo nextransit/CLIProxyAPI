@@ -1,0 +1,382 @@
+- generic [ref=e46]:
+  - banner [ref=e47]:
+    - generic [ref=e48]:
+      - button "收起" [ref=e49] [cursor=pointer]:
+        - img [ref=e50]
+      - img "CPAMC logo" [ref=e52]
+      - generic "CLI Proxy API Management Center" [ref=e219] [cursor=pointer]:
+        - generic: CLI Proxy API Management Center
+        - generic [ref=e220]: CPAMC
+    - generic [ref=e55]:
+      - generic [ref=e56]:
+        - generic [ref=e57]: Connected
+        - generic [ref=e58]: http://localhost:8317
+      - generic [ref=e59]:
+        - button "Refresh All" [ref=e60] [cursor=pointer]:
+          - img [ref=e62]
+        - button "Check for updates" [ref=e65] [cursor=pointer]:
+          - img [ref=e67]
+        - button "Language" [ref=e70] [cursor=pointer]:
+          - img [ref=e72]
+        - button "Theme" [ref=e75] [cursor=pointer]:
+          - img [ref=e77]
+        - button "Logout" [ref=e84] [cursor=pointer]:
+          - img [ref=e86]
+  - generic [ref=e89]:
+    - complementary [ref=e90]:
+      - generic [ref=e91]:
+        - link "Dashboard" [ref=e92] [cursor=pointer]:
+          - /url: "#/"
+          - img [ref=e94]
+          - generic [ref=e99]: Dashboard
+        - link "Config Panel" [ref=e100] [cursor=pointer]:
+          - /url: "#/config"
+          - img [ref=e102]
+          - generic [ref=e105]: Config Panel
+        - link "AI Providers" [ref=e106] [cursor=pointer]:
+          - /url: "#/ai-providers"
+          - img [ref=e108]
+          - generic [ref=e111]: AI Providers
+        - link "Auth Files" [active] [ref=e112] [cursor=pointer]:
+          - /url: "#/auth-files"
+          - img [ref=e114]
+          - generic [ref=e117]: Auth Files
+        - link "OAuth Login" [ref=e118] [cursor=pointer]:
+          - /url: "#/oauth"
+          - img [ref=e120]
+          - generic [ref=e122]: OAuth Login
+        - link "Quota Management" [ref=e123] [cursor=pointer]:
+          - /url: "#/quota"
+          - img [ref=e125]
+          - generic [ref=e128]: Quota Management
+        - link "Usage Statistics" [ref=e129] [cursor=pointer]:
+          - /url: "#/usage"
+          - img [ref=e131]
+          - generic [ref=e134]: Usage Statistics
+        - link "Management Center Info" [ref=e135] [cursor=pointer]:
+          - /url: "#/system"
+          - img [ref=e137]
+          - generic [ref=e139]: Management Center Info
+    - main [ref=e141]:
+      - generic [ref=e222]:
+        - generic [ref=e223]:
+          - heading "Auth Files Management" [level=1] [ref=e224]
+          - paragraph [ref=e225]: Manage all CLI Proxy JSON auth files here (e.g. Qwen, Gemini, Vertex). Uploading a credential immediately enables the corresponding AI integration.
+        - generic [ref=e226]:
+          - generic [ref=e227]:
+            - generic [ref=e229]:
+              - generic [ref=e230]: Auth Files
+              - generic [ref=e231]: "1516"
+            - generic [ref=e232]:
+              - button "Refresh" [ref=e233] [cursor=pointer]:
+                - generic [ref=e234]: Refresh
+              - button "Upload File" [ref=e235] [cursor=pointer]:
+                - generic [ref=e236]: Upload File
+              - button "Delete All" [ref=e237] [cursor=pointer]:
+                - generic [ref=e238]: Delete All
+          - generic [ref=e239]:
+            - generic [ref=e240]:
+              - button "All 1516" [ref=e241] [cursor=pointer]:
+                - generic [ref=e242]: All
+                - generic [ref=e243]: "1516"
+              - button "Codex 1516" [ref=e244] [cursor=pointer]:
+                - generic [ref=e245]: Codex
+                - generic [ref=e246]: "1516"
+            - generic [ref=e247]:
+              - generic [ref=e248]:
+                - generic [ref=e249]: Search configs
+                - textbox "Search by name, error code, status message, auth_index, path, or provider" [ref=e252]
+              - generic [ref=e253]:
+                - generic [ref=e254]: Per page
+                - spinbutton [ref=e255]: "9"
+              - generic [ref=e256]:
+                - generic [ref=e257]: Status Filter
+                - combobox [ref=e258]:
+                  - option "All" [selected]
+                  - option "Enabled Only"
+                  - option "Disabled Only"
+              - generic [ref=e259]:
+                - generic [ref=e260]: View Mode
+                - generic [ref=e261]:
+                  - button "Cards" [ref=e262] [cursor=pointer]:
+                    - generic [ref=e263]: Cards
+                  - button "List" [ref=e264] [cursor=pointer]:
+                    - generic [ref=e265]: List
+          - generic [ref=e266]:
+            - generic [ref=e269]:
+              - generic [ref=e270]:
+                - button "Select All" [ref=e271] [cursor=pointer]
+                - generic [ref=e272]: Codex
+                - generic [ref=e273]: addi3c38e3@x8.sixthirtydance.org.json
+              - generic [ref=e274]:
+                - generic [ref=e275]: "Size: 4.08 KB"
+                - generic [ref=e276]: "Modified: 3/21/2026, 2:41:32 PM"
+                - generic [ref=e277]: "Auth Index: 0ac71df5537eb7e5"
+                - generic "/root/.cli-proxy-api/addi3c38e3@x8.sixthirtydance.org.json" [ref=e278]: "Path: /root/.cli-proxy-api/addi3c38e3@x8.sixthirtydance.org.json"
+              - generic [ref=e279]:
+                - generic [ref=e280]: "Success: 17"
+                - generic [ref=e281]: "Failure: 9"
+              - generic [ref=e324]: "--"
+              - generic [ref=e325]:
+                - button "Models" [ref=e326] [cursor=pointer]:
+                  - img [ref=e328]
+                - button "Info" [ref=e331] [cursor=pointer]:
+                  - img [ref=e333]
+                - button "Download" [ref=e335] [cursor=pointer]:
+                  - img [ref=e337]
+                - button "Edit Auth Fields" [ref=e340] [cursor=pointer]:
+                  - img [ref=e342]
+                - button "Delete" [ref=e345] [cursor=pointer]:
+                  - img [ref=e347]
+                - generic [ref=e351] [cursor=pointer]:
+                  - checkbox "Enabled"
+            - generic [ref=e356]:
+              - generic [ref=e357]:
+                - button "Select All" [ref=e358] [cursor=pointer]
+                - generic [ref=e359]: Codex
+                - generic [ref=e360]: adela3c3c97@q7f.leadharbor.org.json
+              - generic [ref=e361]:
+                - generic [ref=e362]: "Size: 4.08 KB"
+                - generic [ref=e363]: "Modified: 3/21/2026, 3:52:32 PM"
+                - generic [ref=e364]: "Auth Index: 5883bf99bd1b0b8d"
+                - generic "/root/.cli-proxy-api/adela3c3c97@q7f.leadharbor.org.json" [ref=e365]: "Path: /root/.cli-proxy-api/adela3c3c97@q7f.leadharbor.org.json"
+              - generic [ref=e366]:
+                - generic [ref=e367]: "Success: 162"
+                - generic [ref=e368]: "Failure: 7"
+              - generic [ref=e411]: "--"
+              - generic [ref=e412]:
+                - button "Models" [ref=e413] [cursor=pointer]:
+                  - img [ref=e415]
+                - button "Info" [ref=e418] [cursor=pointer]:
+                  - img [ref=e420]
+                - button "Download" [ref=e422] [cursor=pointer]:
+                  - img [ref=e424]
+                - button "Edit Auth Fields" [ref=e427] [cursor=pointer]:
+                  - img [ref=e429]
+                - button "Delete" [ref=e432] [cursor=pointer]:
+                  - img [ref=e434]
+                - generic [ref=e438] [cursor=pointer]:
+                  - checkbox "Enabled"
+            - generic [ref=e443]:
+              - generic [ref=e444]:
+                - button "Select All" [ref=e445] [cursor=pointer]
+                - generic [ref=e446]: Codex
+                - generic [ref=e447]: adelaide3caed9@xdi.hush2u.com.json
+              - generic [ref=e448]:
+                - generic [ref=e449]: "Size: 4.12 KB"
+                - generic [ref=e450]: "Modified: 3/21/2026, 10:41:25 AM"
+                - generic [ref=e451]: "Auth Index: aec2bc69ee054b52"
+                - generic "/root/.cli-proxy-api/adelaide3caed9@xdi.hush2u.com.json" [ref=e452]: "Path: /root/.cli-proxy-api/adelaide3caed9@xdi.hush2u.com.json"
+              - generic [ref=e453]:
+                - generic [ref=e454]: "Success: 57"
+                - generic [ref=e455]: "Failure: 3"
+              - generic [ref=e498]: "--"
+              - generic [ref=e499]:
+                - button "Models" [ref=e500] [cursor=pointer]:
+                  - img [ref=e502]
+                - button "Info" [ref=e505] [cursor=pointer]:
+                  - img [ref=e507]
+                - button "Download" [ref=e509] [cursor=pointer]:
+                  - img [ref=e511]
+                - button "Edit Auth Fields" [ref=e514] [cursor=pointer]:
+                  - img [ref=e516]
+                - button "Delete" [ref=e519] [cursor=pointer]:
+                  - img [ref=e521]
+                - generic [ref=e525] [cursor=pointer]:
+                  - checkbox "Enabled"
+            - generic [ref=e530]:
+              - generic [ref=e531]:
+                - button "Select All" [ref=e532] [cursor=pointer]
+                - generic [ref=e533]: Codex
+                - generic [ref=e534]: adelina3ccad0@g1.moonairse.com.json
+              - generic [ref=e535]:
+                - generic [ref=e536]: "Size: 4.08 KB"
+                - generic [ref=e537]: "Modified: 3/21/2026, 3:52:27 PM"
+                - generic [ref=e538]: "Auth Index: c9a3cc8096e5025e"
+                - generic "/root/.cli-proxy-api/adelina3ccad0@g1.moonairse.com.json" [ref=e539]: "Path: /root/.cli-proxy-api/adelina3ccad0@g1.moonairse.com.json"
+              - generic [ref=e540]:
+                - generic [ref=e541]: "Success: 112"
+                - generic [ref=e542]: "Failure: 6"
+              - generic [ref=e585]: "--"
+              - generic [ref=e586]:
+                - button "Models" [ref=e587] [cursor=pointer]:
+                  - img [ref=e589]
+                - button "Info" [ref=e592] [cursor=pointer]:
+                  - img [ref=e594]
+                - button "Download" [ref=e596] [cursor=pointer]:
+                  - img [ref=e598]
+                - button "Edit Auth Fields" [ref=e601] [cursor=pointer]:
+                  - img [ref=e603]
+                - button "Delete" [ref=e606] [cursor=pointer]:
+                  - img [ref=e608]
+                - generic [ref=e612] [cursor=pointer]:
+                  - checkbox "Enabled"
+            - generic [ref=e617]:
+              - generic [ref=e618]:
+                - button "Select All" [ref=e619] [cursor=pointer]
+                - generic [ref=e620]: Codex
+                - generic [ref=e621]: adella3c0da7@f1.sixthirtydance.org.json
+              - generic [ref=e622]:
+                - generic [ref=e623]: "Size: 4.09 KB"
+                - generic [ref=e624]: "Modified: 3/21/2026, 3:52:28 PM"
+                - generic [ref=e625]: "Auth Index: 8c99ecbc1f4a3e95"
+                - generic "/root/.cli-proxy-api/adella3c0da7@f1.sixthirtydance.org.json" [ref=e626]: "Path: /root/.cli-proxy-api/adella3c0da7@f1.sixthirtydance.org.json"
+              - generic [ref=e627]:
+                - generic [ref=e628]: "Success: 44"
+                - generic [ref=e629]: "Failure: 8"
+              - generic [ref=e672]: "--"
+              - generic [ref=e673]:
+                - button "Models" [ref=e674] [cursor=pointer]:
+                  - img [ref=e676]
+                - button "Info" [ref=e679] [cursor=pointer]:
+                  - img [ref=e681]
+                - button "Download" [ref=e683] [cursor=pointer]:
+                  - img [ref=e685]
+                - button "Edit Auth Fields" [ref=e688] [cursor=pointer]:
+                  - img [ref=e690]
+                - button "Delete" [ref=e693] [cursor=pointer]:
+                  - img [ref=e695]
+                - generic [ref=e699] [cursor=pointer]:
+                  - checkbox "Enabled"
+            - generic [ref=e704]:
+              - generic [ref=e705]:
+                - button "Select All" [ref=e706] [cursor=pointer]
+                - generic [ref=e707]: Codex
+                - generic [ref=e708]: adelric3cc989@c3.cloudvxz.com.json
+              - generic [ref=e709]:
+                - generic [ref=e710]: "Size: 4.07 KB"
+                - generic [ref=e711]: "Modified: 3/21/2026, 10:41:18 AM"
+                - generic [ref=e712]: "Auth Index: 481de314958863a7"
+                - generic "/root/.cli-proxy-api/adelric3cc989@c3.cloudvxz.com.json" [ref=e713]: "Path: /root/.cli-proxy-api/adelric3cc989@c3.cloudvxz.com.json"
+              - generic [ref=e714]:
+                - generic [ref=e715]: "Success: 40"
+                - generic [ref=e716]: "Failure: 14"
+              - generic [ref=e759]: "--"
+              - generic [ref=e760]:
+                - button "Models" [ref=e761] [cursor=pointer]:
+                  - img [ref=e763]
+                - button "Info" [ref=e766] [cursor=pointer]:
+                  - img [ref=e768]
+                - button "Download" [ref=e770] [cursor=pointer]:
+                  - img [ref=e772]
+                - button "Edit Auth Fields" [ref=e775] [cursor=pointer]:
+                  - img [ref=e777]
+                - button "Delete" [ref=e780] [cursor=pointer]:
+                  - img [ref=e782]
+                - generic [ref=e786] [cursor=pointer]:
+                  - checkbox "Enabled"
+            - generic [ref=e791]:
+              - generic [ref=e792]:
+                - button "Select All" [ref=e793] [cursor=pointer]
+                - generic [ref=e794]: Codex
+                - generic [ref=e795]: ader3c29fb@jp.moonairse.com.json
+              - generic [ref=e796]:
+                - generic [ref=e797]: "Size: 4.07 KB"
+                - generic [ref=e798]: "Modified: 3/21/2026, 3:52:29 PM"
+                - generic [ref=e799]: "Auth Index: 740419a78e10013c"
+                - generic "/root/.cli-proxy-api/ader3c29fb@jp.moonairse.com.json" [ref=e800]: "Path: /root/.cli-proxy-api/ader3c29fb@jp.moonairse.com.json"
+              - generic [ref=e801]:
+                - generic [ref=e802]: "Success: 120"
+                - generic [ref=e803]: "Failure: 5"
+              - generic [ref=e846]: "--"
+              - generic [ref=e847]:
+                - button "Models" [ref=e848] [cursor=pointer]:
+                  - img [ref=e850]
+                - button "Info" [ref=e853] [cursor=pointer]:
+                  - img [ref=e855]
+                - button "Download" [ref=e857] [cursor=pointer]:
+                  - img [ref=e859]
+                - button "Edit Auth Fields" [ref=e862] [cursor=pointer]:
+                  - img [ref=e864]
+                - button "Delete" [ref=e867] [cursor=pointer]:
+                  - img [ref=e869]
+                - generic [ref=e873] [cursor=pointer]:
+                  - checkbox "Enabled"
+            - generic [ref=e878]:
+              - generic [ref=e879]:
+                - button "Select All" [ref=e880] [cursor=pointer]
+                - generic [ref=e881]: Codex
+                - generic [ref=e882]: adhern3c3464@lf.moonairse.com.json
+              - generic [ref=e883]:
+                - generic [ref=e884]: "Size: 4.07 KB"
+                - generic [ref=e885]: "Modified: 3/21/2026, 2:41:38 PM"
+                - generic [ref=e886]: "Auth Index: d756740d6ea092dd"
+                - generic "/root/.cli-proxy-api/adhern3c3464@lf.moonairse.com.json" [ref=e887]: "Path: /root/.cli-proxy-api/adhern3c3464@lf.moonairse.com.json"
+              - generic [ref=e888]:
+                - generic [ref=e889]: "Success: 27"
+                - generic [ref=e890]: "Failure: 4"
+              - generic [ref=e933]: "--"
+              - generic [ref=e934]:
+                - button "Models" [ref=e935] [cursor=pointer]:
+                  - img [ref=e937]
+                - button "Info" [ref=e940] [cursor=pointer]:
+                  - img [ref=e942]
+                - button "Download" [ref=e944] [cursor=pointer]:
+                  - img [ref=e946]
+                - button "Edit Auth Fields" [ref=e949] [cursor=pointer]:
+                  - img [ref=e951]
+                - button "Delete" [ref=e954] [cursor=pointer]:
+                  - img [ref=e956]
+                - generic [ref=e960] [cursor=pointer]:
+                  - checkbox "Enabled"
+            - generic [ref=e965]:
+              - generic [ref=e966]:
+                - button "Select All" [ref=e967] [cursor=pointer]
+                - generic [ref=e968]: Codex
+                - generic [ref=e969]: adi3c9c82@rd.hush2u.com.json
+              - generic [ref=e970]:
+                - generic [ref=e971]: "Size: 4.10 KB"
+                - generic [ref=e972]: "Modified: 3/21/2026, 2:41:39 PM"
+                - generic [ref=e973]: "Auth Index: 289ca213a5fbd23e"
+                - generic "/root/.cli-proxy-api/adi3c9c82@rd.hush2u.com.json" [ref=e974]: "Path: /root/.cli-proxy-api/adi3c9c82@rd.hush2u.com.json"
+              - generic [ref=e975]:
+                - generic [ref=e976]: "Success: 73"
+                - generic [ref=e977]: "Failure: 4"
+              - generic [ref=e1020]: "--"
+              - generic [ref=e1021]:
+                - button "Models" [ref=e1022] [cursor=pointer]:
+                  - img [ref=e1024]
+                - button "Info" [ref=e1027] [cursor=pointer]:
+                  - img [ref=e1029]
+                - button "Download" [ref=e1031] [cursor=pointer]:
+                  - img [ref=e1033]
+                - button "Edit Auth Fields" [ref=e1036] [cursor=pointer]:
+                  - img [ref=e1038]
+                - button "Delete" [ref=e1041] [cursor=pointer]:
+                  - img [ref=e1043]
+                - generic [ref=e1047] [cursor=pointer]:
+                  - checkbox "Enabled"
+          - generic [ref=e1050]:
+            - button "Previous" [disabled] [ref=e1051]:
+              - generic [ref=e1052]: Previous
+            - generic [ref=e1053]: Page 1 / 169 · 1516 files
+            - button "Next" [ref=e1054] [cursor=pointer]:
+              - generic [ref=e1055]: Next
+        - generic [ref=e1056]:
+          - generic [ref=e1057]:
+            - generic [ref=e1058]: OAuth Model Disablement
+            - button "Add Disablement" [ref=e1059] [cursor=pointer]:
+              - generic [ref=e1060]: Add Disablement
+          - generic [ref=e1062]:
+            - generic [ref=e1063]:
+              - generic [ref=e1064]: oauth-excluded-models
+              - generic [ref=e1065]: No disabled models configured
+            - generic [ref=e1066]:
+              - button "Edit" [ref=e1067] [cursor=pointer]:
+                - generic [ref=e1068]: Edit
+              - button "Delete Provider" [ref=e1069] [cursor=pointer]:
+                - generic [ref=e1070]: Delete Provider
+        - generic [ref=e1071]:
+          - generic [ref=e1072]:
+            - generic [ref=e1073]: OAuth Model Aliases
+            - generic [ref=e1074]:
+              - generic [ref=e1075]:
+                - button "List" [ref=e1076] [cursor=pointer]:
+                  - generic [ref=e1077]: List
+                - button "Diagram" [ref=e1078] [cursor=pointer]:
+                  - generic [ref=e1079]: Diagram
+              - button "Add Alias" [ref=e1080] [cursor=pointer]:
+                - generic [ref=e1081]: Add Alias
+          - generic [ref=e1083]:
+            - img [ref=e1085]
+            - generic [ref=e1089]: No model aliases yet—use “Add Alias” to create one.

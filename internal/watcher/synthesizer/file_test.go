@@ -189,6 +189,55 @@ func TestFileSynthesizer_Synthesize_SkipsInvalidFiles(t *testing.T) {
 	}
 }
 
+func TestFileSynthesizer_Synthesize_LegacyCodexTokenWithoutType(t *testing.T) {
+	tempDir := t.TempDir()
+
+	legacy := map[string]any{
+		"email":         "legacy@example.com",
+		"openai_token":  "oa_token_legacy",
+		"refresh_token": "oa_refresh_legacy",
+		"account_id":    "user_123",
+	}
+	data, _ := json.Marshal(legacy)
+	if err := os.WriteFile(filepath.Join(tempDir, "legacy-openai-token.json"), data, 0o644); err != nil {
+		t.Fatalf("failed to write legacy auth file: %v", err)
+	}
+
+	synth := NewFileSynthesizer()
+	ctx := &SynthesisContext{
+		Config:      &config.Config{},
+		AuthDir:     tempDir,
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	}
+
+	auths, err := synth.Synthesize(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("expected 1 auth, got %d", len(auths))
+	}
+	if auths[0].Provider != "codex" {
+		t.Fatalf("expected provider codex, got %s", auths[0].Provider)
+	}
+	if got, _ := auths[0].Metadata["type"].(string); got != "codex" {
+		t.Fatalf("expected metadata type codex, got %q", got)
+	}
+	if got, _ := auths[0].Metadata["access_token"].(string); got != "oa_token_legacy" {
+		t.Fatalf("expected access_token mapped from openai_token, got %q", got)
+	}
+	if !auths[0].Disabled {
+		t.Fatal("expected legacy oa_token auth to be auto-disabled")
+	}
+	if auths[0].Status != coreauth.StatusDisabled {
+		t.Fatalf("expected status disabled, got %s", auths[0].Status)
+	}
+	if auths[0].StatusMessage == "" {
+		t.Fatal("expected status message for auto-disabled legacy oa_token auth")
+	}
+}
+
 func TestFileSynthesizer_Synthesize_SkipsDirectories(t *testing.T) {
 	tempDir := t.TempDir()
 
