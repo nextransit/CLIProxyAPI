@@ -527,3 +527,30 @@ func TestRoundRobinSelectorPick_MixedVirtualAndNonVirtualFallsBackToFlat(t *test
 		}
 	}
 }
+
+
+func TestCanonicalModelKey_OnlyParsesKnownThinkingSuffix(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{name: "no suffix", input: "gpt-5.3-codex", want: "gpt-5.3-codex"},
+		{name: "numeric thinking suffix", input: "gpt-5.3-codex(8192)", want: "gpt-5.3-codex"},
+		{name: "level thinking suffix", input: "gpt-5.3-codex(high)", want: "gpt-5.3-codex"},
+		{name: "special thinking suffix", input: "gpt-5.3-codex(auto)", want: "gpt-5.3-codex"},
+		{name: "model name with parenthesis should stay intact", input: "DeepSeek: DeepSeek V4 Pro (Free)", want: "DeepSeek: DeepSeek V4 Pro (Free)"},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := canonicalModelKey(tc.input); got != tc.want {
+				t.Fatalf("canonicalModelKey(%q) = %q, want %q", tc.input, got, tc.want)
+			}
+		})
+	}
+}

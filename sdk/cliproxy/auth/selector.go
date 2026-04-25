@@ -128,6 +128,19 @@ func canonicalModelKey(model string) string {
 		return ""
 	}
 	parsed := thinking.ParseSuffix(model)
+	if !parsed.HasSuffix {
+		return model
+	}
+	if parsed.RawSuffix == "" {
+		return model
+	}
+	if _, ok := thinking.ParseSpecialSuffix(parsed.RawSuffix); !ok {
+		if _, ok := thinking.ParseLevelSuffix(parsed.RawSuffix); !ok {
+			if _, ok := thinking.ParseNumericSuffix(parsed.RawSuffix); !ok {
+				return model
+			}
+		}
+	}
 	modelName := strings.TrimSpace(parsed.ModelName)
 	if modelName == "" {
 		return model
