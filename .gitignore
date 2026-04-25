@@ -5,6 +5,7 @@ cli-proxy-api
 # Configuration
 config.yaml
 .env
+.env.github
 
 # Generated content
 bin/*
