@@ -539,7 +539,7 @@ func preserveReasoningContentInMessages(body []byte) []byte {
 	model := strings.ToLower(gjson.GetBytes(body, "model").String())
 
 	// Only apply to models that support thinking with history preservation
-	needsPreservation := strings.HasPrefix(model, "glm-4") || strings.HasPrefix(model, "minimax-m2")
+	needsPreservation := strings.HasPrefix(model, "glm-4") || strings.HasPrefix(model, "minimax-m2") || strings.HasPrefix(model, "deepseek")
 
 	if !needsPreservation {
 		return body

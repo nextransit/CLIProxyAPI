@@ -153,8 +153,11 @@ func isEnableThinkingModel(modelID string) bool {
 		return true
 	}
 	id := strings.ToLower(modelID)
+	if strings.HasPrefix(id, "deepseek") {
+		return true
+	}
 	switch id {
-	case "qwen3-max-preview", "deepseek-v3.2", "deepseek-v3.1":
+	case "qwen3-max-preview":
 		return true
 	default:
 		return false

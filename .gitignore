@@ -50,3 +50,6 @@ _bmad-output/*
 # macOS
 .DS_Store
 ._*
+tmp.txt
+.external/
+Cli-Proxy-API-Management-Center/

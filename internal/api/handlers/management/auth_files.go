@@ -808,43 +808,124 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 		c.JSON(200, gin.H{"status": "ok", "deleted": deleted})
 		return
 	}
+
+	deleteOne := func(name string) (int, string, error) {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return http.StatusBadRequest, "", errors.New("name is required")
+		}
+
+		targetPath := filepath.Join(h.cfg.AuthDir, filepath.Base(name))
+		targetID := ""
+		if targetAuth := h.findAuthForDelete(name); targetAuth != nil {
+			targetID = strings.TrimSpace(targetAuth.ID)
+			if path := strings.TrimSpace(authAttribute(targetAuth, "path")); path != "" {
+				targetPath = path
+			}
+		}
+		if !filepath.IsAbs(targetPath) {
+			if abs, errAbs := filepath.Abs(targetPath); errAbs == nil {
+				targetPath = abs
+			}
+		}
+		if errRemove := os.Remove(targetPath); errRemove != nil {
+			if os.IsNotExist(errRemove) {
+				return http.StatusNotFound, "", errors.New("file not found")
+			}
+			return http.StatusInternalServerError, "", fmt.Errorf("failed to remove file: %v", errRemove)
+		}
+		if errDeleteRecord := h.deleteTokenRecord(ctx, targetPath); errDeleteRecord != nil {
+			return http.StatusInternalServerError, "", errDeleteRecord
+		}
+		if targetID != "" {
+			h.disableAuth(ctx, targetID)
+		} else {
+			h.disableAuth(ctx, targetPath)
+		}
+		return http.StatusOK, filepath.Base(name), nil
+	}
+
 	name := strings.TrimSpace(c.Query("name"))
+	var names []string
 	if name == "" {
-		c.JSON(400, gin.H{"error": "name is required"})
+		type deleteAuthFilesReq struct {
+			Name  string   `json:"name"`
+			Names []string `json:"names"`
+		}
+		var req deleteAuthFilesReq
+		if c.Request != nil && c.Request.Body != nil {
+			data, errRead := io.ReadAll(c.Request.Body)
+			if errRead != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read body"})
+				return
+			}
+			if len(bytes.TrimSpace(data)) > 0 {
+				if errUnmarshal := json.Unmarshal(data, &req); errUnmarshal != nil {
+					c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+					return
+				}
+			}
+		}
+		if trimmed := strings.TrimSpace(req.Name); trimmed != "" {
+			name = trimmed
+		}
+		if len(req.Names) > 0 {
+			seen := make(map[string]struct{}, len(req.Names))
+			for _, item := range req.Names {
+				trimmed := strings.TrimSpace(item)
+				if trimmed == "" {
+					continue
+				}
+				if _, ok := seen[trimmed]; ok {
+					continue
+				}
+				seen[trimmed] = struct{}{}
+				names = append(names, trimmed)
+			}
+		}
+	}
+
+	if len(names) > 0 {
+		deletedFiles := make([]string, 0, len(names))
+		failed := make([]gin.H, 0)
+		for _, item := range names {
+			_, deletedName, errDelete := deleteOne(item)
+			if errDelete != nil {
+				failed = append(failed, gin.H{
+					"name":  item,
+					"error": errDelete.Error(),
+				})
+				continue
+			}
+			deletedFiles = append(deletedFiles, deletedName)
+		}
+
+		status := "ok"
+		if len(failed) > 0 && len(deletedFiles) > 0 {
+			status = "partial"
+		} else if len(failed) > 0 {
+			status = "error"
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"status":  status,
+			"deleted": len(deletedFiles),
+			"files":   deletedFiles,
+			"failed":  failed,
+		})
 		return
 	}
 
-	targetPath := filepath.Join(h.cfg.AuthDir, filepath.Base(name))
-	targetID := ""
-	if targetAuth := h.findAuthForDelete(name); targetAuth != nil {
-		targetID = strings.TrimSpace(targetAuth.ID)
-		if path := strings.TrimSpace(authAttribute(targetAuth, "path")); path != "" {
-			targetPath = path
-		}
-	}
-	if !filepath.IsAbs(targetPath) {
-		if abs, errAbs := filepath.Abs(targetPath); errAbs == nil {
-			targetPath = abs
-		}
-	}
-	if errRemove := os.Remove(targetPath); errRemove != nil {
-		if os.IsNotExist(errRemove) {
-			c.JSON(404, gin.H{"error": "file not found"})
-		} else {
-			c.JSON(500, gin.H{"error": fmt.Sprintf("failed to remove file: %v", errRemove)})
-		}
+	if name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
 		return
 	}
-	if errDeleteRecord := h.deleteTokenRecord(ctx, targetPath); errDeleteRecord != nil {
-		c.JSON(500, gin.H{"error": errDeleteRecord.Error()})
+	statusCode, _, errDelete := deleteOne(name)
+	if errDelete != nil {
+		c.JSON(statusCode, gin.H{"error": errDelete.Error()})
 		return
 	}
-	if targetID != "" {
-		h.disableAuth(ctx, targetID)
-	} else {
-		h.disableAuth(ctx, targetPath)
-	}
-	c.JSON(200, gin.H{"status": "ok"})
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
 
 func (h *Handler) findAuthForDelete(name string) *coreauth.Auth {
@@ -1020,12 +1101,40 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 	}
 	targetAuth.UpdatedAt = time.Now()
 
-	if _, err := h.authManager.Update(ctx, targetAuth); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth: %v", err)})
-		return
+	// Persist the disabled state back to the JSON file so it survives restarts.
+	if err := h.persistAuthFileDisabledField(ctx, targetAuth, *req.Disabled); err != nil {
+		log.WithError(err).Warnf("failed to persist disabled state to auth file for %s", name)
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "disabled": *req.Disabled})
+}
+
+// persistAuthFileDisabledField updates the "disabled" field in the auth JSON file on disk.
+func (h *Handler) persistAuthFileDisabledField(ctx context.Context, auth *coreauth.Auth, disabled bool) error {
+	if auth == nil || h.cfg == nil || h.cfg.AuthDir == "" {
+		return nil
+	}
+	path := strings.TrimSpace(authAttribute(auth, "path"))
+	if path == "" {
+		return nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("failed to read auth file: %w", err)
+	}
+	var metadata map[string]any
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		return fmt.Errorf("failed to parse auth file: %w", err)
+	}
+	metadata["disabled"] = disabled
+	updated, err := json.MarshalIndent(metadata, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal updated auth file: %w", err)
+	}
+	if err := os.WriteFile(path, updated, 0o600); err != nil {
+		return fmt.Errorf("failed to write auth file: %w", err)
+	}
+	return nil
 }
 
 // PatchAuthFileFields updates editable fields (prefix, proxy_url, priority, note) of an auth file.

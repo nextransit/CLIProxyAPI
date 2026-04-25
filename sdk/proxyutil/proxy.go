@@ -87,7 +87,7 @@ func BuildHTTPTransport(raw string) (*http.Transport, Mode, error) {
 
 	switch setting.Mode {
 	case ModeInherit:
-		return nil, setting.Mode, nil
+		return &http.Transport{Proxy: http.ProxyFromEnvironment}, setting.Mode, nil
 	case ModeDirect:
 		return NewDirectTransport(), setting.Mode, nil
 	case ModeProxy:

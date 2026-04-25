@@ -1,6 +1,7 @@
 package management
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -181,5 +182,119 @@ func TestDeleteAuthFile_FallbackToAuthDirPath(t *testing.T) {
 	}
 	if _, errStat := os.Stat(filePath); !os.IsNotExist(errStat) {
 		t.Fatalf("expected auth file to be removed from auth dir, stat err: %v", errStat)
+	}
+}
+
+func TestDeleteAuthFile_BatchByBodyNames(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	first := "first-user.json"
+	second := "second-user.json"
+	firstPath := filepath.Join(authDir, first)
+	secondPath := filepath.Join(authDir, second)
+	if errWrite := os.WriteFile(firstPath, []byte(`{"type":"codex"}`), 0o600); errWrite != nil {
+		t.Fatalf("failed to write first auth file: %v", errWrite)
+	}
+	if errWrite := os.WriteFile(secondPath, []byte(`{"type":"codex"}`), 0o600); errWrite != nil {
+		t.Fatalf("failed to write second auth file: %v", errWrite)
+	}
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	h.tokenStore = &memoryAuthStore{}
+
+	body := []byte(`{"names":["first-user.json","second-user.json"]}`)
+	deleteRec := httptest.NewRecorder()
+	deleteCtx, _ := gin.CreateTestContext(deleteRec)
+	deleteReq := httptest.NewRequest(http.MethodDelete, "/v0/management/auth-files", bytes.NewReader(body))
+	deleteReq.Header.Set("Content-Type", "application/json")
+	deleteCtx.Request = deleteReq
+	h.DeleteAuthFile(deleteCtx)
+
+	if deleteRec.Code != http.StatusOK {
+		t.Fatalf("expected delete status %d, got %d with body %s", http.StatusOK, deleteRec.Code, deleteRec.Body.String())
+	}
+
+	var payload struct {
+		Status  string `json:"status"`
+		Deleted int    `json:"deleted"`
+		Files   []any  `json:"files"`
+		Failed  []any  `json:"failed"`
+	}
+	if errUnmarshal := json.Unmarshal(deleteRec.Body.Bytes(), &payload); errUnmarshal != nil {
+		t.Fatalf("failed to unmarshal delete payload: %v", errUnmarshal)
+	}
+	if payload.Status != "ok" {
+		t.Fatalf("expected status ok, got %q", payload.Status)
+	}
+	if payload.Deleted != 2 {
+		t.Fatalf("expected deleted=2, got %d", payload.Deleted)
+	}
+	if len(payload.Files) != 2 {
+		t.Fatalf("expected files length 2, got %d", len(payload.Files))
+	}
+	if len(payload.Failed) != 0 {
+		t.Fatalf("expected failed length 0, got %d", len(payload.Failed))
+	}
+	if _, errStat := os.Stat(firstPath); !os.IsNotExist(errStat) {
+		t.Fatalf("expected first file deleted, stat err: %v", errStat)
+	}
+	if _, errStat := os.Stat(secondPath); !os.IsNotExist(errStat) {
+		t.Fatalf("expected second file deleted, stat err: %v", errStat)
+	}
+}
+
+func TestDeleteAuthFile_BatchByBodyNames_PartialFailure(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	existing := "existing-user.json"
+	existingPath := filepath.Join(authDir, existing)
+	if errWrite := os.WriteFile(existingPath, []byte(`{"type":"codex"}`), 0o600); errWrite != nil {
+		t.Fatalf("failed to write auth file: %v", errWrite)
+	}
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	h.tokenStore = &memoryAuthStore{}
+
+	body := []byte(`{"names":["existing-user.json","missing-user.json"]}`)
+	deleteRec := httptest.NewRecorder()
+	deleteCtx, _ := gin.CreateTestContext(deleteRec)
+	deleteReq := httptest.NewRequest(http.MethodDelete, "/v0/management/auth-files", bytes.NewReader(body))
+	deleteReq.Header.Set("Content-Type", "application/json")
+	deleteCtx.Request = deleteReq
+	h.DeleteAuthFile(deleteCtx)
+
+	if deleteRec.Code != http.StatusOK {
+		t.Fatalf("expected delete status %d, got %d with body %s", http.StatusOK, deleteRec.Code, deleteRec.Body.String())
+	}
+
+	var payload struct {
+		Status  string `json:"status"`
+		Deleted int    `json:"deleted"`
+		Files   []any  `json:"files"`
+		Failed  []any  `json:"failed"`
+	}
+	if errUnmarshal := json.Unmarshal(deleteRec.Body.Bytes(), &payload); errUnmarshal != nil {
+		t.Fatalf("failed to unmarshal delete payload: %v", errUnmarshal)
+	}
+	if payload.Status != "partial" {
+		t.Fatalf("expected status partial, got %q", payload.Status)
+	}
+	if payload.Deleted != 1 {
+		t.Fatalf("expected deleted=1, got %d", payload.Deleted)
+	}
+	if len(payload.Files) != 1 {
+		t.Fatalf("expected files length 1, got %d", len(payload.Files))
+	}
+	if len(payload.Failed) != 1 {
+		t.Fatalf("expected failed length 1, got %d", len(payload.Failed))
+	}
+	if _, errStat := os.Stat(existingPath); !os.IsNotExist(errStat) {
+		t.Fatalf("expected existing file deleted, stat err: %v", errStat)
 	}
 }
