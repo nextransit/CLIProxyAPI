@@ -140,10 +140,11 @@ type ClaudeHeaderDefaults struct {
 	Timeout        string `yaml:"timeout" json:"timeout"`
 }
 
-// CodexHeaderDefaults configures fallback header values injected into Codex
-// model requests for OAuth/file-backed auth when the client omits them.
-// UserAgent applies to HTTP and websocket requests; BetaFeatures only applies to websockets.
+// CodexHeaderDefaults configures default header values injected into Codex
+// model requests for OAuth/file-backed auth.
+// Version and UserAgent apply to HTTP and websocket requests; BetaFeatures only applies to websockets.
 type CodexHeaderDefaults struct {
+	Version      string `yaml:"version" json:"version"`
 	UserAgent    string `yaml:"user-agent" json:"user-agent"`
 	BetaFeatures string `yaml:"beta-features" json:"beta-features"`
 }
@@ -838,6 +839,7 @@ func (cfg *Config) SanitizeCodexHeaderDefaults() {
 	if cfg == nil {
 		return
 	}
+	cfg.CodexHeaderDefaults.Version = strings.TrimSpace(cfg.CodexHeaderDefaults.Version)
 	cfg.CodexHeaderDefaults.UserAgent = strings.TrimSpace(cfg.CodexHeaderDefaults.UserAgent)
 	cfg.CodexHeaderDefaults.BetaFeatures = strings.TrimSpace(cfg.CodexHeaderDefaults.BetaFeatures)
 }

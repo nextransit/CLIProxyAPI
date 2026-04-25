@@ -11,6 +11,7 @@ func TestLoadConfigOptional_CodexHeaderDefaults(t *testing.T) {
 	configPath := filepath.Join(dir, "config.yaml")
 	configYAML := []byte(`
 codex-header-defaults:
+  version: "  0.125.0  "
   user-agent: "  my-codex-client/1.0  "
   beta-features: "  feature-a,feature-b  "
 `)
@@ -23,6 +24,9 @@ codex-header-defaults:
 		t.Fatalf("LoadConfigOptional() error = %v", err)
 	}
 
+	if got := cfg.CodexHeaderDefaults.Version; got != "0.125.0" {
+		t.Fatalf("Version = %q, want %q", got, "0.125.0")
+	}
 	if got := cfg.CodexHeaderDefaults.UserAgent; got != "my-codex-client/1.0" {
 		t.Fatalf("UserAgent = %q, want %q", got, "my-codex-client/1.0")
 	}

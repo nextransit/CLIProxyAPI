@@ -28,8 +28,8 @@ import (
 )
 
 const (
-	codexClientVersion = "0.101.0"
-	codexUserAgent     = "codex_cli_rs/0.101.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464"
+	codexClientVersion = "0.125.0"
+	codexUserAgent     = "codex_cli_rs/0.125.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464"
 )
 
 var dataTag = []byte("data:")
@@ -645,9 +645,9 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 		ginHeaders = ginCtx.Request.Header
 	}
 
-	misc.EnsureHeader(r.Header, ginHeaders, "Version", codexClientVersion)
+	cfgVersion, cfgUserAgent, _ := codexHeaderDefaults(cfg, auth)
+	ensureHeaderWithConfigPrecedence(r.Header, ginHeaders, "Version", cfgVersion, codexClientVersion)
 	misc.EnsureHeader(r.Header, ginHeaders, "Session_id", uuid.NewString())
-	cfgUserAgent, _ := codexHeaderDefaults(cfg, auth)
 	ensureHeaderWithConfigPrecedence(r.Header, ginHeaders, "User-Agent", cfgUserAgent, codexUserAgent)
 
 	if stream {
