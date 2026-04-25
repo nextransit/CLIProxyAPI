@@ -20,6 +20,8 @@ auths/*
 logs/*
 conv/*
 config.yaml
+.external/*
+Cli-Proxy-API-Management-Center/*
 
 # Development/editor
 bin/*

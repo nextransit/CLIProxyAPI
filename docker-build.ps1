@@ -27,9 +27,10 @@ switch ($choice) {
         $VERSION = (git describe --tags --always --dirty)
         $COMMIT  = (git rev-parse --short HEAD)
         $BUILD_DATE = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        $VERSION_WITH_BUILD_DATE = "$VERSION-$BUILD_DATE"
 
         Write-Host "Building with the following info:"
-        Write-Host "  Version: $VERSION"
+        Write-Host "  Version: $VERSION_WITH_BUILD_DATE"
         Write-Host "  Commit: $COMMIT"
         Write-Host "  Build Date: $BUILD_DATE"
         Write-Host "----------------------------------------"

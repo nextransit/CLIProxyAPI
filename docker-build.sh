@@ -142,9 +142,10 @@ case "$choice" in
     VERSION="$(git describe --tags --always --dirty)"
     COMMIT="$(git rev-parse --short HEAD)"
     BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    VERSION_WITH_BUILD_DATE="${VERSION}-${BUILD_DATE}"
 
     echo "Building with the following info:"
-    echo "  Version: ${VERSION}"
+    echo "  Version: ${VERSION_WITH_BUILD_DATE}"
     echo "  Commit: ${COMMIT}"
     echo "  Build Date: ${BUILD_DATE}"
     echo "----------------------------------------"
