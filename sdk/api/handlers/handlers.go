@@ -6,6 +6,7 @@ package handlers
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -13,7 +14,6 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/access/apikeypolicy"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
@@ -56,6 +56,7 @@ const (
 type pinnedAuthContextKey struct{}
 type selectedAuthCallbackContextKey struct{}
 type executionSessionContextKey struct{}
+type disallowFreeAuthContextKey struct{}
 
 // WithPinnedAuthID returns a child context that requests execution on a specific auth ID.
 func WithPinnedAuthID(ctx context.Context, authID string) context.Context {
@@ -90,6 +91,14 @@ func WithExecutionSessionID(ctx context.Context, sessionID string) context.Conte
 		ctx = context.Background()
 	}
 	return context.WithValue(ctx, executionSessionContextKey{}, sessionID)
+}
+
+// WithDisallowFreeAuth returns a child context that requests skipping known free-tier credentials.
+func WithDisallowFreeAuth(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, disallowFreeAuthContextKey{}, true)
 }
 
 // BuildErrorResponseBody builds an OpenAI-compatible JSON error response body.
@@ -188,18 +197,18 @@ func PassthroughHeadersEnabled(cfg *config.SDKConfig) bool {
 
 func requestExecutionMetadata(ctx context.Context) map[string]any {
 	// Idempotency-Key is an optional client-supplied header used to correlate retries.
-	// It is forwarded as execution metadata; when absent we generate a UUID.
+	// Only include it if the client explicitly provides it.
 	key := ""
 	if ctx != nil {
 		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
 			key = strings.TrimSpace(ginCtx.GetHeader("Idempotency-Key"))
 		}
 	}
-	if key == "" {
-		key = uuid.NewString()
-	}
 
-	meta := map[string]any{idempotencyKeyMetadataKey: key}
+	meta := make(map[string]any)
+	if key != "" {
+		meta[idempotencyKeyMetadataKey] = key
+	}
 	if pinnedAuthID := pinnedAuthIDFromContext(ctx); pinnedAuthID != "" {
 		meta[coreexecutor.PinnedAuthMetadataKey] = pinnedAuthID
 	}
@@ -208,6 +217,9 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	}
 	if executionSessionID := executionSessionIDFromContext(ctx); executionSessionID != "" {
 		meta[coreexecutor.ExecutionSessionMetadataKey] = executionSessionID
+	}
+	if disallowFreeAuthFromContext(ctx) {
+		meta[coreexecutor.DisallowFreeAuthMetadataKey] = true
 	}
 	return meta
 }
@@ -253,6 +265,14 @@ func executionSessionIDFromContext(ctx context.Context) string {
 	}
 }
 
+func disallowFreeAuthFromContext(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	raw, ok := ctx.Value(disallowFreeAuthContextKey{}).(bool)
+	return ok && raw
+}
+
 // BaseAPIHandler contains the handlers for API endpoints.
 // It holds a pool of clients to interact with the backend service and manages
 // load balancing, client selection, and configuration.
@@ -260,11 +280,11 @@ type BaseAPIHandler struct {
 	// AuthManager manages auth lifecycle and execution in the new architecture.
 	AuthManager *coreauth.Manager
 
-	// APIKeyPolicyManager enforces per-client-key model/rate/concurrency quotas.
-	APIKeyPolicyManager *apikeypolicy.Manager
-
 	// Cfg holds the current application configuration.
 	Cfg *config.SDKConfig
+
+	// APIKeyPolicyManager enforces per-client-key model/rate/concurrency quotas.
+	APIKeyPolicyManager *apikeypolicy.Manager
 }
 
 // NewBaseAPIHandlers creates a new API handlers instance.
@@ -283,14 +303,6 @@ func NewBaseAPIHandlers(cfg *config.SDKConfig, authManager *coreauth.Manager) *B
 	}
 }
 
-// SetAPIKeyPolicyManager updates the API key policy manager reference.
-func (h *BaseAPIHandler) SetAPIKeyPolicyManager(manager *apikeypolicy.Manager) {
-	if h == nil {
-		return
-	}
-	h.APIKeyPolicyManager = manager
-}
-
 // UpdateClients updates the handlers' client list and configuration.
 // This method is called when the configuration or authentication tokens change.
 //
@@ -298,6 +310,9 @@ func (h *BaseAPIHandler) SetAPIKeyPolicyManager(manager *apikeypolicy.Manager) {
 //   - clients: The new slice of AI service clients
 //   - cfg: The new application configuration
 func (h *BaseAPIHandler) UpdateClients(cfg *config.SDKConfig) { h.Cfg = cfg }
+
+// SetAPIKeyPolicyManager sets the API key policy manager for rate limiting.
+func (h *BaseAPIHandler) SetAPIKeyPolicyManager(manager *apikeypolicy.Manager) { h.APIKeyPolicyManager = manager }
 
 // GetAlt extracts the 'alt' parameter from the request query string.
 // It checks both 'alt' and '$alt' parameters and returns the appropriate value.
@@ -351,12 +366,13 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 		}
 	}
 	newCtx, cancel := context.WithCancel(parentCtx)
+	cancelCtx := newCtx
 	if requestCtx != nil && requestCtx != parentCtx {
 		go func() {
 			select {
 			case <-requestCtx.Done():
 				cancel()
-			case <-newCtx.Done():
+			case <-cancelCtx.Done():
 			}
 		}()
 	}
@@ -484,13 +500,6 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 	if errMsg != nil {
 		return nil, nil, errMsg
 	}
-	policyLease, policyErr := h.acquireAPIKeyPolicyLease(ctx, normalizedModel)
-	if policyErr != nil {
-		return nil, nil, policyErr
-	}
-	if policyLease != nil {
-		defer policyLease.Release()
-	}
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
 	payload := rawJSON
@@ -510,6 +519,7 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 	opts.Metadata = reqMeta
 	resp, err := h.AuthManager.Execute(ctx, providers, req, opts)
 	if err != nil {
+		err = enrichAuthSelectionError(err, providers, normalizedModel)
 		status := http.StatusInternalServerError
 		if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
 			if code := se.StatusCode(); code > 0 {
@@ -537,13 +547,6 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 	if errMsg != nil {
 		return nil, nil, errMsg
 	}
-	policyLease, policyErr := h.acquireAPIKeyPolicyLease(ctx, normalizedModel)
-	if policyErr != nil {
-		return nil, nil, policyErr
-	}
-	if policyLease != nil {
-		defer policyLease.Release()
-	}
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
 	payload := rawJSON
@@ -563,6 +566,7 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 	opts.Metadata = reqMeta
 	resp, err := h.AuthManager.ExecuteCount(ctx, providers, req, opts)
 	if err != nil {
+		err = enrichAuthSelectionError(err, providers, normalizedModel)
 		status := http.StatusInternalServerError
 		if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
 			if code := se.StatusCode(); code > 0 {
@@ -594,13 +598,6 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 		close(errChan)
 		return nil, nil, errChan
 	}
-	policyLease, policyErr := h.acquireAPIKeyPolicyLease(ctx, normalizedModel)
-	if policyErr != nil {
-		errChan := make(chan *interfaces.ErrorMessage, 1)
-		errChan <- policyErr
-		close(errChan)
-		return nil, nil, errChan
-	}
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
 	payload := rawJSON
@@ -620,9 +617,7 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 	opts.Metadata = reqMeta
 	streamResult, err := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
 	if err != nil {
-		if policyLease != nil {
-			policyLease.Release()
-		}
+		err = enrichAuthSelectionError(err, providers, normalizedModel)
 		errChan := make(chan *interfaces.ErrorMessage, 1)
 		status := http.StatusInternalServerError
 		if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
@@ -654,9 +649,6 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 	dataChan := make(chan []byte)
 	errChan := make(chan *interfaces.ErrorMessage, 1)
 	go func() {
-		if policyLease != nil {
-			defer policyLease.Release()
-		}
 		defer close(dataChan)
 		defer close(errChan)
 		sentPayload := false
@@ -735,7 +727,7 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 								chunks = retryResult.Chunks
 								continue outer
 							}
-							streamErr = retryErr
+							streamErr = enrichAuthSelectionError(retryErr, providers, normalizedModel)
 						}
 					}
 
@@ -770,62 +762,6 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 		}
 	}()
 	return dataChan, upstreamHeaders, errChan
-}
-
-func (h *BaseAPIHandler) acquireAPIKeyPolicyLease(ctx context.Context, modelName string) (apikeypolicy.Lease, *interfaces.ErrorMessage) {
-	if h == nil || h.APIKeyPolicyManager == nil {
-		return nil, nil
-	}
-	apiKey := apiKeyFromContext(ctx)
-	if apiKey == "" {
-		return nil, nil
-	}
-
-	lease, err := h.APIKeyPolicyManager.Acquire(ctx, apiKey, modelName)
-	if err == nil {
-		return lease, nil
-	}
-
-	status := http.StatusTooManyRequests
-	if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
-		if code := se.StatusCode(); code > 0 {
-			status = code
-		}
-	}
-	var addon http.Header
-	if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
-		if hdr := he.Headers(); hdr != nil {
-			addon = hdr.Clone()
-		}
-	}
-
-	return nil, &interfaces.ErrorMessage{
-		StatusCode: status,
-		Error:      err,
-		Addon:      addon,
-	}
-}
-
-func apiKeyFromContext(ctx context.Context) string {
-	if ctx == nil {
-		return ""
-	}
-	ginCtx, ok := ctx.Value("gin").(*gin.Context)
-	if !ok || ginCtx == nil {
-		return ""
-	}
-	raw, exists := ginCtx.Get("apiKey")
-	if !exists {
-		return ""
-	}
-	switch value := raw.(type) {
-	case string:
-		return strings.TrimSpace(value)
-	case fmt.Stringer:
-		return strings.TrimSpace(value.String())
-	default:
-		return strings.TrimSpace(fmt.Sprintf("%v", value))
-	}
 }
 
 func validateSSEDataJSON(chunk []byte) error {
@@ -886,6 +822,13 @@ func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string
 	parsed := thinking.ParseSuffix(resolvedModelName)
 	baseModel := strings.TrimSpace(parsed.ModelName)
 
+	if strings.EqualFold(baseModel, "gpt-image-2") {
+		return nil, "", &interfaces.ErrorMessage{
+			StatusCode: http.StatusServiceUnavailable,
+			Error:      fmt.Errorf("model %s is only supported on /v1/images/generations and /v1/images/edits", baseModel),
+		}
+	}
+
 	providers = util.GetProviderName(baseModel)
 	// Fallback: if baseModel has no provider but differs from resolvedModelName,
 	// try using the full model name. This handles edge cases where custom models
@@ -931,6 +874,54 @@ func replaceHeader(dst http.Header, src http.Header) {
 	}
 	for key, values := range src {
 		dst[key] = append([]string(nil), values...)
+	}
+}
+
+func enrichAuthSelectionError(err error, providers []string, model string) error {
+	if err == nil {
+		return nil
+	}
+
+	var authErr *coreauth.Error
+	if !errors.As(err, &authErr) || authErr == nil {
+		return err
+	}
+
+	code := strings.TrimSpace(authErr.Code)
+	if code != "auth_not_found" && code != "auth_unavailable" {
+		return err
+	}
+
+	providerText := strings.Join(providers, ",")
+	if providerText == "" {
+		providerText = "unknown"
+	}
+	modelText := strings.TrimSpace(model)
+	if modelText == "" {
+		modelText = "unknown"
+	}
+
+	baseMessage := strings.TrimSpace(authErr.Message)
+	if baseMessage == "" {
+		baseMessage = "no auth available"
+	}
+	detail := fmt.Sprintf("%s (providers=%s, model=%s)", baseMessage, providerText, modelText)
+
+	// Clarify the most common alias confusion between Anthropic route names and internal provider keys.
+	if strings.Contains(","+providerText+",", ",claude,") {
+		detail += "; check Claude auth/key session and cooldown state via /v0/management/auth-files"
+	}
+
+	status := authErr.HTTPStatus
+	if status <= 0 {
+		status = http.StatusServiceUnavailable
+	}
+
+	return &coreauth.Error{
+		Code:       authErr.Code,
+		Message:    detail,
+		Retryable:  authErr.Retryable,
+		HTTPStatus: status,
 	}
 }
 

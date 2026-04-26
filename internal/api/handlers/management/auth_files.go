@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"os"
@@ -25,9 +26,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/claude"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	geminiAuth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/gemini"
-	iflowauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/iflow"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kimi"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/qwen"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
@@ -42,15 +41,12 @@ import (
 
 var lastRefreshKeys = []string{"last_refresh", "lastRefresh", "last_refreshed_at", "lastRefreshedAt"}
 
-var errInvalidAuthFilePayload = errors.New("invalid auth file payload")
-
 const (
 	anthropicCallbackPort = 54545
 	geminiCallbackPort    = 8085
 	codexCallbackPort     = 1455
 	geminiCLIEndpoint     = "https://cloudcode-pa.googleapis.com"
 	geminiCLIVersion      = "v1internal"
-	maxAuthFilesPageSize  = 1000
 )
 
 type callbackForwarder struct {
@@ -60,8 +56,10 @@ type callbackForwarder struct {
 }
 
 var (
-	callbackForwardersMu sync.Mutex
-	callbackForwarders   = make(map[int]*callbackForwarder)
+	callbackForwardersMu  sync.Mutex
+	callbackForwarders    = make(map[int]*callbackForwarder)
+	errAuthFileMustBeJSON = errors.New("auth file must be .json")
+	errAuthFileNotFound   = errors.New("auth file not found")
 )
 
 func extractLastRefreshTimestamp(meta map[string]any) (time.Time, bool) {
@@ -142,7 +140,7 @@ func startCallbackForwarder(port int, provider, targetBase string) (*callbackFor
 		stopForwarderInstance(port, prev)
 	}
 
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	addr := fmt.Sprintf("0.0.0.0:%d", port)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to listen on %s: %w", addr, err)
@@ -258,7 +256,7 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		nameJ, _ := files[j]["name"].(string)
 		return strings.ToLower(nameI) < strings.ToLower(nameJ)
 	})
-	h.writeAuthFilesResponse(c, files)
+	c.JSON(200, gin.H{"files": files})
 }
 
 // GetAuthFileModels returns the models supported by a specific auth file
@@ -355,97 +353,7 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 			files = append(files, fileData)
 		}
 	}
-	sort.Slice(files, func(i, j int) bool {
-		nameI, _ := files[i]["name"].(string)
-		nameJ, _ := files[j]["name"].(string)
-		return strings.ToLower(nameI) < strings.ToLower(nameJ)
-	})
-	h.writeAuthFilesResponse(c, files)
-}
-
-func (h *Handler) writeAuthFilesResponse(c *gin.Context, files []gin.H) {
-	page, pageSize, paginated, err := parseAuthFilesPageRequest(c)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	total := len(files)
-	resp := gin.H{
-		"files": files,
-		"total": total,
-	}
-
-	if !paginated {
-		c.JSON(http.StatusOK, resp)
-		return
-	}
-
-	totalPages := 0
-	if total > 0 {
-		totalPages = (total + pageSize - 1) / pageSize
-	}
-	if totalPages > 0 && page > totalPages {
-		page = totalPages
-	}
-	start := 0
-	end := total
-	if total > 0 {
-		start = (page - 1) * pageSize
-		if start < 0 {
-			start = 0
-		}
-		if start > total {
-			start = total
-		}
-		end = start + pageSize
-		if end > total {
-			end = total
-		}
-		files = files[start:end]
-	} else {
-		files = []gin.H{}
-	}
-
-	resp["files"] = files
-	resp["page"] = page
-	resp["page_size"] = pageSize
-	resp["total_pages"] = totalPages
-	c.JSON(http.StatusOK, resp)
-}
-
-func parseAuthFilesPageRequest(c *gin.Context) (int, int, bool, error) {
-	if c == nil {
-		return 0, 0, false, fmt.Errorf("request context is required")
-	}
-	rawPage := strings.TrimSpace(c.Query("page"))
-	rawPageSize := strings.TrimSpace(c.Query("page_size"))
-	if rawPage == "" && rawPageSize == "" {
-		return 0, 0, false, nil
-	}
-
-	page := 1
-	if rawPage != "" {
-		parsed, err := strconv.Atoi(rawPage)
-		if err != nil || parsed <= 0 {
-			return 0, 0, false, fmt.Errorf("page must be a positive integer")
-		}
-		page = parsed
-	}
-
-	pageSize := maxAuthFilesPageSize
-	if rawPageSize != "" {
-		parsed, err := strconv.Atoi(rawPageSize)
-		if err != nil || parsed <= 0 {
-			return 0, 0, false, fmt.Errorf("page_size must be a positive integer")
-		}
-		if parsed > maxAuthFilesPageSize {
-			parsed = maxAuthFilesPageSize
-		}
-		pageSize = parsed
-	}
-
-	return page, pageSize, true, nil
+	c.JSON(200, gin.H{"files": files})
 }
 
 func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
@@ -503,27 +411,6 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	}
 	if !auth.NextRetryAfter.IsZero() {
 		entry["next_retry_after"] = auth.NextRetryAfter
-	}
-	if auth.LastError != nil {
-		lastError := gin.H{}
-		if code := strings.TrimSpace(auth.LastError.Code); code != "" {
-			lastError["code"] = code
-			entry["error_code"] = code
-		}
-		if message := strings.TrimSpace(auth.LastError.Message); message != "" {
-			lastError["message"] = message
-			entry["error_message"] = message
-		}
-		if auth.LastError.HTTPStatus > 0 {
-			lastError["http_status"] = auth.LastError.HTTPStatus
-			entry["error_http_status"] = auth.LastError.HTTPStatus
-		}
-		if auth.LastError.Retryable {
-			lastError["retryable"] = true
-		}
-		if len(lastError) > 0 {
-			entry["last_error"] = lastError
-		}
 	}
 	if path != "" {
 		entry["path"] = path
@@ -652,12 +539,24 @@ func isRuntimeOnlyAuth(auth *coreauth.Auth) bool {
 	return strings.EqualFold(strings.TrimSpace(auth.Attributes["runtime_only"]), "true")
 }
 
+func isUnsafeAuthFileName(name string) bool {
+	if strings.TrimSpace(name) == "" {
+		return true
+	}
+	if strings.ContainsAny(name, "/\\") {
+		return true
+	}
+	if filepath.VolumeName(name) != "" {
+		return true
+	}
+	return false
+}
+
 // Download single auth file by name
 func (h *Handler) DownloadAuthFile(c *gin.Context) {
-	name := c.Query("name")
-	name = strings.TrimSpace(name)
-	if name == "" {
-		c.JSON(400, gin.H{"error": "name is required"})
+	name := strings.TrimSpace(c.Query("name"))
+	if isUnsafeAuthFileName(name) {
+		c.JSON(400, gin.H{"error": "invalid name"})
 		return
 	}
 	if !strings.HasSuffix(strings.ToLower(name), ".json") {
@@ -685,52 +584,62 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
-	if file, err := c.FormFile("file"); err == nil && file != nil {
-		name := filepath.Base(file.Filename)
-		if !strings.HasSuffix(strings.ToLower(name), ".json") {
-			c.JSON(400, gin.H{"error": "file must be .json"})
-			return
-		}
-		src, errOpen := file.Open()
-		if errOpen != nil {
-			c.JSON(400, gin.H{"error": fmt.Sprintf("failed to read uploaded file: %v", errOpen)})
-			return
-		}
-		defer src.Close()
-		data, errRead := io.ReadAll(src)
-		if errRead != nil {
-			c.JSON(400, gin.H{"error": fmt.Sprintf("failed to read uploaded file: %v", errRead)})
-			return
-		}
-		if len(bytes.TrimSpace(data)) == 0 {
-			c.JSON(400, gin.H{"error": "auth file is empty"})
-			return
-		}
-		dst := filepath.Join(h.cfg.AuthDir, name)
-		if !filepath.IsAbs(dst) {
-			if abs, errAbs := filepath.Abs(dst); errAbs == nil {
-				dst = abs
-			}
-		}
-		if errWrite := os.WriteFile(dst, data, 0o600); errWrite != nil {
-			c.JSON(500, gin.H{"error": fmt.Sprintf("failed to write file: %v", errWrite)})
-			return
-		}
-		if errReg := h.registerAuthFromFile(ctx, dst, data); errReg != nil {
-			if errors.Is(errReg, errInvalidAuthFilePayload) {
-				_ = os.Remove(dst)
-				c.JSON(400, gin.H{"error": errReg.Error()})
+
+	fileHeaders, errMultipart := h.multipartAuthFileHeaders(c)
+	if errMultipart != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid multipart form: %v", errMultipart)})
+		return
+	}
+	if len(fileHeaders) == 1 {
+		if _, errUpload := h.storeUploadedAuthFile(ctx, fileHeaders[0]); errUpload != nil {
+			if errors.Is(errUpload, errAuthFileMustBeJSON) {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "file must be .json"})
 				return
 			}
-			c.JSON(500, gin.H{"error": errReg.Error()})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errUpload.Error()})
 			return
 		}
-		c.JSON(200, gin.H{"status": "ok"})
+		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+		return
+	}
+	if len(fileHeaders) > 1 {
+		uploaded := make([]string, 0, len(fileHeaders))
+		failed := make([]gin.H, 0)
+		for _, file := range fileHeaders {
+			name, errUpload := h.storeUploadedAuthFile(ctx, file)
+			if errUpload != nil {
+				failureName := ""
+				if file != nil {
+					failureName = filepath.Base(file.Filename)
+				}
+				msg := errUpload.Error()
+				if errors.Is(errUpload, errAuthFileMustBeJSON) {
+					msg = "file must be .json"
+				}
+				failed = append(failed, gin.H{"name": failureName, "error": msg})
+				continue
+			}
+			uploaded = append(uploaded, name)
+		}
+		if len(failed) > 0 {
+			c.JSON(http.StatusMultiStatus, gin.H{
+				"status":   "partial",
+				"uploaded": len(uploaded),
+				"files":    uploaded,
+				"failed":   failed,
+			})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"status": "ok", "uploaded": len(uploaded), "files": uploaded})
+		return
+	}
+	if c.ContentType() == "multipart/form-data" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "no files uploaded"})
 		return
 	}
 	name := strings.TrimSpace(c.Query("name"))
-	if name == "" {
-		c.JSON(400, gin.H{"error": "name is required"})
+	if isUnsafeAuthFileName(name) {
+		c.JSON(400, gin.H{"error": "invalid name"})
 		return
 	}
 	if !strings.HasSuffix(strings.ToLower(name), ".json") {
@@ -742,26 +651,7 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "failed to read body"})
 		return
 	}
-	if len(bytes.TrimSpace(data)) == 0 {
-		c.JSON(400, gin.H{"error": "auth file is empty"})
-		return
-	}
-	dst := filepath.Join(h.cfg.AuthDir, filepath.Base(name))
-	if !filepath.IsAbs(dst) {
-		if abs, errAbs := filepath.Abs(dst); errAbs == nil {
-			dst = abs
-		}
-	}
-	if errWrite := os.WriteFile(dst, data, 0o600); errWrite != nil {
-		c.JSON(500, gin.H{"error": fmt.Sprintf("failed to write file: %v", errWrite)})
-		return
-	}
-	if err = h.registerAuthFromFile(ctx, dst, data); err != nil {
-		if errors.Is(err, errInvalidAuthFilePayload) {
-			_ = os.Remove(dst)
-			c.JSON(400, gin.H{"error": err.Error()})
-			return
-		}
+	if err = h.writeAuthFile(ctx, filepath.Base(name), data); err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
@@ -809,123 +699,210 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 		return
 	}
 
-	deleteOne := func(name string) (int, string, error) {
-		name = strings.TrimSpace(name)
-		if name == "" {
-			return http.StatusBadRequest, "", errors.New("name is required")
+	names, errNames := requestedAuthFileNamesForDelete(c)
+	if errNames != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errNames.Error()})
+		return
+	}
+	if len(names) == 0 {
+		c.JSON(400, gin.H{"error": "invalid name"})
+		return
+	}
+	if len(names) == 1 {
+		if _, status, errDelete := h.deleteAuthFileByName(ctx, names[0]); errDelete != nil {
+			c.JSON(status, gin.H{"error": errDelete.Error()})
+			return
 		}
-
-		targetPath := filepath.Join(h.cfg.AuthDir, filepath.Base(name))
-		targetID := ""
-		if targetAuth := h.findAuthForDelete(name); targetAuth != nil {
-			targetID = strings.TrimSpace(targetAuth.ID)
-			if path := strings.TrimSpace(authAttribute(targetAuth, "path")); path != "" {
-				targetPath = path
-			}
-		}
-		if !filepath.IsAbs(targetPath) {
-			if abs, errAbs := filepath.Abs(targetPath); errAbs == nil {
-				targetPath = abs
-			}
-		}
-		if errRemove := os.Remove(targetPath); errRemove != nil {
-			if os.IsNotExist(errRemove) {
-				return http.StatusNotFound, "", errors.New("file not found")
-			}
-			return http.StatusInternalServerError, "", fmt.Errorf("failed to remove file: %v", errRemove)
-		}
-		if errDeleteRecord := h.deleteTokenRecord(ctx, targetPath); errDeleteRecord != nil {
-			return http.StatusInternalServerError, "", errDeleteRecord
-		}
-		if targetID != "" {
-			h.disableAuth(ctx, targetID)
-		} else {
-			h.disableAuth(ctx, targetPath)
-		}
-		return http.StatusOK, filepath.Base(name), nil
+		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+		return
 	}
 
-	name := strings.TrimSpace(c.Query("name"))
-	var names []string
-	if name == "" {
-		type deleteAuthFilesReq struct {
-			Name  string   `json:"name"`
-			Names []string `json:"names"`
+	deletedFiles := make([]string, 0, len(names))
+	failed := make([]gin.H, 0)
+	for _, name := range names {
+		deletedName, _, errDelete := h.deleteAuthFileByName(ctx, name)
+		if errDelete != nil {
+			failed = append(failed, gin.H{"name": name, "error": errDelete.Error()})
+			continue
 		}
-		var req deleteAuthFilesReq
-		if c.Request != nil && c.Request.Body != nil {
-			data, errRead := io.ReadAll(c.Request.Body)
-			if errRead != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read body"})
-				return
-			}
-			if len(bytes.TrimSpace(data)) > 0 {
-				if errUnmarshal := json.Unmarshal(data, &req); errUnmarshal != nil {
-					c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
-					return
-				}
-			}
-		}
-		if trimmed := strings.TrimSpace(req.Name); trimmed != "" {
-			name = trimmed
-		}
-		if len(req.Names) > 0 {
-			seen := make(map[string]struct{}, len(req.Names))
-			for _, item := range req.Names {
-				trimmed := strings.TrimSpace(item)
-				if trimmed == "" {
-					continue
-				}
-				if _, ok := seen[trimmed]; ok {
-					continue
-				}
-				seen[trimmed] = struct{}{}
-				names = append(names, trimmed)
-			}
-		}
+		deletedFiles = append(deletedFiles, deletedName)
 	}
-
-	if len(names) > 0 {
-		deletedFiles := make([]string, 0, len(names))
-		failed := make([]gin.H, 0)
-		for _, item := range names {
-			_, deletedName, errDelete := deleteOne(item)
-			if errDelete != nil {
-				failed = append(failed, gin.H{
-					"name":  item,
-					"error": errDelete.Error(),
-				})
-				continue
-			}
-			deletedFiles = append(deletedFiles, deletedName)
-		}
-
-		status := "ok"
-		if len(failed) > 0 && len(deletedFiles) > 0 {
-			status = "partial"
-		} else if len(failed) > 0 {
-			status = "error"
-		}
-
-		c.JSON(http.StatusOK, gin.H{
-			"status":  status,
+	if len(failed) > 0 {
+		c.JSON(http.StatusMultiStatus, gin.H{
+			"status":  "partial",
 			"deleted": len(deletedFiles),
 			"files":   deletedFiles,
 			"failed":  failed,
 		})
 		return
 	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "deleted": len(deletedFiles), "files": deletedFiles})
+}
 
-	if name == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
-		return
+func (h *Handler) multipartAuthFileHeaders(c *gin.Context) ([]*multipart.FileHeader, error) {
+	if h == nil || c == nil || c.ContentType() != "multipart/form-data" {
+		return nil, nil
 	}
-	statusCode, _, errDelete := deleteOne(name)
-	if errDelete != nil {
-		c.JSON(statusCode, gin.H{"error": errDelete.Error()})
-		return
+	form, err := c.MultipartForm()
+	if err != nil {
+		return nil, err
 	}
-	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	if form == nil || len(form.File) == 0 {
+		return nil, nil
+	}
+
+	keys := make([]string, 0, len(form.File))
+	for key := range form.File {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	headers := make([]*multipart.FileHeader, 0)
+	for _, key := range keys {
+		headers = append(headers, form.File[key]...)
+	}
+	return headers, nil
+}
+
+func (h *Handler) storeUploadedAuthFile(ctx context.Context, file *multipart.FileHeader) (string, error) {
+	if file == nil {
+		return "", fmt.Errorf("no file uploaded")
+	}
+	name := filepath.Base(strings.TrimSpace(file.Filename))
+	if !strings.HasSuffix(strings.ToLower(name), ".json") {
+		return "", errAuthFileMustBeJSON
+	}
+	src, err := file.Open()
+	if err != nil {
+		return "", fmt.Errorf("failed to open uploaded file: %w", err)
+	}
+	defer src.Close()
+
+	data, err := io.ReadAll(src)
+	if err != nil {
+		return "", fmt.Errorf("failed to read uploaded file: %w", err)
+	}
+	if err := h.writeAuthFile(ctx, name, data); err != nil {
+		return "", err
+	}
+	return name, nil
+}
+
+func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) error {
+	dst := filepath.Join(h.cfg.AuthDir, filepath.Base(name))
+	if !filepath.IsAbs(dst) {
+		if abs, errAbs := filepath.Abs(dst); errAbs == nil {
+			dst = abs
+		}
+	}
+	auth, err := h.buildAuthFromFileData(dst, data)
+	if err != nil {
+		return err
+	}
+	if errWrite := os.WriteFile(dst, data, 0o600); errWrite != nil {
+		return fmt.Errorf("failed to write file: %w", errWrite)
+	}
+	if err := h.upsertAuthRecord(ctx, auth); err != nil {
+		return err
+	}
+	return nil
+}
+
+func requestedAuthFileNamesForDelete(c *gin.Context) ([]string, error) {
+	if c == nil {
+		return nil, nil
+	}
+	names := uniqueAuthFileNames(c.QueryArray("name"))
+	if len(names) > 0 {
+		return names, nil
+	}
+
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read body")
+	}
+	body = bytes.TrimSpace(body)
+	if len(body) == 0 {
+		return nil, nil
+	}
+
+	var objectBody struct {
+		Name  string   `json:"name"`
+		Names []string `json:"names"`
+	}
+	if body[0] == '[' {
+		var arrayBody []string
+		if err := json.Unmarshal(body, &arrayBody); err != nil {
+			return nil, fmt.Errorf("invalid request body")
+		}
+		return uniqueAuthFileNames(arrayBody), nil
+	}
+	if err := json.Unmarshal(body, &objectBody); err != nil {
+		return nil, fmt.Errorf("invalid request body")
+	}
+
+	out := make([]string, 0, len(objectBody.Names)+1)
+	if strings.TrimSpace(objectBody.Name) != "" {
+		out = append(out, objectBody.Name)
+	}
+	out = append(out, objectBody.Names...)
+	return uniqueAuthFileNames(out), nil
+}
+
+func uniqueAuthFileNames(names []string) []string {
+	if len(names) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(names))
+	out := make([]string, 0, len(names))
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		out = append(out, name)
+	}
+	return out
+}
+
+func (h *Handler) deleteAuthFileByName(ctx context.Context, name string) (string, int, error) {
+	name = strings.TrimSpace(name)
+	if isUnsafeAuthFileName(name) {
+		return "", http.StatusBadRequest, fmt.Errorf("invalid name")
+	}
+
+	targetPath := filepath.Join(h.cfg.AuthDir, filepath.Base(name))
+	targetID := ""
+	if targetAuth := h.findAuthForDelete(name); targetAuth != nil {
+		targetID = strings.TrimSpace(targetAuth.ID)
+		if path := strings.TrimSpace(authAttribute(targetAuth, "path")); path != "" {
+			targetPath = path
+		}
+	}
+	if !filepath.IsAbs(targetPath) {
+		if abs, errAbs := filepath.Abs(targetPath); errAbs == nil {
+			targetPath = abs
+		}
+	}
+	if errRemove := os.Remove(targetPath); errRemove != nil {
+		if os.IsNotExist(errRemove) {
+			return filepath.Base(name), http.StatusNotFound, errAuthFileNotFound
+		}
+		return filepath.Base(name), http.StatusInternalServerError, fmt.Errorf("failed to remove file: %w", errRemove)
+	}
+	if errDeleteRecord := h.deleteTokenRecord(ctx, targetPath); errDeleteRecord != nil {
+		return filepath.Base(name), http.StatusInternalServerError, errDeleteRecord
+	}
+	if targetID != "" {
+		h.disableAuth(ctx, targetID)
+	} else {
+		h.disableAuth(ctx, targetPath)
+	}
+	return filepath.Base(name), http.StatusOK, nil
 }
 
 func (h *Handler) findAuthForDelete(name string) *coreauth.Auth {
@@ -959,10 +936,25 @@ func (h *Handler) authIDForPath(path string) string {
 	if path == "" {
 		return ""
 	}
+	path = filepath.Clean(path)
+	if !filepath.IsAbs(path) {
+		if abs, errAbs := filepath.Abs(path); errAbs == nil {
+			path = abs
+		}
+	}
 	id := path
 	if h != nil && h.cfg != nil {
 		authDir := strings.TrimSpace(h.cfg.AuthDir)
+		if resolvedAuthDir, errResolve := util.ResolveAuthDir(authDir); errResolve == nil && resolvedAuthDir != "" {
+			authDir = resolvedAuthDir
+		}
 		if authDir != "" {
+			authDir = filepath.Clean(authDir)
+			if !filepath.IsAbs(authDir) {
+				if abs, errAbs := filepath.Abs(authDir); errAbs == nil {
+					authDir = abs
+				}
+			}
 			if rel, errRel := filepath.Rel(authDir, path); errRel == nil && rel != "" {
 				id = rel
 			}
@@ -979,23 +971,27 @@ func (h *Handler) registerAuthFromFile(ctx context.Context, path string, data []
 	if h.authManager == nil {
 		return nil
 	}
+	auth, err := h.buildAuthFromFileData(path, data)
+	if err != nil {
+		return err
+	}
+	return h.upsertAuthRecord(ctx, auth)
+}
+
+func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Auth, error) {
 	if path == "" {
-		return fmt.Errorf("auth path is empty")
+		return nil, fmt.Errorf("auth path is empty")
 	}
 	if data == nil {
 		var err error
 		data, err = os.ReadFile(path)
 		if err != nil {
-			return fmt.Errorf("failed to read auth file: %w", err)
+			return nil, fmt.Errorf("failed to read auth file: %w", err)
 		}
-	}
-	data = bytes.TrimSpace(data)
-	if len(data) == 0 {
-		return fmt.Errorf("%w: empty file", errInvalidAuthFilePayload)
 	}
 	metadata := make(map[string]any)
 	if err := json.Unmarshal(data, &metadata); err != nil {
-		return fmt.Errorf("%w: %v", errInvalidAuthFilePayload, err)
+		return nil, fmt.Errorf("invalid auth file: %w", err)
 	}
 	provider, _ := metadata["type"].(string)
 	if provider == "" {
@@ -1029,13 +1025,26 @@ func (h *Handler) registerAuthFromFile(ctx context.Context, path string, data []
 	if hasLastRefresh {
 		auth.LastRefreshedAt = lastRefresh
 	}
-	if existing, ok := h.authManager.GetByID(authID); ok {
-		auth.CreatedAt = existing.CreatedAt
-		if !hasLastRefresh {
-			auth.LastRefreshedAt = existing.LastRefreshedAt
+	if h != nil && h.authManager != nil {
+		if existing, ok := h.authManager.GetByID(authID); ok {
+			auth.CreatedAt = existing.CreatedAt
+			if !hasLastRefresh {
+				auth.LastRefreshedAt = existing.LastRefreshedAt
+			}
+			auth.NextRefreshAfter = existing.NextRefreshAfter
+			auth.Runtime = existing.Runtime
 		}
-		auth.NextRefreshAfter = existing.NextRefreshAfter
-		auth.Runtime = existing.Runtime
+	}
+	coreauth.ApplyCustomHeadersFromMetadata(auth)
+	return auth, nil
+}
+
+func (h *Handler) upsertAuthRecord(ctx context.Context, auth *coreauth.Auth) error {
+	if h == nil || h.authManager == nil || auth == nil {
+		return nil
+	}
+	if existing, ok := h.authManager.GetByID(auth.ID); ok {
+		auth.CreatedAt = existing.CreatedAt
 		_, err := h.authManager.Update(ctx, auth)
 		return err
 	}
@@ -1101,43 +1110,15 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 	}
 	targetAuth.UpdatedAt = time.Now()
 
-	// Persist the disabled state back to the JSON file so it survives restarts.
-	if err := h.persistAuthFileDisabledField(ctx, targetAuth, *req.Disabled); err != nil {
-		log.WithError(err).Warnf("failed to persist disabled state to auth file for %s", name)
+	if _, err := h.authManager.Update(ctx, targetAuth); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth: %v", err)})
+		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "disabled": *req.Disabled})
 }
 
-// persistAuthFileDisabledField updates the "disabled" field in the auth JSON file on disk.
-func (h *Handler) persistAuthFileDisabledField(ctx context.Context, auth *coreauth.Auth, disabled bool) error {
-	if auth == nil || h.cfg == nil || h.cfg.AuthDir == "" {
-		return nil
-	}
-	path := strings.TrimSpace(authAttribute(auth, "path"))
-	if path == "" {
-		return nil
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return fmt.Errorf("failed to read auth file: %w", err)
-	}
-	var metadata map[string]any
-	if err := json.Unmarshal(data, &metadata); err != nil {
-		return fmt.Errorf("failed to parse auth file: %w", err)
-	}
-	metadata["disabled"] = disabled
-	updated, err := json.MarshalIndent(metadata, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal updated auth file: %w", err)
-	}
-	if err := os.WriteFile(path, updated, 0o600); err != nil {
-		return fmt.Errorf("failed to write auth file: %w", err)
-	}
-	return nil
-}
-
-// PatchAuthFileFields updates editable fields (prefix, proxy_url, priority, note) of an auth file.
+// PatchAuthFileFields updates editable fields (prefix, proxy_url, headers, priority, note) of an auth file.
 func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	if h.authManager == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
@@ -1145,11 +1126,12 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	}
 
 	var req struct {
-		Name     string  `json:"name"`
-		Prefix   *string `json:"prefix"`
-		ProxyURL *string `json:"proxy_url"`
-		Priority *int    `json:"priority"`
-		Note     *string `json:"note"`
+		Name     string            `json:"name"`
+		Prefix   *string           `json:"prefix"`
+		ProxyURL *string           `json:"proxy_url"`
+		Headers  map[string]string `json:"headers"`
+		Priority *int              `json:"priority"`
+		Note     *string           `json:"note"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
@@ -1185,12 +1167,106 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 
 	changed := false
 	if req.Prefix != nil {
-		targetAuth.Prefix = *req.Prefix
+		prefix := strings.TrimSpace(*req.Prefix)
+		targetAuth.Prefix = prefix
+		if targetAuth.Metadata == nil {
+			targetAuth.Metadata = make(map[string]any)
+		}
+		if prefix == "" {
+			delete(targetAuth.Metadata, "prefix")
+		} else {
+			targetAuth.Metadata["prefix"] = prefix
+		}
 		changed = true
 	}
 	if req.ProxyURL != nil {
-		targetAuth.ProxyURL = *req.ProxyURL
+		proxyURL := strings.TrimSpace(*req.ProxyURL)
+		targetAuth.ProxyURL = proxyURL
+		if targetAuth.Metadata == nil {
+			targetAuth.Metadata = make(map[string]any)
+		}
+		if proxyURL == "" {
+			delete(targetAuth.Metadata, "proxy_url")
+		} else {
+			targetAuth.Metadata["proxy_url"] = proxyURL
+		}
 		changed = true
+	}
+	if len(req.Headers) > 0 {
+		existingHeaders := coreauth.ExtractCustomHeadersFromMetadata(targetAuth.Metadata)
+		nextHeaders := make(map[string]string, len(existingHeaders))
+		for k, v := range existingHeaders {
+			nextHeaders[k] = v
+		}
+		headerChanged := false
+
+		for key, value := range req.Headers {
+			name := strings.TrimSpace(key)
+			if name == "" {
+				continue
+			}
+			val := strings.TrimSpace(value)
+			attrKey := "header:" + name
+			if val == "" {
+				if _, ok := nextHeaders[name]; ok {
+					delete(nextHeaders, name)
+					headerChanged = true
+				}
+				if targetAuth.Attributes != nil {
+					if _, ok := targetAuth.Attributes[attrKey]; ok {
+						headerChanged = true
+					}
+				}
+				continue
+			}
+			if prev, ok := nextHeaders[name]; !ok || prev != val {
+				headerChanged = true
+			}
+			nextHeaders[name] = val
+			if targetAuth.Attributes != nil {
+				if prev, ok := targetAuth.Attributes[attrKey]; !ok || prev != val {
+					headerChanged = true
+				}
+			} else {
+				headerChanged = true
+			}
+		}
+
+		if headerChanged {
+			if targetAuth.Metadata == nil {
+				targetAuth.Metadata = make(map[string]any)
+			}
+			if targetAuth.Attributes == nil {
+				targetAuth.Attributes = make(map[string]string)
+			}
+
+			for key, value := range req.Headers {
+				name := strings.TrimSpace(key)
+				if name == "" {
+					continue
+				}
+				val := strings.TrimSpace(value)
+				attrKey := "header:" + name
+				if val == "" {
+					delete(nextHeaders, name)
+					delete(targetAuth.Attributes, attrKey)
+					continue
+				}
+				nextHeaders[name] = val
+				targetAuth.Attributes[attrKey] = val
+			}
+
+			if len(nextHeaders) == 0 {
+				delete(targetAuth.Metadata, "headers")
+			} else {
+				metaHeaders := make(map[string]any, len(nextHeaders))
+				for k, v := range nextHeaders {
+					metaHeaders[k] = v
+				}
+				targetAuth.Metadata["headers"] = metaHeaders
+			}
+			changed = true
+		}
 	}
 	if req.Priority != nil || req.Note != nil {
 		if targetAuth.Metadata == nil {
@@ -2025,62 +2101,6 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
 }
 
-func (h *Handler) RequestQwenToken(c *gin.Context) {
-	ctx := context.Background()
-	ctx = PopulateAuthContext(ctx, c)
-
-	fmt.Println("Initializing Qwen authentication...")
-
-	state := fmt.Sprintf("gem-%d", time.Now().UnixNano())
-	// Initialize Qwen auth service
-	qwenAuth := qwen.NewQwenAuth(h.cfg)
-
-	// Generate authorization URL
-	deviceFlow, err := qwenAuth.InitiateDeviceFlow(ctx)
-	if err != nil {
-		log.Errorf("Failed to generate authorization URL: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate authorization url"})
-		return
-	}
-	authURL := deviceFlow.VerificationURIComplete
-
-	RegisterOAuthSession(state, "qwen")
-
-	go func() {
-		fmt.Println("Waiting for authentication...")
-		tokenData, errPollForToken := qwenAuth.PollForToken(deviceFlow.DeviceCode, deviceFlow.CodeVerifier)
-		if errPollForToken != nil {
-			SetOAuthSessionError(state, "Authentication failed")
-			fmt.Printf("Authentication failed: %v\n", errPollForToken)
-			return
-		}
-
-		// Create token storage
-		tokenStorage := qwenAuth.CreateTokenStorage(tokenData)
-
-		tokenStorage.Email = fmt.Sprintf("%d", time.Now().UnixMilli())
-		record := &coreauth.Auth{
-			ID:       fmt.Sprintf("qwen-%s.json", tokenStorage.Email),
-			Provider: "qwen",
-			FileName: fmt.Sprintf("qwen-%s.json", tokenStorage.Email),
-			Storage:  tokenStorage,
-			Metadata: map[string]any{"email": tokenStorage.Email},
-		}
-		savedPath, errSave := h.saveTokenRecord(ctx, record)
-		if errSave != nil {
-			log.Errorf("Failed to save authentication tokens: %v", errSave)
-			SetOAuthSessionError(state, "Failed to save authentication tokens")
-			return
-		}
-
-		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
-		fmt.Println("You can now use Qwen services through this CLI")
-		CompleteOAuthSession(state)
-	}()
-
-	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
-}
-
 func (h *Handler) RequestKimiToken(c *gin.Context) {
 	ctx := context.Background()
 	ctx = PopulateAuthContext(ctx, c)
@@ -2156,215 +2176,6 @@ func (h *Handler) RequestKimiToken(c *gin.Context) {
 	}()
 
 	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
-}
-
-func (h *Handler) RequestIFlowToken(c *gin.Context) {
-	ctx := context.Background()
-	ctx = PopulateAuthContext(ctx, c)
-
-	fmt.Println("Initializing iFlow authentication...")
-
-	state := fmt.Sprintf("ifl-%d", time.Now().UnixNano())
-	authSvc := iflowauth.NewIFlowAuth(h.cfg)
-	authURL, redirectURI := authSvc.AuthorizationURL(state, iflowauth.CallbackPort)
-
-	RegisterOAuthSession(state, "iflow")
-
-	isWebUI := isWebUIRequest(c)
-	var forwarder *callbackForwarder
-	if isWebUI {
-		targetURL, errTarget := h.managementCallbackURL("/iflow/callback")
-		if errTarget != nil {
-			log.WithError(errTarget).Error("failed to compute iflow callback target")
-			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "callback server unavailable"})
-			return
-		}
-		var errStart error
-		if forwarder, errStart = startCallbackForwarder(iflowauth.CallbackPort, "iflow", targetURL); errStart != nil {
-			log.WithError(errStart).Error("failed to start iflow callback forwarder")
-			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "failed to start callback server"})
-			return
-		}
-	}
-
-	go func() {
-		if isWebUI {
-			defer stopCallbackForwarderInstance(iflowauth.CallbackPort, forwarder)
-		}
-		fmt.Println("Waiting for authentication...")
-
-		waitFile := filepath.Join(h.cfg.AuthDir, fmt.Sprintf(".oauth-iflow-%s.oauth", state))
-		deadline := time.Now().Add(5 * time.Minute)
-		var resultMap map[string]string
-		for {
-			if !IsOAuthSessionPending(state, "iflow") {
-				return
-			}
-			if time.Now().After(deadline) {
-				SetOAuthSessionError(state, "Authentication failed")
-				fmt.Println("Authentication failed: timeout waiting for callback")
-				return
-			}
-			if data, errR := os.ReadFile(waitFile); errR == nil {
-				_ = os.Remove(waitFile)
-				_ = json.Unmarshal(data, &resultMap)
-				break
-			}
-			time.Sleep(500 * time.Millisecond)
-		}
-
-		if errStr := strings.TrimSpace(resultMap["error"]); errStr != "" {
-			SetOAuthSessionError(state, "Authentication failed")
-			fmt.Printf("Authentication failed: %s\n", errStr)
-			return
-		}
-		if resultState := strings.TrimSpace(resultMap["state"]); resultState != state {
-			SetOAuthSessionError(state, "Authentication failed")
-			fmt.Println("Authentication failed: state mismatch")
-			return
-		}
-
-		code := strings.TrimSpace(resultMap["code"])
-		if code == "" {
-			SetOAuthSessionError(state, "Authentication failed")
-			fmt.Println("Authentication failed: code missing")
-			return
-		}
-
-		tokenData, errExchange := authSvc.ExchangeCodeForTokens(ctx, code, redirectURI)
-		if errExchange != nil {
-			SetOAuthSessionError(state, "Authentication failed")
-			fmt.Printf("Authentication failed: %v\n", errExchange)
-			return
-		}
-
-		tokenStorage := authSvc.CreateTokenStorage(tokenData)
-		identifier := strings.TrimSpace(tokenStorage.Email)
-		if identifier == "" {
-			identifier = fmt.Sprintf("%d", time.Now().UnixMilli())
-			tokenStorage.Email = identifier
-		}
-		record := &coreauth.Auth{
-			ID:         fmt.Sprintf("iflow-%s.json", identifier),
-			Provider:   "iflow",
-			FileName:   fmt.Sprintf("iflow-%s.json", identifier),
-			Storage:    tokenStorage,
-			Metadata:   map[string]any{"email": identifier, "api_key": tokenStorage.APIKey},
-			Attributes: map[string]string{"api_key": tokenStorage.APIKey},
-		}
-
-		savedPath, errSave := h.saveTokenRecord(ctx, record)
-		if errSave != nil {
-			SetOAuthSessionError(state, "Failed to save authentication tokens")
-			log.Errorf("Failed to save authentication tokens: %v", errSave)
-			return
-		}
-
-		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
-		if tokenStorage.APIKey != "" {
-			fmt.Println("API key obtained and saved")
-		}
-		fmt.Println("You can now use iFlow services through this CLI")
-		CompleteOAuthSession(state)
-		CompleteOAuthSessionsByProvider("iflow")
-	}()
-
-	c.JSON(http.StatusOK, gin.H{"status": "ok", "url": authURL, "state": state})
-}
-
-func (h *Handler) RequestIFlowCookieToken(c *gin.Context) {
-	ctx := context.Background()
-
-	var payload struct {
-		Cookie string `json:"cookie"`
-	}
-	if err := c.ShouldBindJSON(&payload); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "cookie is required"})
-		return
-	}
-
-	cookieValue := strings.TrimSpace(payload.Cookie)
-
-	if cookieValue == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "cookie is required"})
-		return
-	}
-
-	cookieValue, errNormalize := iflowauth.NormalizeCookie(cookieValue)
-	if errNormalize != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": errNormalize.Error()})
-		return
-	}
-
-	// Check for duplicate BXAuth before authentication
-	bxAuth := iflowauth.ExtractBXAuth(cookieValue)
-	if existingFile, err := iflowauth.CheckDuplicateBXAuth(h.cfg.AuthDir, bxAuth); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "failed to check duplicate"})
-		return
-	} else if existingFile != "" {
-		existingFileName := filepath.Base(existingFile)
-		c.JSON(http.StatusConflict, gin.H{"status": "error", "error": "duplicate BXAuth found", "existing_file": existingFileName})
-		return
-	}
-
-	authSvc := iflowauth.NewIFlowAuth(h.cfg)
-	tokenData, errAuth := authSvc.AuthenticateWithCookie(ctx, cookieValue)
-	if errAuth != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": errAuth.Error()})
-		return
-	}
-
-	tokenData.Cookie = cookieValue
-
-	tokenStorage := authSvc.CreateCookieTokenStorage(tokenData)
-	email := strings.TrimSpace(tokenStorage.Email)
-	if email == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "failed to extract email from token"})
-		return
-	}
-
-	fileName := iflowauth.SanitizeIFlowFileName(email)
-	if fileName == "" {
-		fileName = fmt.Sprintf("iflow-%d", time.Now().UnixMilli())
-	} else {
-		fileName = fmt.Sprintf("iflow-%s", fileName)
-	}
-
-	tokenStorage.Email = email
-	timestamp := time.Now().Unix()
-
-	record := &coreauth.Auth{
-		ID:       fmt.Sprintf("%s-%d.json", fileName, timestamp),
-		Provider: "iflow",
-		FileName: fmt.Sprintf("%s-%d.json", fileName, timestamp),
-		Storage:  tokenStorage,
-		Metadata: map[string]any{
-			"email":        email,
-			"api_key":      tokenStorage.APIKey,
-			"expired":      tokenStorage.Expire,
-			"cookie":       tokenStorage.Cookie,
-			"type":         tokenStorage.Type,
-			"last_refresh": tokenStorage.LastRefresh,
-		},
-		Attributes: map[string]string{
-			"api_key": tokenStorage.APIKey,
-		},
-	}
-
-	savedPath, errSave := h.saveTokenRecord(ctx, record)
-	if errSave != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "failed to save authentication tokens"})
-		return
-	}
-
-	fmt.Printf("iFlow cookie authentication successful. Token saved to %s\n", savedPath)
-	c.JSON(http.StatusOK, gin.H{
-		"status":     "ok",
-		"saved_path": savedPath,
-		"email":      email,
-		"expired":    tokenStorage.Expire,
-		"type":       tokenStorage.Type,
-	})
 }
 
 type projectSelectionRequiredError struct{}
