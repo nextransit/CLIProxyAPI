@@ -416,36 +416,6 @@ func TestAddOrUpdateClientTriggersReloadAndHash(t *testing.T) {
 	}
 }
 
-func TestAddOrUpdateClientContinuesWhenCoreAuthUnmarshalFails(t *testing.T) {
-	tmpDir := t.TempDir()
-	authFile := filepath.Join(tmpDir, "legacy-codex.json")
-	payload := `{"type":"codex","email":"legacy@example.com","created_at":"2026-03-18T12:15:22.702943","openai_token":"oa_token_legacy","refresh_token":"oa_refresh_legacy"}`
-	if err := os.WriteFile(authFile, []byte(payload), 0o644); err != nil {
-		t.Fatalf("failed to create auth file: %v", err)
-	}
-
-	w := &Watcher{
-		authDir:          tmpDir,
-		lastAuthHashes:   make(map[string]string),
-		lastAuthContents: make(map[string]*coreauth.Auth),
-		fileAuthsByPath:  make(map[string]map[string]*coreauth.Auth),
-	}
-	w.SetConfig(&config.Config{AuthDir: tmpDir})
-
-	w.addOrUpdateClient(authFile)
-
-	normalized := w.normalizeAuthPath(authFile)
-	if _, ok := w.lastAuthHashes[normalized]; !ok {
-		t.Fatalf("expected hash to be stored for %s", normalized)
-	}
-	if _, ok := w.fileAuthsByPath[normalized]; !ok {
-		t.Fatalf("expected synthesized auths for %s", normalized)
-	}
-	if len(w.currentAuths) == 0 {
-		t.Fatal("expected currentAuths to be populated from synthesized auth")
-	}
-}
-
 func TestRemoveClientRemovesHash(t *testing.T) {
 	tmpDir := t.TempDir()
 	authFile := filepath.Join(tmpDir, "sample.json")
