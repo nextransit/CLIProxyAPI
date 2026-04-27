@@ -412,14 +412,14 @@ func (e *OpenAICompatExecutor) overrideModel(payload []byte, model string) []byt
 
 // isDeepSeekModel checks whether the model name indicates a DeepSeek model.
 // DeepSeek API requires reasoning_content to be passed back in multi-turn
-// conversations with tool calls, otherwise it returns 400.
+// thinking-mode conversations, otherwise it returns 400.
 func isDeepSeekModel(model string) bool {
 	return strings.Contains(strings.ToLower(model), "deepseek")
 }
 
-// ensureDeepSeekReasoningContent ensures that assistant messages with tool_calls
-// have reasoning_content present. DeepSeek's API requires reasoning_content to be
-// passed back in multi-turn conversations; missing it causes 400 errors.
+// ensureDeepSeekReasoningContent ensures assistant messages have reasoning_content present.
+// DeepSeek's API requires reasoning_content to be passed back in multi-turn
+// thinking-mode conversations; missing it causes 400 errors.
 // This mirrors the same logic in kimi_executor.go normalizeKimiToolMessageLinks.
 func ensureDeepSeekReasoningContent(payload []byte) ([]byte, error) {
 	if len(payload) == 0 || !gjson.ValidBytes(payload) {
@@ -436,7 +436,7 @@ func ensureDeepSeekReasoningContent(payload []byte) ([]byte, error) {
 	hasLatestReasoning := false
 	patched := 0
 
-	for msgIdx, msg := range messages.Array() {
+for msgIdx, msg := range messages.Array() {
 		role := strings.TrimSpace(msg.Get("role").String())
 		if role != "assistant" {
 			continue
@@ -446,23 +446,17 @@ func ensureDeepSeekReasoningContent(payload []byte) ([]byte, error) {
 		if reasoning.Exists() && strings.TrimSpace(reasoning.String()) != "" {
 			latestReasoning = reasoning.String()
 			hasLatestReasoning = true
-		}
-
-		toolCalls := msg.Get("tool_calls")
-		if !toolCalls.Exists() || !toolCalls.IsArray() || len(toolCalls.Array()) == 0 {
 			continue
 		}
 
-		if !reasoning.Exists() || strings.TrimSpace(reasoning.String()) == "" {
-			reasoningText := fallbackDeepSeekReasoning(msg, hasLatestReasoning, latestReasoning)
-			path := fmt.Sprintf("messages.%d.reasoning_content", msgIdx)
-			next, err := sjson.SetBytes(out, path, reasoningText)
-			if err != nil {
-				return payload, fmt.Errorf("openai compat executor: failed to set reasoning_content for deepseek: %w", err)
-			}
-			out = next
-			patched++
+		reasoningText := fallbackDeepSeekTextReasoning(msg, hasLatestReasoning, latestReasoning)
+		path := fmt.Sprintf("messages.%d.reasoning_content", msgIdx)
+		next, err := sjson.SetBytes(out, path, reasoningText)
+		if err != nil {
+			return payload, fmt.Errorf("openai compat executor: failed to set reasoning_content for deepseek: %w", err)
 		}
+		out = next
+patched++
 	}
 
 	if patched > 0 {
@@ -473,15 +467,42 @@ func ensureDeepSeekReasoningContent(payload []byte) ([]byte, error) {
 	return out, nil
 }
 
-// fallbackDeepSeekReasoning determines the best reasoning text to inject when
-// an assistant message has tool_calls but is missing reasoning_content.
-// It tries: 1) latest reasoning from a prior message, 2) message content text,
-// 3) a placeholder string.
-func fallbackDeepSeekReasoning(msg gjson.Result, hasLatest bool, latest string) string {
+// fallbackDeepSeekReasoningForAssistant determines the best reasoning text to inject
+// when an assistant message is missing reasoning_content.
+// For tool-call messages, prefer previous reasoning context first.
+// For text-only assistant messages, prefer current content first.
+func fallbackDeepSeekReasoningForAssistant(msg gjson.Result, hasToolCalls bool, hasLatest bool, latest string) string {
+	if hasToolCalls {
+		return fallbackDeepSeekToolReasoning(msg, hasLatest, latest)
+	}
+	return fallbackDeepSeekTextReasoning(msg, hasLatest, latest)
+}
+
+// fallbackDeepSeekToolReasoning determines reasoning text for assistant tool-call messages.
+// It tries: 1) latest reasoning from prior messages, 2) current message content, 3) placeholder.
+func fallbackDeepSeekToolReasoning(msg gjson.Result, hasLatest bool, latest string) string {
 	if hasLatest && strings.TrimSpace(latest) != "" {
 		return latest
 	}
+	if text := extractDeepSeekReasoningContentText(msg); text != "" {
+		return text
+	}
+	return "[reasoning unavailable]"
+}
 
+// fallbackDeepSeekTextReasoning determines reasoning text for assistant text-only messages.
+// It tries: 1) current message content, 2) latest reasoning from prior messages, 3) placeholder.
+func fallbackDeepSeekTextReasoning(msg gjson.Result, hasLatest bool, latest string) string {
+	if text := extractDeepSeekReasoningContentText(msg); text != "" {
+		return text
+	}
+	if hasLatest && strings.TrimSpace(latest) != "" {
+		return latest
+	}
+	return "[reasoning unavailable]"
+}
+
+func extractDeepSeekReasoningContentText(msg gjson.Result) string {
 	content := msg.Get("content")
 	if content.Type == gjson.String {
 		if text := strings.TrimSpace(content.String()); text != "" {
@@ -501,8 +522,7 @@ func fallbackDeepSeekReasoning(msg gjson.Result, hasLatest bool, latest string) 
 			return strings.Join(parts, "\n")
 		}
 	}
-
-	return "[reasoning unavailable]"
+	return ""
 }
 
 type statusErr struct {
