@@ -145,12 +145,11 @@ start_server() {
 
   echo "Starting server in background..."
   cd "$ROOT_DIR"
-  nohup env MANAGEMENT_PASSWORD="$MANAGEMENT_PASSWORD" "$BIN_PATH" --config "$runtime_config" ${extra_args[@]+"${extra_args[@]}"} >>"$LOG_FILE" 2>&1 &
+  env MANAGEMENT_PASSWORD="$MANAGEMENT_PASSWORD" nohup "$BIN_PATH" --config "$runtime_config" ${extra_args[@]+"${extra_args[@]}"} >>"$LOG_FILE" 2>&1 &
   local pid=$!
-  echo "$pid" >"$PID_FILE"
-
-  sleep 1
-  if kill -0 "$pid" >/dev/null 2>&1; then
+  sleep 2
+  if kill -0 $pid 2>/dev/null; then
+    echo "$pid" > "$PID_FILE"
     echo "Server started (PID: $pid)"
     echo "Log file: $LOG_FILE"
   else
