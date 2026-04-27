@@ -9,7 +9,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -216,7 +215,7 @@ func (e *GeminiCLIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 			return resp, err
 		}
 
-		data, errRead := io.ReadAll(httpResp.Body)
+		data, errRead := helps.LimitedReadAll(httpResp.Body)
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("gemini cli executor: close response body error: %v", errClose)
 		}
@@ -363,7 +362,7 @@ func (e *GeminiCLIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 		}
 		helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 		if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-			data, errRead := io.ReadAll(httpResp.Body)
+			data, errRead := helps.LimitedReadAll(httpResp.Body)
 			if errClose := httpResp.Body.Close(); errClose != nil {
 				log.Errorf("gemini cli executor: close response body error: %v", errClose)
 			}
@@ -426,7 +425,7 @@ func (e *GeminiCLIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 				return
 			}
 
-			data, errRead := io.ReadAll(resp.Body)
+			data, errRead := helps.LimitedReadAll(resp.Body)
 			if errRead != nil {
 				helps.RecordAPIResponseError(ctx, e.cfg, errRead)
 				reporter.PublishFailure(ctx)
@@ -542,7 +541,7 @@ func (e *GeminiCLIExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.
 			helps.RecordAPIResponseError(ctx, e.cfg, errDo)
 			return cliproxyexecutor.Response{}, errDo
 		}
-		data, errRead := io.ReadAll(resp.Body)
+		data, errRead := helps.LimitedReadAll(resp.Body)
 		if errClose := resp.Body.Close(); errClose != nil {
 			helps.LogWithRequestID(ctx).Errorf("response body close error: %v", errClose)
 		}

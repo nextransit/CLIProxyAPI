@@ -3,9 +3,12 @@ package middleware
 import (
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
+
+	"github.com/gin-gonic/gin"
 )
 
 func TestShouldSkipMethodForRequestLogging(t *testing.T) {
@@ -134,5 +137,32 @@ func TestShouldCaptureRequestBody(t *testing.T) {
 		if got != tests[i].want {
 			t.Fatalf("%s: got %t, want %t", tests[i].name, got, tests[i].want)
 		}
+	}
+}
+
+func TestCaptureRequestInfoCapsLoggedBodyAndPreservesFullRequestBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+
+	payload := strings.Repeat("a", maxRequestBodyBytes) + "tail"
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	c.Request = req
+
+	info, err := captureRequestInfo(c, true)
+	if err != nil {
+		t.Fatalf("captureRequestInfo returned error: %v", err)
+	}
+	if len(info.Body) != maxRequestBodyBytes {
+		t.Fatalf("captured body length = %d, want %d", len(info.Body), maxRequestBodyBytes)
+	}
+
+	restored, errRead := io.ReadAll(c.Request.Body)
+	if errRead != nil {
+		t.Fatalf("restored request body read returned error: %v", errRead)
+	}
+	if string(restored) != payload {
+		t.Fatalf("restored request body length = %d, want %d", len(restored), len(payload))
 	}
 }

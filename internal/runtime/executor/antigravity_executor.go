@@ -568,7 +568,7 @@ attemptLoop:
 			}
 
 			helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
-			bodyBytes, errRead := io.ReadAll(httpResp.Body)
+			bodyBytes, errRead := helps.LimitedReadAll(httpResp.Body)
 			if errClose := httpResp.Body.Close(); errClose != nil {
 				log.Errorf("antigravity executor: close response body error: %v", errClose)
 			}
@@ -765,7 +765,7 @@ attemptLoop:
 			}
 			helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 			if httpResp.StatusCode < http.StatusOK || httpResp.StatusCode >= http.StatusMultipleChoices {
-				bodyBytes, errRead := io.ReadAll(httpResp.Body)
+				bodyBytes, errRead := helps.LimitedReadAll(httpResp.Body)
 				if errClose := httpResp.Body.Close(); errClose != nil {
 					log.Errorf("antigravity executor: close response body error: %v", errClose)
 				}
@@ -1224,7 +1224,7 @@ attemptLoop:
 			}
 			helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 			if httpResp.StatusCode < http.StatusOK || httpResp.StatusCode >= http.StatusMultipleChoices {
-				bodyBytes, errRead := io.ReadAll(httpResp.Body)
+				bodyBytes, errRead := helps.LimitedReadAll(httpResp.Body)
 				if errClose := httpResp.Body.Close(); errClose != nil {
 					log.Errorf("antigravity executor: close response body error: %v", errClose)
 				}
@@ -1511,7 +1511,7 @@ func (e *AntigravityExecutor) CountTokens(ctx context.Context, auth *cliproxyaut
 		}
 
 		helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
-		bodyBytes, errRead := io.ReadAll(httpResp.Body)
+		bodyBytes, errRead := helps.LimitedReadAll(httpResp.Body)
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("antigravity executor: close response body error: %v", errClose)
 		}
@@ -1674,7 +1674,7 @@ func (e *AntigravityExecutor) refreshToken(ctx context.Context, auth *cliproxyau
 		}
 	}()
 
-	bodyBytes, errRead := io.ReadAll(httpResp.Body)
+	bodyBytes, errRead := helps.LimitedReadAll(httpResp.Body)
 	if errRead != nil {
 		return auth, errRead
 	}
@@ -1786,7 +1786,7 @@ func (e *AntigravityExecutor) updateAntigravityCreditsBalance(ctx context.Contex
 		}
 	}()
 
-	bodyBytes, errRead := io.ReadAll(httpResp.Body)
+	bodyBytes, errRead := helps.LimitedReadAll(httpResp.Body)
 	if errRead != nil || httpResp.StatusCode < http.StatusOK || httpResp.StatusCode >= http.StatusMultipleChoices {
 		log.Debugf("antigravity executor: loadCodeAssist returned status %d, err=%v", httpResp.StatusCode, errRead)
 		return

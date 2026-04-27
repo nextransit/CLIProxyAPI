@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"golang.org/x/net/proxy"
 )
@@ -70,9 +71,19 @@ func Parse(raw string) (Setting, error) {
 
 func cloneDefaultTransport() *http.Transport {
 	if transport, ok := http.DefaultTransport.(*http.Transport); ok && transport != nil {
-		return transport.Clone()
+		t := transport.Clone()
+		applyConnPoolLimits(t)
+		return t
 	}
-	return &http.Transport{}
+	t := &http.Transport{}
+	applyConnPoolLimits(t)
+	return t
+}
+
+func applyConnPoolLimits(t *http.Transport) {
+	t.MaxIdleConns = 100
+	t.MaxIdleConnsPerHost = 10
+	t.IdleConnTimeout = 90 * time.Second
 }
 
 // NewDirectTransport returns a transport that bypasses environment proxies.
@@ -91,7 +102,9 @@ func BuildHTTPTransport(raw string) (*http.Transport, Mode, error) {
 
 	switch setting.Mode {
 	case ModeInherit:
-		return &http.Transport{Proxy: http.ProxyFromEnvironment}, setting.Mode, nil
+		t := &http.Transport{Proxy: http.ProxyFromEnvironment}
+		applyConnPoolLimits(t)
+		return t, setting.Mode, nil
 	case ModeDirect:
 		return NewDirectTransport(), setting.Mode, nil
 	case ModeProxy:

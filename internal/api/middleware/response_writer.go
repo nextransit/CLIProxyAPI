@@ -18,6 +18,13 @@ const requestBodyOverrideContextKey = "REQUEST_BODY_OVERRIDE"
 const responseBodyOverrideContextKey = "RESPONSE_BODY_OVERRIDE"
 const websocketTimelineOverrideContextKey = "WEBSOCKET_TIMELINE_OVERRIDE"
 
+// maxResponseBodyBytes caps the in-memory response body buffer to 1 MiB
+// to prevent unbounded allocation when logging is active (commercial-mode: false).
+const maxResponseBodyBytes = 1 << 20
+
+// maxRequestBodyBytes caps the request body captured for logging at 1 MiB.
+const maxRequestBodyBytes = 1 << 20
+
 // RequestInfo holds essential details of an incoming HTTP request for logging purposes.
 type RequestInfo struct {
 	URL       string              // URL is the request URL.
@@ -93,7 +100,14 @@ func (w *ResponseWriterWrapper) Write(data []byte) (int, error) {
 	}
 
 	if w.shouldBufferResponseBody() {
-		w.body.Write(data)
+		if w.body.Len() < maxResponseBodyBytes {
+			remaining := maxResponseBodyBytes - w.body.Len()
+			if len(data) > remaining {
+				w.body.Write(data[:remaining])
+			} else {
+				w.body.Write(data)
+			}
+		}
 	}
 
 	return n, err
@@ -140,7 +154,14 @@ func (w *ResponseWriterWrapper) WriteString(data string) (int, error) {
 	}
 
 	if w.shouldBufferResponseBody() {
-		w.body.WriteString(data)
+		if w.body.Len() < maxResponseBodyBytes {
+			remaining := maxResponseBodyBytes - w.body.Len()
+			if len(data) > remaining {
+				w.body.WriteString(data[:remaining])
+			} else {
+				w.body.WriteString(data)
+			}
+		}
 	}
 	return n, err
 }

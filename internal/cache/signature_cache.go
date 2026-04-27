@@ -29,6 +29,10 @@ const (
 
 	// CacheCleanupInterval controls how often stale entries are purged
 	CacheCleanupInterval = 10 * time.Minute
+
+	// MaxEntriesPerGroup caps the number of cached signatures per model group
+	// to prevent unbounded growth under high cardinality workloads.
+	MaxEntriesPerGroup = 10000
 )
 
 // signatureCache stores signatures by model group -> textHash -> SignatureEntry
@@ -98,6 +102,7 @@ func purgeExpiredCaches() {
 
 // CacheSignature stores a thinking signature for a given model group and text.
 // Used for Claude models that require signed thinking blocks in multi-turn conversations.
+// When the group cache exceeds MaxEntriesPerGroup, the oldest entry is evicted.
 func CacheSignature(modelName, text, signature string) {
 	if text == "" || signature == "" {
 		return
@@ -111,6 +116,19 @@ func CacheSignature(modelName, text, signature string) {
 	sc := getOrCreateGroupCache(groupKey)
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
+
+	// Evict oldest entry if at capacity (simple FIFO eviction by timestamp)
+	if _, exists := sc.entries[textHash]; !exists && len(sc.entries) >= MaxEntriesPerGroup {
+		var oldestKey string
+		var oldestTime time.Time
+		for k, entry := range sc.entries {
+			if oldestKey == "" || entry.Timestamp.Before(oldestTime) {
+				oldestKey = k
+				oldestTime = entry.Timestamp
+			}
+		}
+		delete(sc.entries, oldestKey)
+	}
 
 	sc.entries[textHash] = SignatureEntry{
 		Signature: signature,

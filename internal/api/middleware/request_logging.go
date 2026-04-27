@@ -128,14 +128,18 @@ func captureRequestInfo(c *gin.Context, captureBody bool) (*RequestInfo, error) 
 	// Capture request body
 	var body []byte
 	if captureBody && c.Request.Body != nil {
-		// Read the body
-		bodyBytes, err := io.ReadAll(c.Request.Body)
+		originalBody := c.Request.Body
+		bodyBytes, err := io.ReadAll(io.LimitReader(originalBody, maxRequestBodyBytes))
 		if err != nil {
 			return nil, err
 		}
 
-		// Restore the body for the actual request processing
-		c.Request.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+		// Restore the full body for the actual request processing. bodyBytes is only
+		// the logging prefix; originalBody still contains any unread remainder.
+		c.Request.Body = &replayReadCloser{
+			reader: io.MultiReader(bytes.NewReader(bodyBytes), originalBody),
+			closer: originalBody,
+		}
 		body = bodyBytes
 	}
 
@@ -147,6 +151,19 @@ func captureRequestInfo(c *gin.Context, captureBody bool) (*RequestInfo, error) 
 		RequestID: logging.GetGinRequestID(c),
 		Timestamp: time.Now(),
 	}, nil
+}
+
+type replayReadCloser struct {
+	reader io.Reader
+	closer io.Closer
+}
+
+func (r *replayReadCloser) Read(p []byte) (int, error) {
+	return r.reader.Read(p)
+}
+
+func (r *replayReadCloser) Close() error {
+	return r.closer.Close()
 }
 
 // shouldLogRequest determines whether the request should be logged.

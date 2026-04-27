@@ -13,6 +13,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime/debug"
+	"strconv"
 	"strings"
 	"time"
 
@@ -42,12 +44,27 @@ var (
 	DefaultConfigPath = ""
 )
 
-// init initializes the shared logger setup.
+// init initializes the shared logger setup and applies explicit runtime tuning overrides.
 func init() {
 	logging.SetupBaseLogger()
 	buildinfo.Version = Version
 	buildinfo.Commit = Commit
 	buildinfo.BuildDate = BuildDate
+
+	// Go applies GOMEMLIMIT/GOGC from the environment before init runs. These calls
+	// only support plain numeric overrides and avoid changing runtime defaults when
+	// the variables are not explicitly set.
+	if memLimitStr := os.Getenv("GOMEMLIMIT"); memLimitStr != "" {
+		if parsed, errParse := strconv.ParseInt(memLimitStr, 10, 64); errParse == nil && parsed > 0 {
+			debug.SetMemoryLimit(parsed)
+		}
+	}
+
+	if gcPctStr := os.Getenv("GOGC"); gcPctStr != "" {
+		if parsed, errParse := strconv.Atoi(gcPctStr); errParse == nil {
+			debug.SetGCPercent(parsed)
+		}
+	}
 }
 
 // main is the entry point of the application.
