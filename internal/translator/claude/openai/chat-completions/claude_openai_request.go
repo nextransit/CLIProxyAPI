@@ -204,8 +204,20 @@ func ConvertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream 
 					})
 				}
 
-				// Handle tool calls (for assistant messages)
-				if toolCalls := message.Get("tool_calls"); toolCalls.Exists() && toolCalls.IsArray() && role == "assistant" {
+// Handle reasoning_content (thinking content from previous turns).
+// Claude API requires thinking content from prior turns to be passed back
+// via thinking content blocks in multi-turn conversations.
+if reasoningContent := message.Get("reasoning_content"); reasoningContent.Exists() && reasoningContent.String() != "" {
+	reasoningText := reasoningContent.String()
+	if strings.TrimSpace(reasoningText) != "" {
+		thinkingPart := []byte(`{"type":"thinking","thinking":""}`)
+		thinkingPart, _ = sjson.SetBytes(thinkingPart, "thinking", reasoningText)
+		msg, _ = sjson.SetRawBytes(msg, "content.-1", thinkingPart)
+	}
+}
+
+// Handle tool calls (for assistant messages)
+if toolCalls := message.Get("tool_calls"); toolCalls.Exists() && toolCalls.IsArray() && role == "assistant" {
 					toolCalls.ForEach(func(_, toolCall gjson.Result) bool {
 						if toolCall.Get("type").String() == "function" {
 							toolCallID := toolCall.Get("id").String()

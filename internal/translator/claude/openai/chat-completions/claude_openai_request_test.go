@@ -243,3 +243,118 @@ func TestConvertOpenAIRequestToClaude_SystemOnlyInputKeepsFallbackUserMessage(t 
 		t.Fatalf("Expected fallback text %q, got %q", "", got)
 	}
 }
+
+func TestConvertOpenAIRequestToClaude_ReasoningContentPreserved(t *testing.T) {
+	inputJSON := `{
+		"model": "gpt-4.1",
+		"messages": [
+			{
+				"role": "assistant",
+				"content": "Let me think about this",
+				"reasoning_content": "First I need to analyze the problem..."
+			},
+			{
+				"role": "user",
+				"content": "Hello"
+			}
+		]
+	}`
+
+	result := ConvertOpenAIRequestToClaude("claude-sonnet-4-5", []byte(inputJSON), false)
+	resultJSON := gjson.ParseBytes(result)
+	messages := resultJSON.Get("messages").Array()
+
+	if len(messages) != 2 {
+		t.Fatalf("Expected 2 messages, got %d. Messages: %s", len(messages), resultJSON.Get("messages").Raw)
+	}
+
+	assistantMsg := messages[0]
+	if got := assistantMsg.Get("role").String(); got != "assistant" {
+		t.Fatalf("Expected first message role %q, got %q", "assistant", got)
+	}
+
+	hasThinkingBlock := false
+	for _, part := range assistantMsg.Get("content").Array() {
+		if part.Get("type").String() == "thinking" {
+			hasThinkingBlock = true
+			if got := part.Get("thinking").String(); got != "First I need to analyze the problem..." {
+				t.Fatalf("Expected thinking content %q, got %q", "First I need to analyze the problem...", got)
+			}
+		}
+	}
+	if !hasThinkingBlock {
+		t.Fatalf("Expected assistant message to have thinking content block, got: %s", assistantMsg.Get("content").Raw)
+	}
+
+	userMsg := messages[1]
+	if got := userMsg.Get("role").String(); got != "user" {
+		t.Fatalf("Expected second message role %q, got %q", "user", got)
+	}
+}
+
+func TestConvertOpenAIRequestToClaude_ReasoningContentWithToolCalls(t *testing.T) {
+	inputJSON := `{
+		"model": "gpt-4.1",
+		"messages": [
+			{
+				"role": "assistant",
+				"content": "",
+				"reasoning_content": "I should use the tool",
+				"tool_calls": [
+					{
+						"id": "call_1",
+						"type": "function",
+						"function": {
+							"name": "do_work",
+							"arguments": "{}"
+						}
+					}
+				]
+			},
+			{
+				"role": "tool",
+				"tool_call_id": "call_1",
+				"content": "done"
+			}
+		]
+	}`
+
+	result := ConvertOpenAIRequestToClaude("claude-sonnet-4-5", []byte(inputJSON), false)
+	resultJSON := gjson.ParseBytes(result)
+	messages := resultJSON.Get("messages").Array()
+
+	if len(messages) != 2 {
+		t.Fatalf("Expected 2 messages (assistant with thinking+tool_use, converted tool), got %d. Messages: %s", len(messages), resultJSON.Get("messages").Raw)
+	}
+
+	assistantMsg := messages[0]
+	if got := assistantMsg.Get("role").String(); got != "assistant" {
+		t.Fatalf("Expected first message role %q, got %q", "assistant", got)
+	}
+
+	content := assistantMsg.Get("content").Array()
+	hasThinking := false
+	hasToolUse := false
+	for _, part := range content {
+		if part.Get("type").String() == "thinking" {
+			hasThinking = true
+		}
+		if part.Get("type").String() == "tool_use" {
+			hasToolUse = true
+		}
+	}
+	if !hasThinking {
+		t.Fatalf("Expected thinking block in assistant message, got: %s", assistantMsg.Get("content").Raw)
+	}
+	if !hasToolUse {
+		t.Fatalf("Expected tool_use block in assistant message, got: %s", assistantMsg.Get("content").Raw)
+	}
+
+	toolMsg := messages[1]
+	if got := toolMsg.Get("role").String(); got != "user" {
+		t.Fatalf("Expected second message (tool result) role %q, got %q", "user", got)
+	}
+	if got := toolMsg.Get("content.0.type").String(); got != "tool_result" {
+		t.Fatalf("Expected tool_result type %q, got %q", "tool_result", got)
+	}
+}
