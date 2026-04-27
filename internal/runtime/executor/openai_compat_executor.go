@@ -18,6 +18,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
@@ -107,6 +108,13 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
 		return resp, err
+	}
+
+	if isDeepSeekModel(baseModel) {
+		translated, err = ensureDeepSeekReasoningContent(translated)
+		if err != nil {
+			return resp, err
+		}
 	}
 
 	url := strings.TrimSuffix(baseURL, "/") + endpoint
@@ -204,6 +212,13 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
 		return nil, err
+	}
+
+	if isDeepSeekModel(baseModel) {
+		translated, err = ensureDeepSeekReasoningContent(translated)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Request usage data in the final streaming chunk so that token statistics
@@ -393,6 +408,101 @@ func (e *OpenAICompatExecutor) overrideModel(payload []byte, model string) []byt
 	}
 	payload, _ = sjson.SetBytes(payload, "model", model)
 	return payload
+}
+
+// isDeepSeekModel checks whether the model name indicates a DeepSeek model.
+// DeepSeek API requires reasoning_content to be passed back in multi-turn
+// conversations with tool calls, otherwise it returns 400.
+func isDeepSeekModel(model string) bool {
+	return strings.Contains(strings.ToLower(model), "deepseek")
+}
+
+// ensureDeepSeekReasoningContent ensures that assistant messages with tool_calls
+// have reasoning_content present. DeepSeek's API requires reasoning_content to be
+// passed back in multi-turn conversations; missing it causes 400 errors.
+// This mirrors the same logic in kimi_executor.go normalizeKimiToolMessageLinks.
+func ensureDeepSeekReasoningContent(payload []byte) ([]byte, error) {
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return payload, nil
+	}
+
+	messages := gjson.GetBytes(payload, "messages")
+	if !messages.Exists() || !messages.IsArray() {
+		return payload, nil
+	}
+
+	out := payload
+	latestReasoning := ""
+	hasLatestReasoning := false
+	patched := 0
+
+	for msgIdx, msg := range messages.Array() {
+		role := strings.TrimSpace(msg.Get("role").String())
+		if role != "assistant" {
+			continue
+		}
+
+		reasoning := msg.Get("reasoning_content")
+		if reasoning.Exists() && strings.TrimSpace(reasoning.String()) != "" {
+			latestReasoning = reasoning.String()
+			hasLatestReasoning = true
+		}
+
+		toolCalls := msg.Get("tool_calls")
+		if !toolCalls.Exists() || !toolCalls.IsArray() || len(toolCalls.Array()) == 0 {
+			continue
+		}
+
+		if !reasoning.Exists() || strings.TrimSpace(reasoning.String()) == "" {
+			reasoningText := fallbackDeepSeekReasoning(msg, hasLatestReasoning, latestReasoning)
+			path := fmt.Sprintf("messages.%d.reasoning_content", msgIdx)
+			next, err := sjson.SetBytes(out, path, reasoningText)
+			if err != nil {
+				return payload, fmt.Errorf("openai compat executor: failed to set reasoning_content for deepseek: %w", err)
+			}
+			out = next
+			patched++
+		}
+	}
+
+	if patched > 0 {
+		log.WithField("patched_reasoning_messages", patched).
+			Debug("openai compat executor: ensured reasoning_content for deepseek model")
+	}
+
+	return out, nil
+}
+
+// fallbackDeepSeekReasoning determines the best reasoning text to inject when
+// an assistant message has tool_calls but is missing reasoning_content.
+// It tries: 1) latest reasoning from a prior message, 2) message content text,
+// 3) a placeholder string.
+func fallbackDeepSeekReasoning(msg gjson.Result, hasLatest bool, latest string) string {
+	if hasLatest && strings.TrimSpace(latest) != "" {
+		return latest
+	}
+
+	content := msg.Get("content")
+	if content.Type == gjson.String {
+		if text := strings.TrimSpace(content.String()); text != "" {
+			return text
+		}
+	}
+	if content.IsArray() {
+		parts := make([]string, 0, len(content.Array()))
+		for _, item := range content.Array() {
+			text := strings.TrimSpace(item.Get("text").String())
+			if text == "" {
+				continue
+			}
+			parts = append(parts, text)
+		}
+		if len(parts) > 0 {
+			return strings.Join(parts, "\n")
+		}
+	}
+
+	return "[reasoning unavailable]"
 }
 
 type statusErr struct {
