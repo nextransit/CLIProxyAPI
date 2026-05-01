@@ -662,6 +662,7 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 		Name          *string                             `json:"name"`
 		Prefix        *string                             `json:"prefix"`
 		BaseURL       *string                             `json:"base-url"`
+		Disabled      *bool                               `json:"disabled"`
 		APIKeyEntries *[]config.OpenAICompatibilityAPIKey `json:"api-key-entries"`
 		Models        *[]config.OpenAICompatibilityModel  `json:"models"`
 		Headers       *map[string]string                  `json:"headers"`
@@ -682,10 +683,16 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 	if body.Index != nil && *body.Index >= 0 && *body.Index < len(h.cfg.OpenAICompatibility) {
 		targetIndex = *body.Index
 	}
+	if targetIndex != -1 && body.Name != nil {
+		match := strings.TrimSpace(*body.Name)
+		if match != "" && !strings.EqualFold(h.cfg.OpenAICompatibility[targetIndex].Name, match) {
+			targetIndex = -1
+		}
+	}
 	if targetIndex == -1 && body.Name != nil {
 		match := strings.TrimSpace(*body.Name)
 		for i := range h.cfg.OpenAICompatibility {
-			if h.cfg.OpenAICompatibility[i].Name == match {
+			if strings.EqualFold(h.cfg.OpenAICompatibility[i].Name, match) {
 				targetIndex = i
 				break
 			}
@@ -712,6 +719,9 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 			return
 		}
 		entry.BaseURL = trimmed
+	}
+	if body.Value.Disabled != nil {
+		entry.Disabled = *body.Value.Disabled
 	}
 	if body.Value.APIKeyEntries != nil {
 		entry.APIKeyEntries = append([]config.OpenAICompatibilityAPIKey(nil), (*body.Value.APIKeyEntries)...)
