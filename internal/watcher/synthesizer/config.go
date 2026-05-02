@@ -200,6 +200,10 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 			providerName = "openai-compatibility"
 		}
 		base := strings.TrimSpace(compat.BaseURL)
+		status := coreauth.StatusActive
+		if compat.Disabled {
+			status = coreauth.StatusDisabled
+		}
 
 		// Handle new APIKeyEntries format (preferred)
 		createdEntries := 0
@@ -230,7 +234,8 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 				Provider:   providerName,
 				Label:      compat.Name,
 				Prefix:     prefix,
-				Status:     coreauth.StatusActive,
+				Status:     status,
+				Disabled:   compat.Disabled,
 				ProxyURL:   proxyURL,
 				Attributes: attrs,
 				CreatedAt:  now,
@@ -261,7 +266,8 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 				Provider:   providerName,
 				Label:      compat.Name,
 				Prefix:     prefix,
-				Status:     coreauth.StatusActive,
+				Status:     status,
+				Disabled:   compat.Disabled,
 				Attributes: attrs,
 				CreatedAt:  now,
 				UpdatedAt:  now,

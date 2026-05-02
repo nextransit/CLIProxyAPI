@@ -65,12 +65,7 @@ func (r *UsageReporter) publishWithOutcome(ctx context.Context, detail usage.Det
 	if r == nil {
 		return
 	}
-	if detail.TotalTokens == 0 {
-		total := detail.InputTokens + detail.OutputTokens + detail.ReasoningTokens
-		if total > 0 {
-			detail.TotalTokens = total
-		}
-	}
+	detail = normalizeUsageDetail(detail)
 	r.once.Do(func() {
 		usage.PublishRecord(ctx, r.buildRecord(detail, failed))
 	})
@@ -81,12 +76,30 @@ func (r *UsageReporter) publishWithOutcome(ctx context.Context, detail usage.Det
 // This is used to ensure request counting even when upstream responses do not
 // include any usage fields (tokens), especially for streaming paths.
 func (r *UsageReporter) EnsurePublished(ctx context.Context) {
+	r.EnsurePublishedWithDetail(ctx, usage.Detail{})
+}
+
+// EnsurePublishedWithDetail guarantees that a usage record is emitted exactly once.
+// When a caller has a best-effort usage estimate, this method avoids dropping to
+// a zero-token record in success paths where the upstream omitted usage fields.
+func (r *UsageReporter) EnsurePublishedWithDetail(ctx context.Context, detail usage.Detail) {
 	if r == nil {
 		return
 	}
+	detail = normalizeUsageDetail(detail)
 	r.once.Do(func() {
-		usage.PublishRecord(ctx, r.buildRecord(usage.Detail{}, false))
+		usage.PublishRecord(ctx, r.buildRecord(detail, false))
 	})
+}
+
+func normalizeUsageDetail(detail usage.Detail) usage.Detail {
+	if detail.TotalTokens == 0 {
+		total := detail.InputTokens + detail.OutputTokens + detail.ReasoningTokens
+		if total > 0 {
+			detail.TotalTokens = total
+		}
+	}
+	return detail
 }
 
 func (r *UsageReporter) buildRecord(detail usage.Detail, failed bool) usage.Record {
@@ -216,9 +229,14 @@ func ParseCodexUsage(data []byte) (usage.Detail, bool) {
 }
 
 func ParseOpenAIUsage(data []byte) usage.Detail {
+	detail, _ := ParseOpenAIUsageWithPresence(data)
+	return detail
+}
+
+func ParseOpenAIUsageWithPresence(data []byte) (usage.Detail, bool) {
 	usageNode := gjson.ParseBytes(data).Get("usage")
-	if !usageNode.Exists() {
-		return usage.Detail{}
+	if !usageNode.Exists() || usageNode.Type == gjson.Null || !usageNode.IsObject() {
+		return usage.Detail{}, false
 	}
 	inputNode := usageNode.Get("prompt_tokens")
 	if !inputNode.Exists() {
@@ -227,6 +245,54 @@ func ParseOpenAIUsage(data []byte) usage.Detail {
 	outputNode := usageNode.Get("completion_tokens")
 	if !outputNode.Exists() {
 		outputNode = usageNode.Get("output_tokens")
+	}
+	cached := usageNode.Get("prompt_tokens_details.cached_tokens")
+	if !cached.Exists() {
+		cached = usageNode.Get("input_tokens_details.cached_tokens")
+	}
+	reasoning := usageNode.Get("completion_tokens_details.reasoning_tokens")
+	if !reasoning.Exists() {
+		reasoning = usageNode.Get("output_tokens_details.reasoning_tokens")
+	}
+	totalNode := usageNode.Get("total_tokens")
+	// Treat usage object as absent when it is a placeholder (e.g. usage: {} / usage: null).
+	if !inputNode.Exists() && !outputNode.Exists() && !totalNode.Exists() && !cached.Exists() && !reasoning.Exists() {
+		return usage.Detail{}, false
+	}
+	detail := usage.Detail{
+		InputTokens:  inputNode.Int(),
+		OutputTokens: outputNode.Int(),
+		TotalTokens:  totalNode.Int(),
+	}
+	if cached.Exists() {
+		detail.CachedTokens = cached.Int()
+	}
+	if reasoning.Exists() {
+		detail.ReasoningTokens = reasoning.Int()
+	}
+	return detail, true
+}
+
+func ParseOpenAIStreamUsage(line []byte) (usage.Detail, bool) {
+	payload := jsonPayload(line)
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return usage.Detail{}, false
+	}
+	usageNode := gjson.GetBytes(payload, "usage")
+	if !usageNode.Exists() || usageNode.Type == gjson.Null || !usageNode.IsObject() {
+		return usage.Detail{}, false
+	}
+	inputNode := usageNode.Get("prompt_tokens")
+	if !inputNode.Exists() {
+		inputNode = usageNode.Get("input_tokens")
+	}
+	outputNode := usageNode.Get("completion_tokens")
+	if !outputNode.Exists() {
+		outputNode = usageNode.Get("output_tokens")
+	}
+	// Ignore usage placeholders (e.g. usage: {} / usage: null) in intermediate chunks.
+	if !inputNode.Exists() && !outputNode.Exists() && !usageNode.Get("total_tokens").Exists() {
+		return usage.Detail{}, false
 	}
 	detail := usage.Detail{
 		InputTokens:  inputNode.Int(),
@@ -245,29 +311,6 @@ func ParseOpenAIUsage(data []byte) usage.Detail {
 		reasoning = usageNode.Get("output_tokens_details.reasoning_tokens")
 	}
 	if reasoning.Exists() {
-		detail.ReasoningTokens = reasoning.Int()
-	}
-	return detail
-}
-
-func ParseOpenAIStreamUsage(line []byte) (usage.Detail, bool) {
-	payload := jsonPayload(line)
-	if len(payload) == 0 || !gjson.ValidBytes(payload) {
-		return usage.Detail{}, false
-	}
-	usageNode := gjson.GetBytes(payload, "usage")
-	if !usageNode.Exists() {
-		return usage.Detail{}, false
-	}
-	detail := usage.Detail{
-		InputTokens:  usageNode.Get("prompt_tokens").Int(),
-		OutputTokens: usageNode.Get("completion_tokens").Int(),
-		TotalTokens:  usageNode.Get("total_tokens").Int(),
-	}
-	if cached := usageNode.Get("prompt_tokens_details.cached_tokens"); cached.Exists() {
-		detail.CachedTokens = cached.Int()
-	}
-	if reasoning := usageNode.Get("completion_tokens_details.reasoning_tokens"); reasoning.Exists() {
 		detail.ReasoningTokens = reasoning.Int()
 	}
 	return detail, true

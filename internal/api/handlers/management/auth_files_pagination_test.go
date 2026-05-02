@@ -110,7 +110,11 @@ func TestListAuthFiles_ExposesLastErrorFieldsForSearch(t *testing.T) {
 			HTTPStatus: http.StatusUnauthorized,
 		},
 		Attributes: map[string]string{
-			"path": path,
+			"path":       path,
+			"account_id": "acct-searchable",
+		},
+		Metadata: map[string]any{
+			"plan_type": "free",
 		},
 	}
 	if _, err := manager.Register(context.Background(), record); err != nil {
@@ -166,5 +170,20 @@ func TestListAuthFiles_ExposesLastErrorFieldsForSearch(t *testing.T) {
 	}
 	if got := lastError["http_status"]; int(got.(float64)) != http.StatusUnauthorized {
 		t.Fatalf("last_error.http_status = %#v, want %d", got, http.StatusUnauthorized)
+	}
+
+	metadata, ok := entry["metadata"].(map[string]any)
+	if !ok {
+		t.Fatalf("metadata type = %T, want map[string]any", entry["metadata"])
+	}
+	if got := metadata["plan_type"]; got != "free" {
+		t.Fatalf("metadata.plan_type = %#v, want free", got)
+	}
+	attributes, ok := entry["attributes"].(map[string]any)
+	if !ok {
+		t.Fatalf("attributes type = %T, want map[string]any", entry["attributes"])
+	}
+	if got := attributes["account_id"]; got != "acct-searchable" {
+		t.Fatalf("attributes.account_id = %#v, want acct-searchable", got)
 	}
 }

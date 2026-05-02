@@ -54,3 +54,4 @@ _bmad-output/*
 tmp.txt
 .external/
 Cli-Proxy-API-Management-Center/
+tmp/

@@ -657,12 +657,20 @@
                             <option value="50">50</option>
                             <option value="100">100</option>
                         </select>
-                        <label class="muted" for="authStatusFilter">状态</label>
+                        <label class="muted" for="authStatusFilter">账号状态</label>
                         <select id="authStatusFilter" style="width: auto;">
                             <option value="all">全部</option>
-                            <option value="enabled">仅启用</option>
-                            <option value="disabled">仅禁用</option>
+                            <option value="enabled">已启动</option>
+                            <option value="disabled">未启动</option>
                         </select>
+                        <label class="muted" for="authSearchInput">搜索</label>
+                        <input
+                            id="authSearchInput"
+                            type="text"
+                            autocomplete="off"
+                            placeholder="搜索配置文件全部账号信息，例如 usage_limit_reached / plan_type / free"
+                            style="min-width: 340px;"
+                        >
                     </div>
                 </div>
 
@@ -756,6 +764,7 @@
             authPageSize: Number(localStorage.getItem("cliproxyapi.authPageSize") || "100"),
             authView: localStorage.getItem("cliproxyapi.authView") || "list",
             authStatusFilter: localStorage.getItem("cliproxyapi.authStatusFilter") || "all",
+            authSearch: localStorage.getItem("cliproxyapi.authSearch") || "",
             authCatalog: [],
             authFiles: [],
             authTotal: 0,
@@ -783,6 +792,7 @@
             connectionStatus: document.getElementById("connectionStatus"),
             pageSizeSelect: document.getElementById("pageSizeSelect"),
             authStatusFilter: document.getElementById("authStatusFilter"),
+            authSearchInput: document.getElementById("authSearchInput"),
             pageInfo: document.getElementById("pageInfo"),
             prevPageBtn: document.getElementById("prevPageBtn"),
             nextPageBtn: document.getElementById("nextPageBtn"),
@@ -865,11 +875,48 @@
             localStorage.setItem("cliproxyapi.authPageSize", String(state.authPageSize));
             localStorage.setItem("cliproxyapi.authView", state.authView);
             localStorage.setItem("cliproxyapi.authStatusFilter", state.authStatusFilter);
+            localStorage.setItem("cliproxyapi.authSearch", state.authSearch);
+        }
+
+        function parseBooleanLike(value) {
+            if (typeof value === "boolean") {
+                return value;
+            }
+            if (typeof value === "number" && Number.isFinite(value)) {
+                return value !== 0;
+            }
+            if (typeof value !== "string") {
+                return null;
+            }
+            const normalized = value.trim().toLowerCase();
+            if (!normalized) {
+                return null;
+            }
+            if (["true", "1", "yes", "y", "on"].includes(normalized)) {
+                return true;
+            }
+            if (["false", "0", "no", "n", "off"].includes(normalized)) {
+                return false;
+            }
+            return null;
+        }
+
+        function isAuthDisabled(item) {
+            const disabled = parseBooleanLike(item?.disabled);
+            if (disabled !== null) {
+                return disabled;
+            }
+            const enabled = parseBooleanLike(item?.enabled);
+            if (enabled !== null) {
+                return !enabled;
+            }
+            const status = String(item?.status || "").trim().toLowerCase();
+            return status === "disabled" || status === "inactive";
         }
 
         function updateHeroStats() {
             const catalog = state.authCatalog.length ? state.authCatalog : state.authFiles;
-            const active = catalog.filter((item) => !item.disabled).length;
+            const active = catalog.filter((item) => !isAuthDisabled(item)).length;
             const logMetric = state.logsSearch ? state.authMatchedNames.length : state.logLines.length;
             els.heroAuthTotal.textContent = String(catalog.length || 0);
             els.heroAuthActive.textContent = String(active);
@@ -899,6 +946,32 @@
             return dedupeTerms([normalized, compact, spaced, ...aliases].map((term) => String(term || "").trim().toLowerCase()));
         }
 
+        function normalizeSearchValue(value) {
+            if (value == null) {
+                return "";
+            }
+            if (typeof value === "string") {
+                return value;
+            }
+            if (typeof value === "number" || typeof value === "boolean") {
+                return String(value);
+            }
+            try {
+                return JSON.stringify(value);
+            } catch (_error) {
+                return String(value);
+            }
+        }
+
+        function buildAuthSearchRegex(query) {
+            if (!query.includes("*")) {
+                return null;
+            }
+            const escaped = query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+            const pattern = escaped.split("\\*").join(".*");
+            return new RegExp(pattern, "i");
+        }
+
         function authFieldValues(item) {
             return [
                 item?.name,
@@ -906,12 +979,21 @@
                 item?.email,
                 item?.provider,
                 item?.type,
+                item?.status,
                 item?.status_message,
+                item?.statusMessage,
+                item?.error_code,
+                item?.error_message,
+                item?.error_http_status,
+                item?.last_error,
+                item?.account,
+                item?.account_type,
                 item?.prefix,
                 item?.proxy_url,
                 item?.label,
                 item?.note,
-            ].map((value) => String(value || "").toLowerCase()).filter(Boolean);
+                item,
+            ].map((value) => normalizeSearchValue(value).toLowerCase()).filter(Boolean);
         }
 
         function authMatchesTerms(item, terms) {
@@ -920,6 +1002,20 @@
             }
             const fields = authFieldValues(item);
             return terms.some((term) => fields.some((field) => field.includes(term)));
+        }
+
+        function authMatchesSearch(item, query, regex) {
+            if (!query) {
+                return true;
+            }
+            const fields = authFieldValues(item);
+            if (!fields.length) {
+                return false;
+            }
+            if (regex) {
+                return fields.some((field) => regex.test(field));
+            }
+            return fields.some((field) => field.includes(query));
         }
 
         function rebuildAuthMatches() {
@@ -956,9 +1052,14 @@
         function visibleAuthCatalog() {
             let catalog = state.authCatalog;
             if (state.authStatusFilter === "enabled") {
-                catalog = catalog.filter((item) => !item.disabled);
+                catalog = catalog.filter((item) => !isAuthDisabled(item));
             } else if (state.authStatusFilter === "disabled") {
-                catalog = catalog.filter((item) => !!item.disabled);
+                catalog = catalog.filter((item) => isAuthDisabled(item));
+            }
+            const authSearch = String(state.authSearch || "").trim().toLowerCase();
+            const authSearchRegex = authSearch ? buildAuthSearchRegex(authSearch) : null;
+            if (authSearch) {
+                catalog = catalog.filter((item) => authMatchesSearch(item, authSearch, authSearchRegex));
             }
             if (!state.logsSearch) {
                 return catalog;
@@ -1000,9 +1101,12 @@
             els.pageInfo.textContent = `第 ${state.authPage} / ${totalPages} 页`;
 
             if (!currentPageItems.length) {
+                const hasAuthSearch = String(state.authSearch || "").trim().length > 0;
                 const emptyCopy = state.logsSearch
                     ? "没有找到匹配该日志搜索条件的认证文件。"
-                    : "当前页没有认证文件。";
+                    : hasAuthSearch
+                        ? "没有找到匹配该搜索条件的认证文件。"
+                        : "当前页没有认证文件。";
                 els.authContainer.innerHTML = `<div class="empty">${emptyCopy}</div>`;
                 return;
             }
@@ -1039,7 +1143,7 @@
         }
 
         function authStatusTag(item) {
-            const active = !item.disabled;
+            const active = !isAuthDisabled(item);
             const label = active ? "Active" : "Disabled";
             const klass = active ? "active" : "disabled";
             return `<span class="status-tag ${klass}">${label}</span>`;
@@ -1054,11 +1158,12 @@
         }
 
         function actionButtons(item) {
+            const disabled = isAuthDisabled(item);
             const searchSeed = item.status_message || item.email || item.name || "";
             return `
                 <div class="row-actions">
-                    <button class="${item.disabled ? "btn-ok" : "btn-secondary"}" data-action="toggle" data-name="${encodeURIComponent(item.name)}" data-disabled="${item.disabled ? "1" : "0"}">
-                        ${item.disabled ? "启用" : "停用"}
+                    <button class="${disabled ? "btn-ok" : "btn-secondary"}" data-action="toggle" data-name="${encodeURIComponent(item.name)}" data-disabled="${disabled ? "1" : "0"}">
+                        ${disabled ? "启用" : "停用"}
                     </button>
                     <button class="btn-ghost" data-action="edit" data-name="${encodeURIComponent(item.name)}">编辑</button>
                     <button class="btn-ghost" data-action="download" data-name="${encodeURIComponent(item.name)}">下载</button>
@@ -1276,6 +1381,7 @@
             els.managementKey.value = state.key;
             els.pageSizeSelect.value = String(state.authPageSize);
             els.authStatusFilter.value = state.authStatusFilter;
+            els.authSearchInput.value = state.authSearch;
             els.logLimitSelect.value = String(state.logLimit);
 
             els.saveKeyBtn.addEventListener("click", async () => {
@@ -1318,6 +1424,13 @@
 
             els.authStatusFilter.addEventListener("change", () => {
                 state.authStatusFilter = els.authStatusFilter.value || "all";
+                state.authPage = 1;
+                rememberState();
+                renderAuthFiles();
+            });
+
+            els.authSearchInput.addEventListener("input", () => {
+                state.authSearch = (els.authSearchInput.value || "").trim();
                 state.authPage = 1;
                 rememberState();
                 renderAuthFiles();

@@ -25,7 +25,12 @@ services:
       - "51121:51121"
       - "11451:11451"
     volumes:
-      - ${CLI_PROXY_CONFIG_PATH:-./config.yaml}:/CLIProxyAPI/config.yaml
+      # Keep config mount strict: avoid auto-creating a directory when config.yaml is missing.
+      - type: bind
+        source: ${CLI_PROXY_CONFIG_PATH:-./config.yaml}
+        target: /CLIProxyAPI/config.yaml
+        bind:
+          create_host_path: false
       - ${CLI_PROXY_ASSETS_PATH:-./assets}:/CLIProxyAPI/assets
       - ${CLI_PROXY_AUTH_PATH:-~/.cliproxyapi}:/root/.cliproxyapi
       - ${CLI_PROXY_LOG_PATH:-./logs}:/CLIProxyAPI/logs

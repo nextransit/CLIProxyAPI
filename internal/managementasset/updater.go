@@ -127,14 +127,22 @@ type releaseAsset struct {
 }
 
 type releaseResponse struct {
-	Assets []releaseAsset `json:"assets"`
+	Assets json.RawMessage `json:"assets"`
+}
+
+type gitLabReleaseAssets struct {
+	Links []struct {
+		Name           string `json:"name"`
+		URL            string `json:"url"`
+		DirectAssetURL string `json:"direct_asset_url"`
+	} `json:"links"`
 }
 
 // StaticDir resolves the directory that stores the management control panel asset.
 func StaticDir(configFilePath string) string {
 	if override := strings.TrimSpace(os.Getenv("MANAGEMENT_STATIC_PATH")); override != "" {
 		cleaned := filepath.Clean(override)
-		if strings.EqualFold(filepath.Base(cleaned), managementAssetName) {
+		if strings.EqualFold(filepath.Ext(cleaned), ".html") {
 			return filepath.Dir(cleaned)
 		}
 		return cleaned
@@ -164,7 +172,7 @@ func StaticDir(configFilePath string) string {
 func FilePath(configFilePath string) string {
 	if override := strings.TrimSpace(os.Getenv("MANAGEMENT_STATIC_PATH")); override != "" {
 		cleaned := filepath.Clean(override)
-		if strings.EqualFold(filepath.Base(cleaned), managementAssetName) {
+		if strings.EqualFold(filepath.Ext(cleaned), ".html") {
 			return cleaned
 		}
 		return filepath.Join(cleaned, ManagementFileName)
@@ -336,7 +344,96 @@ func resolveReleaseURL(repo string) string {
 		}
 	}
 
+	if strings.Contains(parsed.Path, "/api/v4/projects/") {
+		if !strings.Contains(strings.ToLower(parsed.Path), "/releases/") {
+			parsed.Path = parsed.Path + "/releases/permalink/latest"
+		}
+		return parsed.String()
+	}
+
+	if host != "" && host != "github.com" && host != "api.github.com" {
+		projectPath := strings.Trim(strings.TrimSuffix(parsed.Path, ".git"), "/")
+		if projectPath != "" {
+			parsed.Path = "/api/v4/projects/" + projectPath + "/releases/permalink/latest"
+			parsed.RawPath = "/api/v4/projects/" + url.PathEscape(projectPath) + "/releases/permalink/latest"
+			parsed.RawQuery = ""
+			parsed.Fragment = ""
+			return parsed.String()
+		}
+	}
+
 	return ""
+}
+
+func applyManagementAssetAuth(req *http.Request) {
+	if req == nil || req.URL == nil {
+		return
+	}
+	token := strings.TrimSpace(os.Getenv("GITSTORE_GIT_TOKEN"))
+	if token == "" {
+		return
+	}
+	host := strings.ToLower(req.URL.Host)
+	gitURL := strings.ToLower(strings.TrimSpace(os.Getenv("GITSTORE_GIT_URL")))
+	if host == "api.github.com" || host == "github.com" || strings.Contains(gitURL, "github.com") {
+		req.Header.Set("Authorization", "Bearer "+token)
+		return
+	}
+	req.Header.Set("PRIVATE-TOKEN", token)
+	req.Header.Set("Authorization", "Bearer "+token)
+}
+
+func releaseAssetFromGitHubAssets(assets []releaseAsset) (*releaseAsset, string, bool) {
+	for i := range assets {
+		asset := &assets[i]
+		if strings.EqualFold(asset.Name, managementAssetName) {
+			remoteHash := parseDigest(asset.Digest)
+			return asset, remoteHash, true
+		}
+	}
+	return nil, "", false
+}
+
+func releaseAssetFromGitLabAssets(assets gitLabReleaseAssets) (*releaseAsset, string, bool) {
+	for _, link := range assets.Links {
+		if !strings.EqualFold(link.Name, managementAssetName) {
+			continue
+		}
+		downloadURL := strings.TrimSpace(link.DirectAssetURL)
+		if downloadURL == "" {
+			downloadURL = strings.TrimSpace(link.URL)
+		}
+		if downloadURL == "" {
+			continue
+		}
+		return &releaseAsset{
+			Name:               link.Name,
+			BrowserDownloadURL: downloadURL,
+		}, "", true
+	}
+	return nil, "", false
+}
+
+func releaseAssetFromResponse(release releaseResponse) (*releaseAsset, string, error) {
+	if len(release.Assets) == 0 {
+		return nil, "", fmt.Errorf("management asset %s not found in latest release", managementAssetName)
+	}
+
+	var githubAssets []releaseAsset
+	if errUnmarshalGitHub := json.Unmarshal(release.Assets, &githubAssets); errUnmarshalGitHub == nil {
+		if asset, remoteHash, ok := releaseAssetFromGitHubAssets(githubAssets); ok {
+			return asset, remoteHash, nil
+		}
+	}
+
+	var gitlabAssets gitLabReleaseAssets
+	if errUnmarshalGitLab := json.Unmarshal(release.Assets, &gitlabAssets); errUnmarshalGitLab == nil {
+		if asset, remoteHash, ok := releaseAssetFromGitLabAssets(gitlabAssets); ok {
+			return asset, remoteHash, nil
+		}
+	}
+
+	return nil, "", fmt.Errorf("management asset %s not found in latest release", managementAssetName)
 }
 
 func fetchLatestAsset(ctx context.Context, client *http.Client, releaseURL string) (*releaseAsset, string, error) {
@@ -350,10 +447,7 @@ func fetchLatestAsset(ctx context.Context, client *http.Client, releaseURL strin
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("User-Agent", httpUserAgent)
-	gitURL := strings.ToLower(strings.TrimSpace(os.Getenv("GITSTORE_GIT_URL")))
-	if tok := strings.TrimSpace(os.Getenv("GITSTORE_GIT_TOKEN")); tok != "" && strings.Contains(gitURL, "github.com") {
-		req.Header.Set("Authorization", "Bearer "+tok)
-	}
+	applyManagementAssetAuth(req)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -373,15 +467,7 @@ func fetchLatestAsset(ctx context.Context, client *http.Client, releaseURL strin
 		return nil, "", fmt.Errorf("decode release response: %w", err)
 	}
 
-	for i := range release.Assets {
-		asset := &release.Assets[i]
-		if strings.EqualFold(asset.Name, managementAssetName) {
-			remoteHash := parseDigest(asset.Digest)
-			return asset, remoteHash, nil
-		}
-	}
-
-	return nil, "", fmt.Errorf("management asset %s not found in latest release", managementAssetName)
+	return releaseAssetFromResponse(release)
 }
 
 func downloadAsset(ctx context.Context, client *http.Client, downloadURL string) ([]byte, string, error) {
@@ -394,6 +480,7 @@ func downloadAsset(ctx context.Context, client *http.Client, downloadURL string)
 		return nil, "", fmt.Errorf("create download request: %w", err)
 	}
 	req.Header.Set("User-Agent", httpUserAgent)
+	applyManagementAssetAuth(req)
 
 	resp, err := client.Do(req)
 	if err != nil {

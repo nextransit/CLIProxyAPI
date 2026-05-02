@@ -15,6 +15,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+	cliproxyusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
@@ -174,9 +175,13 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		return resp, err
 	}
 	helps.AppendAPIResponseChunk(ctx, e.cfg, body)
-	reporter.Publish(ctx, helps.ParseOpenAIUsage(body))
-	// Ensure we at least record the request even if upstream doesn't return usage
-	reporter.EnsurePublished(ctx)
+	if detail, hasUsage := helps.ParseOpenAIUsageWithPresence(body); hasUsage {
+		reporter.Publish(ctx, detail)
+	} else {
+		// Some OpenAI-compatible providers return successful responses without usage fields.
+		// Publish a best-effort prompt-token estimate so dashboard metrics don't collapse to zero.
+		reporter.Publish(ctx, estimateOpenAICompatPromptUsage(baseModel, translated))
+	}
 	// Translate response back to source format when needed
 	var param any
 	out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, body, &param)
@@ -287,6 +292,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		scanner := bufio.NewScanner(httpResp.Body)
 		scanner.Buffer(nil, 52_428_800) // 50MB
 		var param any
+		estimatedUsage := estimateOpenAICompatPromptUsage(baseModel, translated)
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
@@ -321,8 +327,8 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 				out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}
 			}
 		}
-		// Ensure we record the request if no usage chunk was ever seen
-		reporter.EnsurePublished(ctx)
+		// Ensure we record the request if no usage chunk was ever seen.
+		reporter.EnsurePublishedWithDetail(ctx, estimatedUsage)
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
 }
@@ -354,6 +360,22 @@ func (e *OpenAICompatExecutor) CountTokens(ctx context.Context, auth *cliproxyau
 	usageJSON := helps.BuildOpenAIUsageJSON(count)
 	translatedUsage := sdktranslator.TranslateTokenCount(ctx, to, from, count, usageJSON)
 	return cliproxyexecutor.Response{Payload: translatedUsage}, nil
+}
+
+func estimateOpenAICompatPromptUsage(model string, translated []byte) cliproxyusage.Detail {
+	enc, err := helps.TokenizerForModel(model)
+	if err != nil {
+		return cliproxyusage.Detail{}
+	}
+	count, err := helps.CountOpenAIChatTokens(enc, translated)
+	if err != nil || count <= 0 {
+		return cliproxyusage.Detail{}
+	}
+	return cliproxyusage.Detail{
+		InputTokens:  count,
+		TotalTokens:  count,
+		OutputTokens: 0,
+	}
 }
 
 // Refresh is a no-op for API-key based compatibility providers.
@@ -392,6 +414,9 @@ func (e *OpenAICompatExecutor) resolveCompatConfig(auth *cliproxyauth.Auth) *con
 	}
 	for i := range e.cfg.OpenAICompatibility {
 		compat := &e.cfg.OpenAICompatibility[i]
+		if compat.Disabled {
+			continue
+		}
 		for _, candidate := range candidates {
 			if candidate != "" && strings.EqualFold(strings.TrimSpace(candidate), compat.Name) {
 				return compat
@@ -435,7 +460,7 @@ func ensureDeepSeekReasoningContent(payload []byte) ([]byte, error) {
 	hasLatestReasoning := false
 	patched := 0
 
-for msgIdx, msg := range messages.Array() {
+	for msgIdx, msg := range messages.Array() {
 		role := strings.TrimSpace(msg.Get("role").String())
 		if role != "assistant" {
 			continue
@@ -455,7 +480,7 @@ for msgIdx, msg := range messages.Array() {
 			return payload, fmt.Errorf("openai compat executor: failed to set reasoning_content for deepseek: %w", err)
 		}
 		out = next
-patched++
+		patched++
 	}
 
 	if patched > 0 {

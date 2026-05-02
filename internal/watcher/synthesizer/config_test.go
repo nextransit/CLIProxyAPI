@@ -511,6 +511,40 @@ func TestConfigSynthesizer_OpenAICompat_FallbackWithModels(t *testing.T) {
 	}
 }
 
+func TestConfigSynthesizer_OpenAICompat_DisabledProvider(t *testing.T) {
+	synth := NewConfigSynthesizer()
+	ctx := &SynthesisContext{
+		Config: &config.Config{
+			OpenAICompatibility: []config.OpenAICompatibility{
+				{
+					Name:     "DisabledProvider",
+					BaseURL:  "https://disabled.api.com",
+					Disabled: true,
+					APIKeyEntries: []config.OpenAICompatibilityAPIKey{
+						{APIKey: "disabled-key"},
+					},
+				},
+			},
+		},
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	}
+
+	auths, err := synth.Synthesize(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("expected 1 auth, got %d", len(auths))
+	}
+	if !auths[0].Disabled {
+		t.Fatal("expected synthesized auth to be disabled")
+	}
+	if auths[0].Status != coreauth.StatusDisabled {
+		t.Fatalf("expected status %q, got %q", coreauth.StatusDisabled, auths[0].Status)
+	}
+}
+
 func TestConfigSynthesizer_VertexCompat_WithModels(t *testing.T) {
 	synth := NewConfigSynthesizer()
 	ctx := &SynthesisContext{

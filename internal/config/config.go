@@ -24,7 +24,7 @@ const (
 	// DefaultDisableAutoUpdatePanel disables automatic panel updates by default.
 	// Custom/local dashboard users can keep full control unless they opt in.
 	DefaultDisableAutoUpdatePanel = true
-	DefaultPprofAddr                = "127.0.0.1:8316"
+	DefaultPprofAddr              = "127.0.0.1:8316"
 )
 
 // Config represents the application's configuration, loaded from a YAML file.
@@ -518,6 +518,10 @@ func (m GeminiModel) GetAlias() string { return m.Alias }
 type OpenAICompatibility struct {
 	// Name is the identifier for this OpenAI compatibility configuration.
 	Name string `yaml:"name" json:"name"`
+
+	// Disabled controls whether this provider is disabled.
+	// Disabled providers remain in configuration but are excluded from runtime routing.
+	Disabled bool `yaml:"disabled,omitempty" json:"disabled,omitempty"`
 
 	// Priority controls selection preference when multiple providers or credentials match.
 	// Higher values are preferred; defaults to 0.

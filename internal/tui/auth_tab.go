@@ -598,12 +598,14 @@ func (m authTabModel) handleNormalInput(msg tea.KeyMsg) (authTabModel, tea.Cmd) 
 	case "j", "down":
 		if len(m.files) > 0 {
 			m.cursor = (m.cursor + 1) % len(m.files)
+			m.expanded = m.cursor
 			m.viewport.SetContent(m.renderContent())
 		}
 		return m, nil
 	case "k", "up":
 		if len(m.files) > 0 {
 			m.cursor = (m.cursor - 1 + len(m.files)) % len(m.files)
+			m.expanded = m.cursor
 			m.viewport.SetContent(m.renderContent())
 		}
 		return m, nil
