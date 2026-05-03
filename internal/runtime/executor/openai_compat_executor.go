@@ -118,6 +118,14 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	}
 
 	url := strings.TrimSuffix(baseURL, "/") + endpoint
+
+	// Debug: log detailed message structure for tool call analysis
+	debugLogMessageStructure(translated, baseModel)
+
+	// Debug: log translated payload
+	log.Printf("DEBUG executor: sending to upstream, model=%s, stream=%v, url=%s", baseModel, opts.Stream, url)
+	log.Printf("DEBUG executor: translated payload (first 2000 chars): %s", string(translated[:min(2000, len(translated))]))
+
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
 	if err != nil {
 		return resp, err
@@ -563,3 +571,106 @@ func (e statusErr) Error() string {
 }
 func (e statusErr) StatusCode() int            { return e.code }
 func (e statusErr) RetryAfter() *time.Duration { return e.retryAfter }
+
+// debugLogMessageStructure logs detailed message structure for diagnosing tool call issues.
+// It prints each message's role, content preview, and tool_call_id (if present) to help
+// identify "tool call result does not follow tool call" errors.
+func debugLogMessageStructure(payload []byte, model string) {
+	if !log.IsLevelEnabled(log.DebugLevel) {
+		return
+	}
+
+	messages := gjson.GetBytes(payload, "messages")
+	if !messages.IsArray() {
+		log.Debugf("DEBUG tool_call: model=%s, messages is not an array", model)
+		return
+	}
+
+	msgCount := len(messages.Array())
+	toolCallIDs := make(map[string]int) // track which message index has which tool_call_id
+	assistantWithToolCalls := make(map[int]bool)
+
+	// First pass: identify all assistant messages with tool_calls and all tool messages
+	for i, msg := range messages.Array() {
+		role := msg.Get("role").String()
+		if role == "assistant" {
+			tcs := msg.Get("tool_calls")
+			if tcs.IsArray() && len(tcs.Array()) > 0 {
+				assistantWithToolCalls[i] = true
+				for j, tc := range tcs.Array() {
+					tcID := tc.Get("id").String()
+					if tcID != "" {
+						toolCallIDs[tcID] = i*1000+j // encode assistant index in upper digits
+					}
+				}
+			}
+		}
+	}
+
+	// Second pass: log detailed structure
+	for i, msg := range messages.Array() {
+		role := msg.Get("role").String()
+
+		switch role {
+		case "assistant":
+			tcs := msg.Get("tool_calls")
+			if tcs.IsArray() && len(tcs.Array()) > 0 {
+				var tcIDs []string
+				for _, tc := range tcs.Array() {
+					tcIDs = append(tcIDs, tc.Get("id").String())
+				}
+				log.Debugf("DEBUG tool_call: [%d] assistant with tool_calls=%v", i, tcIDs)
+			} else {
+				content := msg.Get("content").String()
+				if len(content) > 60 {
+					content = content[:60] + "..."
+				}
+				log.Debugf("DEBUG tool_call: [%d] assistant content=%q", i, content)
+			}
+		case "tool":
+			toolCallID := msg.Get("tool_call_id").String()
+			if toolCallID == "" {
+				toolCallID = "(empty)"
+			}
+			content := msg.Get("content").String()
+			if len(content) > 40 {
+				content = content[:40] + "..."
+			}
+			// Check if tool_call_id matches a known assistant tool call
+			if origIdx, ok := toolCallIDs[toolCallID]; ok {
+				assistantIdx := origIdx / 1000
+				log.Debugf("DEBUG tool_call: [%d] tool tool_call_id=%s matches assistant[%d]", i, toolCallID[:min(8, len(toolCallID))], assistantIdx)
+			} else {
+				log.Debugf("DEBUG tool_call: [%d] tool tool_call_id=%s UNMATCHED", i, toolCallID[:min(8, len(toolCallID))])
+			}
+			_ = content
+		case "system":
+			log.Debugf("DEBUG tool_call: [%d] system", i)
+		case "user":
+			content := msg.Get("content").String()
+			if len(content) > 60 {
+				content = content[:60] + "..."
+			}
+			log.Debugf("DEBUG tool_call: [%d] user content=%q", i, content)
+		default:
+			log.Debugf("DEBUG tool_call: [%d] %s", i, role)
+		}
+	}
+
+	// Log sequence integrity check
+	var lastAssistantWithTC, lastToolMsg int = -1, -1
+	for i, msg := range messages.Array() {
+		role := msg.Get("role").String()
+		if role == "assistant" && assistantWithToolCalls[i] {
+			lastAssistantWithTC = i
+		}
+		if role == "tool" {
+			lastToolMsg = i
+			if lastAssistantWithTC == -1 {
+				log.Warnf("DEBUG tool_call: tool message at [%d] has no preceding assistant with tool_calls", i)
+			} else if lastToolMsg < lastAssistantWithTC {
+				log.Warnf("DEBUG tool_call: ORDER ISSUE: tool at [%d] after assistant at [%d]", i, lastAssistantWithTC)
+			}
+		}
+	}
+}

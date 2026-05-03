@@ -1,6 +1,8 @@
 package responses
 
 import (
+	"fmt"
+	"log"
 	"strings"
 
 	"github.com/tidwall/gjson"
@@ -27,6 +29,9 @@ import (
 // Returns:
 //   - []byte: The transformed request data in OpenAI chat completions format
 func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inputRawJSON []byte, stream bool) []byte {
+	log.Printf("DEBUG: ConvertOpenAIResponsesRequestToOpenAIChatCompletions called with model=%s, stream=%v", modelName, stream)
+	log.Printf("DEBUG: input raw: %s", string(inputRawJSON))
+
 	rawJSON := inputRawJSON
 	// Base OpenAI chat completions template with default values
 	out := []byte(`{"model":"","messages":[],"stream":false}`)
@@ -111,13 +116,18 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 
 				out, _ = sjson.SetRawBytes(out, "messages.-1", message)
 
-			case "function_call":
+			case "function_call", "custom_tool_call":
 				// Handle function call conversion to assistant message with tool_calls
 				assistantMessage := []byte(`{"role":"assistant","tool_calls":[]}`)
 
 				toolCall := []byte(`{"id":"","type":"function","function":{"name":"","arguments":""}}`)
 
-				if callId := item.Get("call_id"); callId.Exists() {
+				// Try call_id first, then fall back to id (some clients use id instead of call_id)
+				callId := item.Get("call_id")
+				if !callId.Exists() || callId.String() == "" {
+					callId = item.Get("id")
+				}
+				if callId.Exists() && callId.String() != "" {
 					toolCall, _ = sjson.SetBytes(toolCall, "id", callId.String())
 				}
 
@@ -132,12 +142,22 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 				assistantMessage, _ = sjson.SetRawBytes(assistantMessage, "tool_calls.0", toolCall)
 				out, _ = sjson.SetRawBytes(out, "messages.-1", assistantMessage)
 
-			case "function_call_output":
+			case "function_call_output", "custom_tool_call_output":
 				// Handle function call output conversion to tool message
 				toolMessage := []byte(`{"role":"tool","tool_call_id":"","content":""}`)
 
-				if callId := item.Get("call_id"); callId.Exists() {
+				// Try call_id first, then fall back to id (some clients use id instead of call_id)
+				callId := item.Get("call_id")
+				if !callId.Exists() || callId.String() == "" {
+					callId = item.Get("id")
+				}
+				if callId.Exists() && callId.String() != "" {
 					toolMessage, _ = sjson.SetBytes(toolMessage, "tool_call_id", callId.String())
+				}
+
+				// Log if tool_call_id is still empty (debugging)
+				if gjson.GetBytes(toolMessage, "tool_call_id").String() == "" {
+					log.Printf("DEBUG: function_call_output with empty tool_call_id, raw item: %s", string(item.Raw))
 				}
 
 				if output := item.Get("output"); output.Exists() {
@@ -209,6 +229,37 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 	if toolChoice := root.Get("tool_choice"); toolChoice.Exists() {
 		out, _ = sjson.SetBytes(out, "tool_choice", toolChoice.String())
 	}
+
+	// Log how many messages were created and show message order
+	msgCount := len(gjson.GetBytes(out, "messages").Array())
+	toolMsgCount := 0
+	emptyToolCallID := []int{}
+	firstFewMsgs := []string{}
+	for i, msg := range gjson.GetBytes(out, "messages").Array() {
+		role := msg.Get("role").String()
+		if role == "tool" {
+			toolMsgCount++
+			if msg.Get("tool_call_id").String() == "" {
+				emptyToolCallID = append(emptyToolCallID, i)
+			}
+		}
+		// Log first 10 and last 10 messages for debugging
+		if i < 10 || i >= msgCount-5 {
+			toolCallID := msg.Get("tool_call_id").String()
+			if toolCallID != "" {
+				firstFewMsgs = append(firstFewMsgs, fmt.Sprintf("[%d]role=%s,tool_call_id=%s...", i, role, toolCallID[:min(8, len(toolCallID))]))
+			} else {
+				content := msg.Get("content").String()
+				if len(content) > 50 {
+					content = content[:min(50, len(content))] + "..."
+				}
+				firstFewMsgs = append(firstFewMsgs, fmt.Sprintf("[%d]role=%s,content=%q", i, role, content))
+			}
+		}
+	}
+	log.Printf("DEBUG: ConvertOpenAIResponsesRequestToOpenAIChatCompletions OUTPUT: messages=%d, tool_msgs=%d, empty_tool_call_id=%v, first_input_type=%s, msg_order=%v",
+		msgCount, toolMsgCount, emptyToolCallID,
+		gjson.GetBytes(rawJSON, "input.0.type").String(), firstFewMsgs)
 
 	return out
 }
