@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -110,6 +111,11 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		return resp, err
 	}
 
+	translated, err = normalizeOpenAICompatToolMessages(translated)
+	if err != nil {
+		return resp, err
+	}
+
 	if isDeepSeekModel(baseModel) {
 		translated, err = ensureDeepSeekReasoningContent(translated)
 		if err != nil {
@@ -119,12 +125,10 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 
 	url := strings.TrimSuffix(baseURL, "/") + endpoint
 
-	// Debug: log detailed message structure for tool call analysis
 	debugLogMessageStructure(translated, baseModel)
-
-	// Debug: log translated payload
-	log.Printf("DEBUG executor: sending to upstream, model=%s, stream=%v, url=%s", baseModel, opts.Stream, url)
-	log.Printf("DEBUG executor: translated payload (first 2000 chars): %s", string(translated[:min(2000, len(translated))]))
+	if log.IsLevelEnabled(log.DebugLevel) {
+		log.Debugf("openai compat executor: sending request upstream, model=%s, stream=%v, url=%s", baseModel, opts.Stream, url)
+	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
 	if err != nil {
@@ -222,6 +226,11 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	translated = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", translated, originalTranslated, requestedModel)
 
 	translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), to.String(), e.Identifier())
+	if err != nil {
+		return nil, err
+	}
+
+	translated, err = normalizeOpenAICompatToolMessages(translated)
 	if err != nil {
 		return nil, err
 	}
@@ -572,6 +581,454 @@ func (e statusErr) Error() string {
 func (e statusErr) StatusCode() int            { return e.code }
 func (e statusErr) RetryAfter() *time.Duration { return e.retryAfter }
 
+type openAICompatToolRepairStats struct {
+	MovedToolMessages           int
+	SynthesizedToolMessages     int
+	DroppedOrphanToolMessages   int
+	NormalizedToolContents      int
+	NormalizedToolArguments     int
+	PatchedToolMessageIDs       int
+	MergedAssistantMessages     int
+	PatchedAssistantToolCallIDs int
+	NormalizedAssistantContent  int
+}
+
+func (s openAICompatToolRepairStats) changed() bool {
+	return s.MovedToolMessages > 0 ||
+		s.SynthesizedToolMessages > 0 ||
+		s.DroppedOrphanToolMessages > 0 ||
+		s.NormalizedToolContents > 0 ||
+		s.NormalizedToolArguments > 0 ||
+		s.PatchedToolMessageIDs > 0 ||
+		s.MergedAssistantMessages > 0 ||
+		s.PatchedAssistantToolCallIDs > 0 ||
+		s.NormalizedAssistantContent > 0
+}
+
+type openAICompatToolMessageRef struct {
+	index int
+	raw   json.RawMessage
+}
+
+func normalizeOpenAICompatToolMessages(payload []byte) ([]byte, error) {
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return payload, nil
+	}
+
+	messages := gjson.GetBytes(payload, "messages")
+	if !messages.Exists() || !messages.IsArray() {
+		return payload, nil
+	}
+
+	var rawMessages []json.RawMessage
+	if errUnmarshal := json.Unmarshal([]byte(messages.Raw), &rawMessages); errUnmarshal != nil {
+		return payload, fmt.Errorf("openai compat executor: failed to parse messages for tool-call normalization: %w", errUnmarshal)
+	}
+
+	normalizedMessages, stats, errNormalize := normalizeOpenAICompatMessageSequence(rawMessages)
+	if errNormalize != nil {
+		return payload, errNormalize
+	}
+	if !stats.changed() {
+		return payload, nil
+	}
+
+	messagesRaw, errMarshal := json.Marshal(normalizedMessages)
+	if errMarshal != nil {
+		return payload, fmt.Errorf("openai compat executor: failed to marshal normalized messages: %w", errMarshal)
+	}
+	out, errSet := sjson.SetRawBytes(payload, "messages", messagesRaw)
+	if errSet != nil {
+		return payload, fmt.Errorf("openai compat executor: failed to set normalized messages: %w", errSet)
+	}
+
+	log.WithFields(log.Fields{
+		"moved_tool_messages":             stats.MovedToolMessages,
+		"synthesized_tool_messages":       stats.SynthesizedToolMessages,
+		"dropped_orphan_tool_messages":    stats.DroppedOrphanToolMessages,
+		"normalized_tool_contents":        stats.NormalizedToolContents,
+		"normalized_tool_arguments":       stats.NormalizedToolArguments,
+		"patched_tool_message_ids":        stats.PatchedToolMessageIDs,
+		"merged_assistant_messages":       stats.MergedAssistantMessages,
+		"patched_assistant_tool_call_ids": stats.PatchedAssistantToolCallIDs,
+		"normalized_assistant_content":    stats.NormalizedAssistantContent,
+	}).Debug("openai compat executor: normalized tool-call message sequence")
+
+	return out, nil
+}
+
+func normalizeOpenAICompatMessageSequence(rawMessages []json.RawMessage) ([]json.RawMessage, openAICompatToolRepairStats, error) {
+	stats := openAICompatToolRepairStats{}
+	if len(rawMessages) == 0 {
+		return rawMessages, stats, nil
+	}
+
+	toolRefs := collectOpenAICompatToolMessageRefs(rawMessages)
+	usedTools := make(map[int]bool)
+	skippedMessages := make(map[int]bool)
+	normalized := make([]json.RawMessage, 0, len(rawMessages))
+
+	for msgIdx, raw := range rawMessages {
+		if skippedMessages[msgIdx] {
+			continue
+		}
+
+		role := openAICompatMessageRole(raw)
+		if role == "tool" {
+			continue
+		}
+
+		if role != "assistant" || !openAICompatHasToolCalls(raw) {
+			normalized = append(normalized, append(json.RawMessage(nil), raw...))
+			continue
+		}
+
+		assistant, toolCallIDs, assistantStats, errNormalize := normalizeOpenAICompatAssistantToolCalls(raw, msgIdx)
+		if errNormalize != nil {
+			return rawMessages, stats, errNormalize
+		}
+		stats.PatchedAssistantToolCallIDs += assistantStats.PatchedAssistantToolCallIDs
+		stats.NormalizedAssistantContent += assistantStats.NormalizedAssistantContent
+		stats.NormalizedToolArguments += assistantStats.NormalizedToolArguments
+
+		if len(toolCallIDs) == 0 {
+			if openAICompatMessageContentString(assistant) != "" {
+				normalized = append(normalized, assistant)
+			}
+			continue
+		}
+
+		var merged int
+		assistant, merged, errNormalize = mergeOpenAICompatAssistantMessagesBeforeToolOutput(assistant, rawMessages, skippedMessages, toolRefs, toolCallIDs, msgIdx)
+		if errNormalize != nil {
+			return rawMessages, stats, errNormalize
+		}
+		stats.MergedAssistantMessages += merged
+		normalized = append(normalized, assistant)
+
+		for toolPos, toolCallID := range toolCallIDs {
+			ref, ok := firstUnusedOpenAICompatToolRef(toolRefs[toolCallID], usedTools)
+			if !ok {
+				normalized = append(normalized, synthesizeOpenAICompatToolMessage(toolCallID))
+				stats.SynthesizedToolMessages++
+				continue
+			}
+
+			toolMessage, toolStats, errTool := normalizeOpenAICompatToolMessage(ref.raw, toolCallID)
+			if errTool != nil {
+				return rawMessages, stats, errTool
+			}
+			stats.NormalizedToolContents += toolStats.NormalizedToolContents
+			stats.PatchedToolMessageIDs += toolStats.PatchedToolMessageIDs
+			if ref.index != msgIdx+1+toolPos {
+				stats.MovedToolMessages++
+			}
+			usedTools[ref.index] = true
+			skippedMessages[ref.index] = true
+			normalized = append(normalized, toolMessage)
+		}
+	}
+
+	for msgIdx, raw := range rawMessages {
+		if openAICompatMessageRole(raw) == "tool" && !usedTools[msgIdx] {
+			stats.DroppedOrphanToolMessages++
+		}
+	}
+
+	return normalized, stats, nil
+}
+
+func collectOpenAICompatToolMessageRefs(rawMessages []json.RawMessage) map[string][]openAICompatToolMessageRef {
+	refs := make(map[string][]openAICompatToolMessageRef)
+	for msgIdx, raw := range rawMessages {
+		if openAICompatMessageRole(raw) != "tool" {
+			continue
+		}
+		toolCallID := strings.TrimSpace(gjson.GetBytes(raw, "tool_call_id").String())
+		callID := strings.TrimSpace(gjson.GetBytes(raw, "call_id").String())
+		if toolCallID != "" {
+			refs[toolCallID] = append(refs[toolCallID], openAICompatToolMessageRef{index: msgIdx, raw: raw})
+		}
+		if callID != "" && callID != toolCallID {
+			refs[callID] = append(refs[callID], openAICompatToolMessageRef{index: msgIdx, raw: raw})
+		}
+	}
+	return refs
+}
+
+func normalizeOpenAICompatAssistantToolCalls(raw json.RawMessage, msgIdx int) (json.RawMessage, []string, openAICompatToolRepairStats, error) {
+	stats := openAICompatToolRepairStats{}
+	out := append([]byte(nil), raw...)
+	toolCalls := gjson.GetBytes(raw, "tool_calls")
+	if !toolCalls.IsArray() {
+		return json.RawMessage(out), nil, stats, nil
+	}
+
+	wrapper := []byte(`{"tool_calls":[]}`)
+	toolCallIDs := make([]string, 0, len(toolCalls.Array()))
+	for toolIdx, toolCall := range toolCalls.Array() {
+		toolCallRaw := []byte(toolCall.Raw)
+		toolCallID := strings.TrimSpace(toolCall.Get("id").String())
+		if toolCallID == "" {
+			toolCallID = strings.TrimSpace(toolCall.Get("call_id").String())
+		}
+		if toolCallID == "" {
+			toolCallID = fmt.Sprintf("call_repaired_%d_%d", msgIdx, toolIdx)
+		}
+		var errSet error
+		toolCallRaw, errSet = sjson.SetBytes(toolCallRaw, "id", toolCallID)
+		if errSet != nil {
+			return nil, nil, stats, fmt.Errorf("openai compat executor: failed to repair empty tool_call id: %w", errSet)
+		}
+		if strings.TrimSpace(toolCall.Get("id").String()) != toolCallID {
+			stats.PatchedAssistantToolCallIDs++
+		}
+		toolCallRaw, errSet = sjson.SetBytes(toolCallRaw, "type", "function")
+		if errSet != nil {
+			return nil, nil, stats, fmt.Errorf("openai compat executor: failed to normalize tool_call type: %w", errSet)
+		}
+		if gjson.GetBytes(toolCallRaw, "call_id").Exists() {
+			if next, errDelete := sjson.DeleteBytes(toolCallRaw, "call_id"); errDelete == nil {
+				toolCallRaw = next
+			}
+		}
+
+		arguments := toolCall.Get("function.arguments")
+		normalizedArgs := normalizeOpenAICompatFunctionArguments(arguments)
+		if !arguments.Exists() || arguments.Type != gjson.String || arguments.String() != normalizedArgs {
+			toolCallRaw, errSet = sjson.SetBytes(toolCallRaw, "function.arguments", normalizedArgs)
+			if errSet != nil {
+				return nil, nil, stats, fmt.Errorf("openai compat executor: failed to normalize tool_call arguments: %w", errSet)
+			}
+			stats.NormalizedToolArguments++
+		}
+		toolCallIDs = append(toolCallIDs, toolCallID)
+		wrapper, errSet = sjson.SetRawBytes(wrapper, "tool_calls.-1", toolCallRaw)
+		if errSet != nil {
+			return nil, nil, stats, fmt.Errorf("openai compat executor: failed to append repaired tool_call: %w", errSet)
+		}
+	}
+
+	var errSet error
+	out, errSet = sjson.SetRawBytes(out, "tool_calls", []byte(gjson.GetBytes(wrapper, "tool_calls").Raw))
+	if errSet != nil {
+		return nil, nil, stats, fmt.Errorf("openai compat executor: failed to set repaired assistant tool_calls: %w", errSet)
+	}
+
+	content := gjson.GetBytes(out, "content")
+	if !content.Exists() || content.Type == gjson.Null {
+		out, errSet = sjson.SetBytes(out, "content", "")
+		if errSet != nil {
+			return nil, nil, stats, fmt.Errorf("openai compat executor: failed to normalize assistant content: %w", errSet)
+		}
+		stats.NormalizedAssistantContent++
+	} else if content.Type != gjson.String {
+		out, errSet = sjson.SetBytes(out, "content", openAICompatMessageContentString(json.RawMessage(out)))
+		if errSet != nil {
+			return nil, nil, stats, fmt.Errorf("openai compat executor: failed to stringify assistant content: %w", errSet)
+		}
+		stats.NormalizedAssistantContent++
+	}
+
+	return json.RawMessage(out), toolCallIDs, stats, nil
+}
+
+func mergeOpenAICompatAssistantMessagesBeforeToolOutput(assistant json.RawMessage, rawMessages []json.RawMessage, skipped map[int]bool, toolRefs map[string][]openAICompatToolMessageRef, toolCallIDs []string, msgIdx int) (json.RawMessage, int, error) {
+	limit := len(rawMessages)
+	for _, toolCallID := range toolCallIDs {
+		for _, ref := range toolRefs[toolCallID] {
+			if ref.index > msgIdx && ref.index < limit {
+				limit = ref.index
+			}
+		}
+	}
+	if limit == len(rawMessages) {
+		limit = msgIdx + 1
+		for limit < len(rawMessages) {
+			if openAICompatMessageRole(rawMessages[limit]) != "assistant" || openAICompatHasToolCalls(rawMessages[limit]) {
+				break
+			}
+			limit++
+		}
+	}
+
+	out := append(json.RawMessage(nil), assistant...)
+	merged := 0
+	for idx := msgIdx + 1; idx < limit; idx++ {
+		if skipped[idx] {
+			continue
+		}
+		if openAICompatMessageRole(rawMessages[idx]) != "assistant" || openAICompatHasToolCalls(rawMessages[idx]) {
+			continue
+		}
+		next, changed, errMerge := appendOpenAICompatAssistantContent(out, rawMessages[idx])
+		if errMerge != nil {
+			return assistant, merged, errMerge
+		}
+		if changed {
+			out = next
+			merged++
+		}
+		skipped[idx] = true
+	}
+	return out, merged, nil
+}
+
+func appendOpenAICompatAssistantContent(base json.RawMessage, extra json.RawMessage) (json.RawMessage, bool, error) {
+	extraText := openAICompatMessageContentString(extra)
+	if extraText == "" {
+		return base, false, nil
+	}
+
+	baseText := openAICompatMessageContentString(base)
+	combined := extraText
+	if baseText != "" {
+		combined = baseText + "\n" + extraText
+	}
+
+	out, errSet := sjson.SetBytes([]byte(base), "content", combined)
+	if errSet != nil {
+		return base, false, fmt.Errorf("openai compat executor: failed to merge assistant content: %w", errSet)
+	}
+	return json.RawMessage(out), true, nil
+}
+
+func firstUnusedOpenAICompatToolRef(refs []openAICompatToolMessageRef, used map[int]bool) (openAICompatToolMessageRef, bool) {
+	for _, ref := range refs {
+		if used[ref.index] {
+			continue
+		}
+		return ref, true
+	}
+	return openAICompatToolMessageRef{}, false
+}
+
+func normalizeOpenAICompatToolMessage(raw json.RawMessage, expectedToolCallID string) (json.RawMessage, openAICompatToolRepairStats, error) {
+	stats := openAICompatToolRepairStats{}
+	out := append([]byte(nil), raw...)
+	currentID := strings.TrimSpace(gjson.GetBytes(out, "tool_call_id").String())
+	if currentID != expectedToolCallID {
+		var errSet error
+		out, errSet = sjson.SetBytes(out, "tool_call_id", expectedToolCallID)
+		if errSet != nil {
+			return nil, stats, fmt.Errorf("openai compat executor: failed to set tool_call_id: %w", errSet)
+		}
+		stats.PatchedToolMessageIDs++
+	}
+
+	content := gjson.GetBytes(out, "content")
+	if !content.Exists() {
+		if output := gjson.GetBytes(out, "output"); output.Exists() {
+			var errSet error
+			out, errSet = sjson.SetBytes(out, "content", openAICompatJSONResultString(output))
+			if errSet != nil {
+				return nil, stats, fmt.Errorf("openai compat executor: failed to set tool content from output: %w", errSet)
+			}
+		} else {
+			var errSet error
+			out, errSet = sjson.SetBytes(out, "content", "")
+			if errSet != nil {
+				return nil, stats, fmt.Errorf("openai compat executor: failed to set empty tool content: %w", errSet)
+			}
+		}
+		stats.NormalizedToolContents++
+	} else if content.Type != gjson.String {
+		var errSet error
+		out, errSet = sjson.SetBytes(out, "content", openAICompatJSONResultString(content))
+		if errSet != nil {
+			return nil, stats, fmt.Errorf("openai compat executor: failed to stringify tool content: %w", errSet)
+		}
+		stats.NormalizedToolContents++
+	}
+	if gjson.GetBytes(out, "call_id").Exists() {
+		if next, errDelete := sjson.DeleteBytes(out, "call_id"); errDelete == nil {
+			out = next
+		}
+	}
+	if gjson.GetBytes(out, "output").Exists() {
+		if next, errDelete := sjson.DeleteBytes(out, "output"); errDelete == nil {
+			out = next
+		}
+	}
+
+	return json.RawMessage(out), stats, nil
+}
+
+func synthesizeOpenAICompatToolMessage(toolCallID string) json.RawMessage {
+	msg := []byte(`{"role":"tool","tool_call_id":"","content":""}`)
+	msg, _ = sjson.SetBytes(msg, "tool_call_id", toolCallID)
+	content, errMarshal := json.Marshal(map[string]string{
+		"error": fmt.Sprintf("tool result missing for tool_call_id %q", toolCallID),
+	})
+	if errMarshal != nil {
+		msg, _ = sjson.SetBytes(msg, "content", "tool result missing")
+		return json.RawMessage(msg)
+	}
+	msg, _ = sjson.SetBytes(msg, "content", string(content))
+	return json.RawMessage(msg)
+}
+
+func openAICompatMessageRole(raw json.RawMessage) string {
+	return strings.TrimSpace(gjson.GetBytes(raw, "role").String())
+}
+
+func openAICompatHasToolCalls(raw json.RawMessage) bool {
+	toolCalls := gjson.GetBytes(raw, "tool_calls")
+	return toolCalls.Exists() && toolCalls.IsArray() && len(toolCalls.Array()) > 0
+}
+
+func openAICompatMessageContentString(raw json.RawMessage) string {
+	content := gjson.GetBytes(raw, "content")
+	if !content.Exists() || content.Type == gjson.Null {
+		return ""
+	}
+	if content.Type == gjson.String {
+		return content.String()
+	}
+	if content.IsArray() {
+		parts := make([]string, 0, len(content.Array()))
+		for _, item := range content.Array() {
+			text := strings.TrimSpace(item.Get("text").String())
+			if text == "" {
+				continue
+			}
+			parts = append(parts, text)
+		}
+		return strings.Join(parts, "\n")
+	}
+	return openAICompatJSONResultString(content)
+}
+
+func openAICompatJSONResultString(value gjson.Result) string {
+	if !value.Exists() || value.Type == gjson.Null {
+		return ""
+	}
+	if value.Type == gjson.String {
+		return value.String()
+	}
+	return value.Raw
+}
+
+func normalizeOpenAICompatFunctionArguments(arguments gjson.Result) string {
+	if !arguments.Exists() || arguments.Type == gjson.Null {
+		return "{}"
+	}
+
+	raw := strings.TrimSpace(openAICompatJSONResultString(arguments))
+	if raw == "" {
+		return "{}"
+	}
+	if json.Valid([]byte(raw)) {
+		return raw
+	}
+
+	wrapped, errMarshal := json.Marshal(map[string]string{"input": raw})
+	if errMarshal != nil {
+		return "{}"
+	}
+	return string(wrapped)
+}
+
 // debugLogMessageStructure logs detailed message structure for diagnosing tool call issues.
 // It prints each message's role, content preview, and tool_call_id (if present) to help
 // identify "tool call result does not follow tool call" errors.
@@ -586,7 +1043,6 @@ func debugLogMessageStructure(payload []byte, model string) {
 		return
 	}
 
-	msgCount := len(messages.Array())
 	toolCallIDs := make(map[string]int) // track which message index has which tool_call_id
 	assistantWithToolCalls := make(map[int]bool)
 
@@ -600,7 +1056,7 @@ func debugLogMessageStructure(payload []byte, model string) {
 				for j, tc := range tcs.Array() {
 					tcID := tc.Get("id").String()
 					if tcID != "" {
-						toolCallIDs[tcID] = i*1000+j // encode assistant index in upper digits
+						toolCallIDs[tcID] = i*1000 + j // encode assistant index in upper digits
 					}
 				}
 			}

@@ -1,8 +1,8 @@
 package responses
 
 import (
+	"encoding/json"
 	"fmt"
-	"log"
 	"strings"
 
 	"github.com/tidwall/gjson"
@@ -29,9 +29,6 @@ import (
 // Returns:
 //   - []byte: The transformed request data in OpenAI chat completions format
 func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inputRawJSON []byte, stream bool) []byte {
-	log.Printf("DEBUG: ConvertOpenAIResponsesRequestToOpenAIChatCompletions called with model=%s, stream=%v", modelName, stream)
-	log.Printf("DEBUG: input raw: %s", string(inputRawJSON))
-
 	rawJSON := inputRawJSON
 	// Base OpenAI chat completions template with default values
 	out := []byte(`{"model":"","messages":[],"stream":false}`)
@@ -62,6 +59,9 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 
 	// Convert input array to messages
 	if input := root.Get("input"); input.Exists() && input.IsArray() {
+		pendingAssistantToolCallIdx := -1
+		pendingAssistantToolOutputSeen := false
+
 		input.ForEach(func(_, item gjson.Result) bool {
 			itemType := item.Get("type").String()
 			if itemType == "" && item.Get("role").String() != "" {
@@ -114,12 +114,21 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 					message, _ = sjson.SetBytes(message, "content", content.String())
 				}
 
+				if role == "assistant" && pendingAssistantToolCallIdx >= 0 && !pendingAssistantToolOutputSeen {
+					if merged, ok := mergeAssistantMessageContentIntoOpenAIMessage(out, pendingAssistantToolCallIdx, message); ok {
+						out = merged
+						return true
+					}
+				}
+
 				out, _ = sjson.SetRawBytes(out, "messages.-1", message)
+				if role != "assistant" {
+					pendingAssistantToolCallIdx = -1
+					pendingAssistantToolOutputSeen = false
+				}
 
 			case "function_call", "custom_tool_call":
-				// Handle function call conversion to assistant message with tool_calls
-				assistantMessage := []byte(`{"role":"assistant","tool_calls":[]}`)
-
+				// Handle function call - accumulate into current assistant message if exists, else create new
 				toolCall := []byte(`{"id":"","type":"function","function":{"name":"","arguments":""}}`)
 
 				// Try call_id first, then fall back to id (some clients use id instead of call_id)
@@ -135,12 +144,30 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 					toolCall, _ = sjson.SetBytes(toolCall, "function.name", name.String())
 				}
 
-				if arguments := item.Get("arguments"); arguments.Exists() {
-					toolCall, _ = sjson.SetBytes(toolCall, "function.arguments", arguments.String())
+				toolCall, _ = sjson.SetBytes(toolCall, "function.arguments", normalizeOpenAIChatFunctionArguments(item.Get("arguments")))
+
+				// Check if the last message in output is an assistant message (for parallel tool calls)
+				msgsArray := gjson.GetBytes(out, "messages").Array()
+				lastMsgIdx := len(msgsArray) - 1
+				if lastMsgIdx >= 0 {
+					lastMsgRole := gjson.GetBytes(out, fmt.Sprintf("messages.%d.role", lastMsgIdx)).String()
+					if lastMsgRole == "assistant" {
+						// Append to existing assistant message's tool_calls
+						existingTCs := gjson.GetBytes(out, fmt.Sprintf("messages.%d.tool_calls", lastMsgIdx))
+						newIdx := len(existingTCs.Array())
+						out, _ = sjson.SetRawBytes(out, fmt.Sprintf("messages.%d.tool_calls.%d", lastMsgIdx, newIdx), toolCall)
+						pendingAssistantToolCallIdx = lastMsgIdx
+						pendingAssistantToolOutputSeen = false
+						return true // continue to next item in input.ForEach
+					}
 				}
 
+				// No existing assistant, create new one
+				assistantMessage := []byte(`{"role":"assistant","tool_calls":[null]}`)
 				assistantMessage, _ = sjson.SetRawBytes(assistantMessage, "tool_calls.0", toolCall)
 				out, _ = sjson.SetRawBytes(out, "messages.-1", assistantMessage)
+				pendingAssistantToolCallIdx = len(gjson.GetBytes(out, "messages").Array()) - 1
+				pendingAssistantToolOutputSeen = false
 
 			case "function_call_output", "custom_tool_call_output":
 				// Handle function call output conversion to tool message
@@ -155,16 +182,14 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 					toolMessage, _ = sjson.SetBytes(toolMessage, "tool_call_id", callId.String())
 				}
 
-				// Log if tool_call_id is still empty (debugging)
-				if gjson.GetBytes(toolMessage, "tool_call_id").String() == "" {
-					log.Printf("DEBUG: function_call_output with empty tool_call_id, raw item: %s", string(item.Raw))
-				}
-
 				if output := item.Get("output"); output.Exists() {
 					toolMessage, _ = sjson.SetBytes(toolMessage, "content", output.String())
 				}
 
 				out, _ = sjson.SetRawBytes(out, "messages.-1", toolMessage)
+				if pendingAssistantToolCallIdx >= 0 {
+					pendingAssistantToolOutputSeen = true
+				}
 			}
 
 			return true
@@ -230,36 +255,80 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 		out, _ = sjson.SetBytes(out, "tool_choice", toolChoice.String())
 	}
 
-	// Log how many messages were created and show message order
-	msgCount := len(gjson.GetBytes(out, "messages").Array())
-	toolMsgCount := 0
-	emptyToolCallID := []int{}
-	firstFewMsgs := []string{}
-	for i, msg := range gjson.GetBytes(out, "messages").Array() {
-		role := msg.Get("role").String()
-		if role == "tool" {
-			toolMsgCount++
-			if msg.Get("tool_call_id").String() == "" {
-				emptyToolCallID = append(emptyToolCallID, i)
-			}
-		}
-		// Log first 10 and last 10 messages for debugging
-		if i < 10 || i >= msgCount-5 {
-			toolCallID := msg.Get("tool_call_id").String()
-			if toolCallID != "" {
-				firstFewMsgs = append(firstFewMsgs, fmt.Sprintf("[%d]role=%s,tool_call_id=%s...", i, role, toolCallID[:min(8, len(toolCallID))]))
-			} else {
-				content := msg.Get("content").String()
-				if len(content) > 50 {
-					content = content[:min(50, len(content))] + "..."
-				}
-				firstFewMsgs = append(firstFewMsgs, fmt.Sprintf("[%d]role=%s,content=%q", i, role, content))
-			}
-		}
-	}
-	log.Printf("DEBUG: ConvertOpenAIResponsesRequestToOpenAIChatCompletions OUTPUT: messages=%d, tool_msgs=%d, empty_tool_call_id=%v, first_input_type=%s, msg_order=%v",
-		msgCount, toolMsgCount, emptyToolCallID,
-		gjson.GetBytes(rawJSON, "input.0.type").String(), firstFewMsgs)
-
 	return out
+}
+
+func mergeAssistantMessageContentIntoOpenAIMessage(out []byte, messageIdx int, message []byte) ([]byte, bool) {
+	text := openAIChatMessageContentText(message)
+	if text == "" {
+		return out, false
+	}
+
+	path := fmt.Sprintf("messages.%d.content", messageIdx)
+	current := gjson.GetBytes(out, path)
+	currentText := openAIChatContentText(current)
+	if currentText != "" {
+		text = currentText + "\n" + text
+	}
+
+	updated, err := sjson.SetBytes(out, path, text)
+	if err != nil {
+		return out, false
+	}
+	return updated, true
+}
+
+func openAIChatMessageContentText(message []byte) string {
+	return openAIChatContentText(gjson.GetBytes(message, "content"))
+}
+
+func openAIChatContentText(content gjson.Result) string {
+	if !content.Exists() || content.Type == gjson.Null {
+		return ""
+	}
+	if content.Type == gjson.String {
+		return content.String()
+	}
+	if content.IsArray() {
+		parts := make([]string, 0, len(content.Array()))
+		for _, item := range content.Array() {
+			text := strings.TrimSpace(item.Get("text").String())
+			if text == "" {
+				continue
+			}
+			parts = append(parts, text)
+		}
+		return strings.Join(parts, "\n")
+	}
+	return content.Raw
+}
+
+func normalizeOpenAIChatFunctionArguments(arguments gjson.Result) string {
+	if !arguments.Exists() || arguments.Type == gjson.Null {
+		return "{}"
+	}
+
+	raw := strings.TrimSpace(openAIChatJSONResultString(arguments))
+	if raw == "" {
+		return "{}"
+	}
+	if json.Valid([]byte(raw)) {
+		return raw
+	}
+
+	wrapped, errMarshal := json.Marshal(map[string]string{"input": raw})
+	if errMarshal != nil {
+		return "{}"
+	}
+	return string(wrapped)
+}
+
+func openAIChatJSONResultString(value gjson.Result) string {
+	if !value.Exists() || value.Type == gjson.Null {
+		return ""
+	}
+	if value.Type == gjson.String {
+		return value.String()
+	}
+	return value.Raw
 }
