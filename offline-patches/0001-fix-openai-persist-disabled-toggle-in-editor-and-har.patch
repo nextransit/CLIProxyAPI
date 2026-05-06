@@ -1,0 +1,134 @@
+From 52e33c22ccab5e94f6c4ec110fe948cb3101d6a2 Mon Sep 17 00:00:00 2001
+From: "zy@decard.com" <zy@decard.com>
+Date: Fri, 1 May 2026 21:24:29 +0800
+Subject: [PATCH] fix(openai): persist disabled toggle in editor and harden
+ toggle targeting
+
+---
+ src/pages/AiProvidersOpenAIEditLayout.tsx | 9 +++++----
+ src/pages/AiProvidersPage.tsx             | 2 +-
+ src/services/api/providers.ts             | 5 +++--
+ src/stores/useOpenAIEditDraftStore.ts     | 2 ++
+ 4 files changed, 11 insertions(+), 7 deletions(-)
+
+diff --git a/src/pages/AiProvidersOpenAIEditLayout.tsx b/src/pages/AiProvidersOpenAIEditLayout.tsx
+index 6ef9997..f0e16b1 100644
+--- a/src/pages/AiProvidersOpenAIEditLayout.tsx
++++ b/src/pages/AiProvidersOpenAIEditLayout.tsx
+@@ -43,6 +43,7 @@ export type OpenAIEditOutletContext = {
+ 
+ const buildEmptyForm = (): OpenAIFormState => ({
+   name: '',
++  disabled: false,
+   priority: undefined,
+   prefix: '',
+   baseUrl: '',
+@@ -106,6 +107,7 @@ const normalizeApiKeyEntries = (entries: ApiKeyEntry[]) =>
+ 
+ const buildOpenAIBaseline = (form: OpenAIFormState, testModel: string): OpenAIEditBaseline => ({
+   name: String(form.name ?? '').trim(),
++  disabled: form.disabled === true,
+   priority:
+     form.priority !== undefined && Number.isFinite(form.priority) ? Math.trunc(form.priority) : null,
+   prefix: String(form.prefix ?? '').trim(),
+@@ -297,6 +299,7 @@ export function AiProvidersOpenAIEditLayout() {
+       const modelEntries = modelsToEntries(initialData.models);
+       const seededForm: OpenAIFormState = {
+         name: initialData.name,
++        disabled: initialData.disabled === true,
+         priority: initialData.priority,
+         prefix: initialData.prefix ?? '',
+         baseUrl: initialData.baseUrl,
+@@ -421,6 +424,7 @@ export function AiProvidersOpenAIEditLayout() {
+     Boolean(draft?.initialized) &&
+     baseline !== null &&
+     (baseline.name !== form.name.trim() ||
++      baseline.disabled !== (form.disabled === true) ||
+       baseline.priority !== normalizedPriority ||
+       baseline.prefix !== form.prefix.trim() ||
+       baseline.baseUrl !== form.baseUrl.trim() ||
+@@ -466,6 +470,7 @@ export function AiProvidersOpenAIEditLayout() {
+     try {
+       const payload: OpenAIProviderConfig = {
+         name,
++        disabled: form.disabled === true,
+         prefix: form.prefix?.trim() || undefined,
+         baseUrl,
+         headers: buildHeaderObject(form.headers),
+@@ -478,9 +483,6 @@ export function AiProvidersOpenAIEditLayout() {
+       if (form.priority !== undefined && Number.isFinite(form.priority)) {
+         payload.priority = Math.trunc(form.priority);
+       }
+-      if (initialData?.disabled !== undefined) {
+-        payload.disabled = initialData.disabled;
+-      }
+       const resolvedTestModel = testModel.trim();
+       if (resolvedTestModel) payload.testModel = resolvedTestModel;
+       const models = entriesToModels(form.modelEntries);
+@@ -522,7 +524,6 @@ export function AiProvidersOpenAIEditLayout() {
+     editIndex,
+     form,
+     handleBack,
+-    initialData?.disabled,
+     providers,
+     setDraftBaseline,
+     showNotification,
+diff --git a/src/pages/AiProvidersPage.tsx b/src/pages/AiProvidersPage.tsx
+index 5986047..d5cce12 100644
+--- a/src/pages/AiProvidersPage.tsx
++++ b/src/pages/AiProvidersPage.tsx
+@@ -312,7 +312,7 @@ export function AiProvidersPage() {
+     clearCache('openai-compatibility');
+ 
+     try {
+-      await providersApi.updateOpenAIProviderDisabled(index, !enabled);
++      await providersApi.updateOpenAIProviderDisabled(index, current.name, !enabled);
+       showNotification(
+         enabled ? t('notification.config_enabled') : t('notification.config_disabled'),
+         'success'
+diff --git a/src/services/api/providers.ts b/src/services/api/providers.ts
+index b2fad9e..4cb2233 100644
+--- a/src/services/api/providers.ts
++++ b/src/services/api/providers.ts
+@@ -140,6 +140,7 @@ const serializeOpenAIProvider = (provider: OpenAIProviderConfig) => {
+   const payload: Record<string, unknown> = {
+     name: provider.name,
+     'base-url': provider.baseUrl,
++    disabled: Boolean(provider.disabled),
+     'api-key-entries': Array.isArray(provider.apiKeyEntries)
+       ? provider.apiKeyEntries.map((entry) => serializeApiKeyEntry(entry))
+       : []
+@@ -228,8 +229,8 @@ export const providersApi = {
+   updateOpenAIProvider: (index: number, value: OpenAIProviderConfig) =>
+     apiClient.patch('/openai-compatibility', { index, value: serializeOpenAIProvider(value) }),
+ 
+-  updateOpenAIProviderDisabled: (index: number, disabled: boolean) =>
+-    apiClient.patch('/openai-compatibility', { index, value: { disabled } }),
++  updateOpenAIProviderDisabled: (index: number, name: string, disabled: boolean) =>
++    apiClient.patch('/openai-compatibility', { index, name, value: { disabled } }),
+ 
+   deleteOpenAIProvider: (name: string) =>
+     apiClient.delete(`/openai-compatibility?name=${encodeURIComponent(name)}`)
+diff --git a/src/stores/useOpenAIEditDraftStore.ts b/src/stores/useOpenAIEditDraftStore.ts
+index 7535c0d..c7c106f 100644
+--- a/src/stores/useOpenAIEditDraftStore.ts
++++ b/src/stores/useOpenAIEditDraftStore.ts
+@@ -22,6 +22,7 @@ export type KeyTestStatus = {
+ 
+ export type OpenAIEditBaseline = {
+   name: string;
++  disabled: boolean;
+   priority: number | null;
+   prefix: string;
+   baseUrl: string;
+@@ -67,6 +68,7 @@ const resolveAction = <T,>(action: SetStateAction<T>, prev: T): T =>
+ 
+ const buildEmptyForm = (): OpenAIFormState => ({
+   name: '',
++  disabled: false,
+   prefix: '',
+   baseUrl: '',
+   headers: [],
+-- 
+2.49.0
+

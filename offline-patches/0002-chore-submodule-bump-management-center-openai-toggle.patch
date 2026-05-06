@@ -1,0 +1,20 @@
+From fac2bdf16681eb4224429f08c4b832dd4fed6f31 Mon Sep 17 00:00:00 2001
+From: "zy@decard.com" <zy@decard.com>
+Date: Fri, 1 May 2026 21:25:11 +0800
+Subject: [PATCH 2/2] chore(submodule): bump management center openai toggle
+ fixes
+
+---
+ Cli-Proxy-API-Management-Center | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/Cli-Proxy-API-Management-Center b/Cli-Proxy-API-Management-Center
+index 7aa6744f..52e33c22 160000
+--- a/Cli-Proxy-API-Management-Center
++++ b/Cli-Proxy-API-Management-Center
+@@ -1 +1 @@
+-Subproject commit 7aa6744f20d424b0bf1951a3afe9ba8209bf7496
++Subproject commit 52e33c22ccab5e94f6c4ec110fe948cb3101d6a2
+-- 
+2.49.0
+
