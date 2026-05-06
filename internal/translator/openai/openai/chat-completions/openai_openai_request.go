@@ -7,6 +7,7 @@ import (
 
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
+	log "github.com/sirupsen/logrus"
 )
 
 // ConvertOpenAIRequestToOpenAI passes through an OpenAI Chat Completions request,
@@ -61,7 +62,11 @@ func sanitizeToolCalls(raw []byte) []byte {
 		dirty = true
 		path := fmt.Sprintf("messages.%d.tool_calls", i)
 		if len(valid) == 0 {
-			out, _ = sjson.DeleteBytes(out, path)
+			var err error
+			out, err = sjson.DeleteBytes(out, path)
+			if err != nil {
+				log.Debugf("sanitizeToolCalls: failed to delete tool_calls at %s: %v", path, err)
+			}
 		} else {
 			arr := make([]byte, 0, len(valid)*128)
 			arr = append(arr, '[')
@@ -72,7 +77,12 @@ func sanitizeToolCalls(raw []byte) []byte {
 				arr = append(arr, v.Raw...)
 			}
 			arr = append(arr, ']')
-			out, _ = sjson.SetRawBytes(out, path, arr)
+			next, err := sjson.SetRawBytes(out, path, arr)
+			if err != nil {
+				log.Debugf("sanitizeToolCalls: failed to set tool_calls at %s: %v", path, err)
+			} else {
+				out = next
+			}
 		}
 	}
 
@@ -110,6 +120,7 @@ func sanitizeToolMessages(raw []byte) []byte {
 		path := fmt.Sprintf("messages.%d.tool_call_id", i)
 		next, err := sjson.SetBytes(out, path, callID)
 		if err != nil {
+			log.Debugf("sanitizeToolMessages: failed to set tool_call_id at %s: %v", path, err)
 			continue
 		}
 		out = next
