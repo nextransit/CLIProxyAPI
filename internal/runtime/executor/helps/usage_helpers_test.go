@@ -146,3 +146,51 @@ func TestUsageReporterBuildRecordIncludesLatency(t *testing.T) {
 		t.Fatalf("latency = %v, want <= 3s", record.Latency)
 	}
 }
+
+func TestUsageReporterSetThinkingFromPayload_OpenAIReasoningEffort(t *testing.T) {
+	reporter := &UsageReporter{}
+	reporter.SetThinkingFromPayload([]byte(`{"reasoning_effort":"high"}`))
+
+	record := reporter.buildRecord(usage.Detail{}, false)
+	if record.Detail.Thinking == nil {
+		t.Fatal("thinking should not be nil")
+	}
+	if got := record.Detail.Thinking.Intensity; got != "high" {
+		t.Fatalf("intensity = %q, want %q", got, "high")
+	}
+	if got := record.Detail.Thinking.Mode; got != "level" {
+		t.Fatalf("mode = %q, want %q", got, "level")
+	}
+	if got := record.Detail.Thinking.Level; got != "high" {
+		t.Fatalf("level = %q, want %q", got, "high")
+	}
+}
+
+func TestUsageReporterSetThinkingFromPayload_GeminiBudget(t *testing.T) {
+	reporter := &UsageReporter{}
+	reporter.SetThinkingFromPayload([]byte(`{"generationConfig":{"thinkingConfig":{"thinkingBudget":8192}}}`))
+
+	record := reporter.buildRecord(usage.Detail{}, false)
+	if record.Detail.Thinking == nil {
+		t.Fatal("thinking should not be nil")
+	}
+	if got := record.Detail.Thinking.Mode; got != "budget" {
+		t.Fatalf("mode = %q, want %q", got, "budget")
+	}
+	if record.Detail.Thinking.Budget == nil || *record.Detail.Thinking.Budget != 8192 {
+		t.Fatalf("budget = %v, want 8192", record.Detail.Thinking.Budget)
+	}
+}
+
+func TestUsageReporterSetThinkingFromPayload_ClaudeAdaptive(t *testing.T) {
+	reporter := &UsageReporter{}
+	reporter.SetThinkingFromPayload([]byte(`{"thinking":{"type":"adaptive"},"output_config":{"effort":"max"}}`))
+
+	record := reporter.buildRecord(usage.Detail{}, false)
+	if record.Detail.Thinking == nil {
+		t.Fatal("thinking should not be nil")
+	}
+	if got := record.Detail.Thinking.Level; got != "max" {
+		t.Fatalf("level = %q, want %q", got, "max")
+	}
+}

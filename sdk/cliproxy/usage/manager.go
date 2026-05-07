@@ -23,6 +23,14 @@ type Record struct {
 	Detail      Detail
 }
 
+// Thinking holds normalized thinking settings extracted from the effective request payload.
+type Thinking struct {
+	Intensity string `json:"intensity,omitempty"`
+	Mode      string `json:"mode,omitempty"`
+	Level     string `json:"level,omitempty"`
+	Budget    *int64 `json:"budget,omitempty"`
+}
+
 // Detail holds the token usage breakdown.
 type Detail struct {
 	InputTokens     int64
@@ -30,6 +38,7 @@ type Detail struct {
 	ReasoningTokens int64
 	CachedTokens    int64
 	TotalTokens     int64
+	Thinking        *Thinking
 }
 
 // Plugin consumes usage records emitted by the proxy runtime.

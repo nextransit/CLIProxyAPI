@@ -32,6 +32,42 @@ func TestRequestStatisticsRecordIncludesLatency(t *testing.T) {
 	}
 }
 
+func TestRequestStatisticsRecordIncludesThinking(t *testing.T) {
+	stats := NewRequestStatistics()
+	budget := int64(8192)
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "gpt-5.4",
+		RequestedAt: time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC),
+		Detail: coreusage.Detail{
+			InputTokens:  10,
+			OutputTokens: 20,
+			TotalTokens:  30,
+			Thinking: &coreusage.Thinking{
+				Intensity: "high",
+				Mode:      "budget",
+				Level:     "high",
+				Budget:    &budget,
+			},
+		},
+	})
+
+	snapshot := stats.Snapshot()
+	details := snapshot.APIs["test-key"].Models["gpt-5.4"].Details
+	if len(details) != 1 {
+		t.Fatalf("details len = %d, want 1", len(details))
+	}
+	if details[0].Thinking == nil {
+		t.Fatal("thinking should not be nil")
+	}
+	if got := details[0].Thinking.Mode; got != "budget" {
+		t.Fatalf("thinking.mode = %q, want %q", got, "budget")
+	}
+	if details[0].Thinking.Budget == nil || *details[0].Thinking.Budget != 8192 {
+		t.Fatalf("thinking.budget = %v, want 8192", details[0].Thinking.Budget)
+	}
+}
+
 func TestRequestStatisticsMergeSnapshotDedupIgnoresLatency(t *testing.T) {
 	stats := NewRequestStatistics()
 	timestamp := time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC)

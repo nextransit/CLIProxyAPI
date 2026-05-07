@@ -201,6 +201,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 
 	body, wsHeaders := applyCodexPromptCacheHeaders(from, req, body)
 	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg)
+	reporter.SetThinkingFromPayload(body)
 
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
@@ -396,6 +397,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 
 	body, wsHeaders := applyCodexPromptCacheHeaders(from, req, body)
 	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg)
+	reporter.SetThinkingFromPayload(body)
 
 	var authID, authLabel, authType, authValue string
 	authID = auth.ID

@@ -337,6 +337,7 @@ func (e *GeminiVertexExecutor) executeWithServiceAccount(ctx context.Context, au
 		body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
 		body, _ = sjson.SetBytes(body, "model", baseModel)
 	}
+	reporter.SetThinkingFromPayload(body)
 
 	action := getVertexAction(baseModel, false)
 	if req.Metadata != nil {
@@ -456,6 +457,7 @@ func (e *GeminiVertexExecutor) executeWithAPIKey(ctx context.Context, auth *clip
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
+	reporter.SetThinkingFromPayload(body)
 
 	action := getVertexAction(baseModel, false)
 	if req.Metadata != nil {
@@ -566,6 +568,7 @@ func (e *GeminiVertexExecutor) executeStreamWithServiceAccount(ctx context.Conte
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
+	reporter.SetThinkingFromPayload(body)
 
 	action := getVertexAction(baseModel, true)
 	baseURL := vertexBaseURL(location)
@@ -695,6 +698,7 @@ func (e *GeminiVertexExecutor) executeStreamWithAPIKey(ctx context.Context, auth
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
+	reporter.SetThinkingFromPayload(body)
 
 	action := getVertexAction(baseModel, true)
 	// For API key auth, use simpler URL format without project/location

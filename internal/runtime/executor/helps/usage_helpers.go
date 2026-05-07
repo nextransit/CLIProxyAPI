@@ -24,6 +24,7 @@ type UsageReporter struct {
 	apiKey      string
 	source      string
 	requestedAt time.Time
+	thinking    *usage.Thinking
 	once        sync.Once
 }
 
@@ -92,6 +93,14 @@ func (r *UsageReporter) EnsurePublishedWithDetail(ctx context.Context, detail us
 	})
 }
 
+// SetThinkingFromPayload extracts normalized thinking settings from the effective request payload.
+func (r *UsageReporter) SetThinkingFromPayload(payload []byte) {
+	if r == nil {
+		return
+	}
+	r.thinking = parseThinkingFromPayload(payload)
+}
+
 func normalizeUsageDetail(detail usage.Detail) usage.Detail {
 	if detail.TotalTokens == 0 {
 		total := detail.InputTokens + detail.OutputTokens + detail.ReasoningTokens
@@ -106,6 +115,9 @@ func (r *UsageReporter) buildRecord(detail usage.Detail, failed bool) usage.Reco
 	if r == nil {
 		return usage.Record{Detail: detail, Failed: failed}
 	}
+	if detail.Thinking == nil && r.thinking != nil {
+		detail.Thinking = cloneUsageThinking(r.thinking)
+	}
 	return usage.Record{
 		Provider:    r.provider,
 		Model:       r.model,
@@ -119,6 +131,180 @@ func (r *UsageReporter) buildRecord(detail usage.Detail, failed bool) usage.Reco
 		Failed:      failed,
 		Detail:      detail,
 	}
+}
+
+func cloneUsageThinking(in *usage.Thinking) *usage.Thinking {
+	if in == nil {
+		return nil
+	}
+	out := &usage.Thinking{
+		Intensity: in.Intensity,
+		Mode:      in.Mode,
+		Level:     in.Level,
+	}
+	if in.Budget != nil {
+		b := *in.Budget
+		out.Budget = &b
+	}
+	return out
+}
+
+func parseThinkingFromPayload(payload []byte) *usage.Thinking {
+	if len(payload) == 0 {
+		return nil
+	}
+
+	if thinking := parseClaudeThinkingPayload(payload); thinking != nil {
+		return thinking
+	}
+	if thinking := parseNativeThinkingObject(payload); thinking != nil {
+		return thinking
+	}
+	if effort := firstNonEmptyPath(payload, []string{"reasoning.effort", "reasoning_effort"}); effort != "" {
+		return buildThinkingFromEffort(effort)
+	}
+	if level := firstNonEmptyPath(payload, []string{
+		"generationConfig.thinkingConfig.thinkingLevel",
+		"generationConfig.thinkingConfig.thinking_level",
+		"request.generationConfig.thinkingConfig.thinkingLevel",
+		"request.generationConfig.thinkingConfig.thinking_level",
+	}); level != "" {
+		return buildThinkingFromEffort(level)
+	}
+	if budget, ok := firstNumberPath(payload, []string{
+		"generationConfig.thinkingConfig.thinkingBudget",
+		"generationConfig.thinkingConfig.thinking_budget",
+		"request.generationConfig.thinkingConfig.thinkingBudget",
+		"request.generationConfig.thinkingConfig.thinking_budget",
+	}); ok {
+		return buildThinkingFromBudget(budget)
+	}
+
+	return nil
+}
+
+func parseClaudeThinkingPayload(payload []byte) *usage.Thinking {
+	thinking := gjson.GetBytes(payload, "thinking")
+	if !thinking.Exists() || !thinking.IsObject() {
+		return nil
+	}
+
+	thinkingType := strings.ToLower(strings.TrimSpace(thinking.Get("type").String()))
+	budgetNode := thinking.Get("budget_tokens")
+	effort := strings.ToLower(strings.TrimSpace(gjson.GetBytes(payload, "output_config.effort").String()))
+
+	switch thinkingType {
+	case "disabled":
+		return buildThinkingFromBudget(0)
+	case "adaptive":
+		if effort != "" {
+			return buildThinkingFromEffort(effort)
+		}
+		return buildThinkingFromEffort("auto")
+	case "enabled":
+		if budgetNode.Exists() {
+			return buildThinkingFromBudget(budgetNode.Int())
+		}
+		return buildThinkingFromEffort("auto")
+	case "":
+		if budgetNode.Exists() {
+			return buildThinkingFromBudget(budgetNode.Int())
+		}
+		if effort != "" {
+			return buildThinkingFromEffort(effort)
+		}
+	default:
+		if budgetNode.Exists() {
+			return buildThinkingFromBudget(budgetNode.Int())
+		}
+		if effort != "" {
+			return buildThinkingFromEffort(effort)
+		}
+	}
+
+	return nil
+}
+
+func parseNativeThinkingObject(payload []byte) *usage.Thinking {
+	node := gjson.GetBytes(payload, "thinking")
+	if !node.Exists() || !node.IsObject() {
+		return nil
+	}
+
+	intensity := strings.TrimSpace(node.Get("intensity").String())
+	mode := strings.TrimSpace(node.Get("mode").String())
+	level := strings.TrimSpace(node.Get("level").String())
+
+	var budgetPtr *int64
+	if budgetNode := node.Get("budget"); budgetNode.Exists() && budgetNode.Type == gjson.Number {
+		b := budgetNode.Int()
+		budgetPtr = &b
+	}
+
+	if intensity == "" && mode == "" && level == "" && budgetPtr == nil {
+		return nil
+	}
+
+	return &usage.Thinking{
+		Intensity: strings.ToLower(intensity),
+		Mode:      strings.ToLower(mode),
+		Level:     strings.ToLower(level),
+		Budget:    budgetPtr,
+	}
+}
+
+func firstNonEmptyPath(payload []byte, paths []string) string {
+	for _, path := range paths {
+		value := strings.TrimSpace(gjson.GetBytes(payload, path).String())
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func firstNumberPath(payload []byte, paths []string) (int64, bool) {
+	for _, path := range paths {
+		value := gjson.GetBytes(payload, path)
+		if value.Exists() && value.Type == gjson.Number {
+			return value.Int(), true
+		}
+	}
+	return 0, false
+}
+
+func buildThinkingFromEffort(raw string) *usage.Thinking {
+	value := strings.ToLower(strings.TrimSpace(raw))
+	if value == "" {
+		return nil
+	}
+
+	switch value {
+	case "none":
+		return &usage.Thinking{Intensity: "none", Mode: "none", Level: "none"}
+	case "auto":
+		b := int64(-1)
+		return &usage.Thinking{Intensity: "auto", Mode: "auto", Level: "auto", Budget: &b}
+	default:
+		return &usage.Thinking{Intensity: value, Mode: "level", Level: value}
+	}
+}
+
+func buildThinkingFromBudget(budget int64) *usage.Thinking {
+	out := &usage.Thinking{Budget: &budget}
+	switch {
+	case budget == 0:
+		out.Intensity = "none"
+		out.Mode = "none"
+		out.Level = "none"
+	case budget == -1:
+		out.Intensity = "auto"
+		out.Mode = "auto"
+		out.Level = "auto"
+	default:
+		out.Mode = "budget"
+	}
+	return out
 }
 
 func (r *UsageReporter) latency() time.Duration {

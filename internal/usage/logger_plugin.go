@@ -93,8 +93,17 @@ type RequestDetail struct {
 	LatencyMs int64      `json:"latency_ms"`
 	Source    string     `json:"source"`
 	AuthIndex string     `json:"auth_index"`
+	Thinking  *Thinking  `json:"thinking,omitempty"`
 	Tokens    TokenStats `json:"tokens"`
 	Failed    bool       `json:"failed"`
+}
+
+// Thinking captures normalized thinking settings for one request.
+type Thinking struct {
+	Intensity string `json:"intensity,omitempty"`
+	Mode      string `json:"mode,omitempty"`
+	Level     string `json:"level,omitempty"`
+	Budget    *int64 `json:"budget,omitempty"`
 }
 
 // TokenStats captures the token usage breakdown for a request.
@@ -202,6 +211,7 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 		LatencyMs: normaliseLatency(record.Latency),
 		Source:    record.Source,
 		AuthIndex: record.AuthIndex,
+		Thinking:  normaliseThinking(record.Detail.Thinking),
 		Tokens:    detail,
 		Failed:    failed,
 	})
@@ -334,6 +344,7 @@ func (s *RequestStatistics) MergeSnapshot(snapshot StatisticsSnapshot) MergeResu
 			}
 			for _, detail := range modelSnapshot.Details {
 				detail.Tokens = normaliseTokenStats(detail.Tokens)
+				detail.Thinking = normaliseThinkingValue(detail.Thinking)
 				if detail.LatencyMs < 0 {
 					detail.LatencyMs = 0
 				}
@@ -383,8 +394,21 @@ func (s *RequestStatistics) recordImported(apiName, modelName string, stats *api
 func dedupKey(apiName, modelName string, detail RequestDetail) string {
 	timestamp := detail.Timestamp.UTC().Format(time.RFC3339Nano)
 	tokens := normaliseTokenStats(detail.Tokens)
+	thinking := normaliseThinkingValue(detail.Thinking)
+	thinkingBudget := int64(0)
+	if thinking != nil && thinking.Budget != nil {
+		thinkingBudget = *thinking.Budget
+	}
+	thinkingIntensity := ""
+	thinkingMode := ""
+	thinkingLevel := ""
+	if thinking != nil {
+		thinkingIntensity = thinking.Intensity
+		thinkingMode = thinking.Mode
+		thinkingLevel = thinking.Level
+	}
 	return fmt.Sprintf(
-		"%s|%s|%s|%s|%s|%t|%d|%d|%d|%d|%d",
+		"%s|%s|%s|%s|%s|%t|%d|%d|%d|%d|%d|%s|%s|%s|%d",
 		apiName,
 		modelName,
 		timestamp,
@@ -396,6 +420,10 @@ func dedupKey(apiName, modelName string, detail RequestDetail) string {
 		tokens.ReasoningTokens,
 		tokens.CachedTokens,
 		tokens.TotalTokens,
+		thinkingIntensity,
+		thinkingMode,
+		thinkingLevel,
+		thinkingBudget,
 	)
 }
 
@@ -466,6 +494,41 @@ func normaliseTokenStats(tokens TokenStats) TokenStats {
 		tokens.TotalTokens = tokens.InputTokens + tokens.OutputTokens + tokens.ReasoningTokens + tokens.CachedTokens
 	}
 	return tokens
+}
+
+func normaliseThinking(value *coreusage.Thinking) *Thinking {
+	if value == nil {
+		return nil
+	}
+	result := &Thinking{
+		Intensity: strings.ToLower(strings.TrimSpace(value.Intensity)),
+		Mode:      strings.ToLower(strings.TrimSpace(value.Mode)),
+		Level:     strings.ToLower(strings.TrimSpace(value.Level)),
+	}
+	if value.Budget != nil {
+		b := *value.Budget
+		result.Budget = &b
+	}
+	return normaliseThinkingValue(result)
+}
+
+func normaliseThinkingValue(value *Thinking) *Thinking {
+	if value == nil {
+		return nil
+	}
+	result := &Thinking{
+		Intensity: strings.ToLower(strings.TrimSpace(value.Intensity)),
+		Mode:      strings.ToLower(strings.TrimSpace(value.Mode)),
+		Level:     strings.ToLower(strings.TrimSpace(value.Level)),
+	}
+	if value.Budget != nil {
+		b := *value.Budget
+		result.Budget = &b
+	}
+	if result.Intensity == "" && result.Mode == "" && result.Level == "" && result.Budget == nil {
+		return nil
+	}
+	return result
 }
 
 func normaliseLatency(latency time.Duration) int64 {
