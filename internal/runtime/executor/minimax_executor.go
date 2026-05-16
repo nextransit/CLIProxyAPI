@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -130,6 +131,10 @@ func (e *MiniMaxExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, 
 	translated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayloadSource, opts.Stream)
 
 	anthropicPayload := e.translateToAnthropic(translated, baseModel)
+
+	// Fetch URL content for messages before sending to MiniMax
+	anthropicPayload = FetchURLsInMessages(anthropicPayload)
+
 	anthropicURL := e.buildAnthropicURL(baseURL)
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, anthropicURL, bytes.NewReader(anthropicPayload))
@@ -519,6 +524,10 @@ func (e *MiniMaxExecutor) StreamExecute(ctx context.Context, auth *cliproxyauth.
 	to := sdktranslator.FromString("openai")
 	translated := sdktranslator.TranslateRequest(opts.SourceFormat, to, baseModel, req.Payload, true)
 	anthropicPayload := e.translateToAnthropic(translated, baseModel)
+
+	// Fetch URL content for messages before sending to MiniMax
+	anthropicPayload = FetchURLsInMessages(anthropicPayload)
+
 	anthropicURL := e.buildAnthropicURL(baseURL)
 
 	e.queueMu.Lock()
@@ -682,4 +691,44 @@ func countConsecutiveToolCallsFromPayload(payload []byte) int {
 		msgStrings = append(msgStrings, m.Raw)
 	}
 	return countConsecutiveToolCalls(msgStrings)
+}
+
+// FetchURLsInMessages scans all messages for URLs and fetches their content.
+// It replaces URL text with fetched content to reduce upstream fetching burden.
+func FetchURLsInMessages(payload []byte) []byte {
+	messages := gjson.GetBytes(payload, "messages")
+	if !messages.IsArray() {
+		return payload
+	}
+
+	arr := messages.Array()
+	for i := 0; i < len(arr); i++ {
+		msg := arr[i]
+		content := msg.Get("content").String()
+		if content == "" {
+			continue
+		}
+
+		urls := extractURLsFromContent(content)
+		for _, url := range urls {
+			fetched, err := fetchURLContent(url)
+			if err != nil {
+				log.Debugf("minimax web fetch: failed to fetch %s: %v", url, err)
+				continue
+			}
+
+			// Truncate very long content
+			if len(fetched) > 5000 {
+				fetched = fetched[:5000] + "...[truncated]"
+			}
+
+			content = replaceURLsWithContent(content, url, fetched)
+		}
+
+		if content != msg.Get("content").String() {
+			payload, _ = sjson.SetBytes(payload, "messages."+strconv.FormatInt(int64(i), 10)+".content", content)
+		}
+	}
+
+	return payload
 }
