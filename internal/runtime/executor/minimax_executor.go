@@ -135,6 +135,15 @@ func (e *MiniMaxExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, 
 	// Fetch URL content for messages before sending to MiniMax
 	anthropicPayload = FetchURLsInMessages(anthropicPayload)
 
+	// Route web search to OpenRouter if configured
+	if shouldRouteWebSearchToOpenRouter(e.provider) {
+		var routed bool
+		anthropicPayload, routed = routeWebSearchToOpenRouter(anthropicPayload)
+		if routed {
+			helps.LogWithRequestID(ctx).Debugf("minimax executor: routed web_search to OpenRouter")
+		}
+	}
+
 	anthropicURL := e.buildAnthropicURL(baseURL)
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, anthropicURL, bytes.NewReader(anthropicPayload))
@@ -528,6 +537,15 @@ func (e *MiniMaxExecutor) StreamExecute(ctx context.Context, auth *cliproxyauth.
 	// Fetch URL content for messages before sending to MiniMax
 	anthropicPayload = FetchURLsInMessages(anthropicPayload)
 
+	// Route web search to OpenRouter if configured
+	if shouldRouteWebSearchToOpenRouter(e.provider) {
+		var routed bool
+		anthropicPayload, routed = routeWebSearchToOpenRouter(anthropicPayload)
+		if routed {
+			helps.LogWithRequestID(ctx).Debugf("minimax executor: routed web_search to OpenRouter")
+		}
+	}
+
 	anthropicURL := e.buildAnthropicURL(baseURL)
 
 	e.queueMu.Lock()
@@ -731,4 +749,62 @@ func FetchURLsInMessages(payload []byte) []byte {
 	}
 
 	return payload
+}
+
+// shouldRouteWebSearchToOpenRouter checks if web search should be routed to OpenRouter
+// based on provider configuration. Returns true for "openrouter" provider.
+func shouldRouteWebSearchToOpenRouter(provider string) bool {
+	return provider == "openrouter"
+}
+
+// containsWebSearchTool checks if the tools array contains a web_search tool
+// by name or by type prefix (e.g., "web_search_20250305").
+func containsWebSearchTool(tools []byte) bool {
+	if !gjson.ValidBytes(tools) {
+		return false
+	}
+	toolsArr := gjson.GetBytes(tools, "tools").Array()
+	for _, t := range toolsArr {
+		name := t.Get("name").String()
+		if name == "web_search" {
+			return true
+		}
+		tp := t.Get("type").String()
+		if strings.HasPrefix(tp, "web_search") {
+			return true
+		}
+	}
+	return false
+}
+
+// routeWebSearchToOpenRouter transforms a request to route web_search to OpenRouter.
+// It removes web_search tool from the request and adds metadata to indicate routing.
+// Returns modified payload and true if routing was applied.
+func routeWebSearchToOpenRouter(payload []byte) ([]byte, bool) {
+	if !containsWebSearchTool(payload) {
+		return payload, false
+	}
+
+	// Remove web_search tool from tools array
+	var newTools []interface{}
+	tools := gjson.GetBytes(payload, "tools")
+	for _, t := range tools.Array() {
+		name := t.Get("name").String()
+		tp := t.Get("type").String()
+		if name == "web_search" || strings.HasPrefix(tp, "web_search") {
+			continue
+		}
+		newTools = append(newTools, t.Value())
+	}
+
+	if len(newTools) == 0 {
+		payload, _ = sjson.DeleteBytes(payload, "tools")
+	} else {
+		payload, _ = sjson.SetBytes(payload, "tools", newTools)
+	}
+
+	// Add metadata to indicate OpenRouter routing
+	payload, _ = sjson.SetBytes(payload, "_meta.route_web_search_to_openrouter", true)
+
+	return payload, true
 }
