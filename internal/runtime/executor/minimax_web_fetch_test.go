@@ -3,6 +3,7 @@ package executor
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -58,10 +59,13 @@ func TestFetchURLContent_404Error(t *testing.T) {
 	defer server.Close()
 
 	_, err := fetchURLContent(server.URL)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	if err == nil {
+		t.Fatal("expected error for 404 response, got nil")
 	}
-	// 404 should return nil error but empty content
+	// Verify error message contains status code
+	if !strings.Contains(err.Error(), "HTTP 404") {
+		t.Errorf("expected error containing 'HTTP 404', got: %v", err)
+	}
 }
 
 func TestReplaceURLsWithContent(t *testing.T) {
@@ -73,5 +77,43 @@ func TestReplaceURLsWithContent(t *testing.T) {
 	expected := "See This is the fetched content for details"
 	if result != expected {
 		t.Errorf("expected %q, got %q", expected, result)
+	}
+}
+
+func TestIsLocalOrPrivateURL_Localhost(t *testing.T) {
+	tests := []struct {
+		name string
+		url  string
+		want bool
+	}{
+		{"localhost", "http://localhost/path", true},
+		{"127.0.0.1", "http://127.0.0.1/path", true},
+		{"::1", "http://[::1]/path", true},
+		{"private IP 192", "http://192.168.1.1/path", true},
+		{"private IP 10", "http://10.0.0.1/path", true},
+		{"private IP 172", "http://172.16.0.1/path", true},
+		{".local domain", "http://server.local/path", true},
+		{"public URL", "https://example.com/path", false},
+		{"public URL no path", "https://google.com", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isLocalOrPrivateURL(tt.url)
+			if got != tt.want {
+				t.Errorf("isLocalOrPrivateURL(%q) = %v, want %v", tt.url, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFetchURLContent_LocalhostRejected(t *testing.T) {
+	// This test verifies SSRF protection works
+	_, err := fetchURLContent("http://127.0.0.1:9999/nonexistent")
+	if err == nil {
+		t.Fatal("expected error for localhost URL, got nil")
+	}
+	if !strings.Contains(err.Error(), "refusing to fetch") {
+		t.Errorf("expected error containing 'refusing to fetch', got: %v", err)
 	}
 }
