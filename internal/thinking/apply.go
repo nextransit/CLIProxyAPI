@@ -454,6 +454,9 @@ func extractGeminiConfig(body []byte, provider string) ThinkingConfig {
 // OpenAI API format:
 //   - reasoning_effort: "none", "low", "medium", "high" (discrete levels)
 //
+// Some DeepSeek models also support thinking config via extra_body:
+//   - extra_body.thinking.type: "enabled" or "disabled"
+//
 // OpenAI uses level-based thinking configuration only, no numeric budget support.
 // The "none" value is treated specially to return ModeNone.
 func extractOpenAIConfig(body []byte) ThinkingConfig {
@@ -462,6 +465,19 @@ func extractOpenAIConfig(body []byte) ThinkingConfig {
 		value := effort.String()
 		if value == "none" {
 			return ThinkingConfig{Mode: ModeNone, Budget: 0}
+		}
+		return ThinkingConfig{Mode: ModeLevel, Level: ThinkingLevel(value)}
+	}
+
+	// Check extra_body.thinking.type (DeepSeek format)
+	if thinkingType := gjson.GetBytes(body, "extra_body.thinking.type"); thinkingType.Exists() {
+		value := strings.ToLower(strings.TrimSpace(thinkingType.String()))
+		if value == "disabled" || value == "none" {
+			return ThinkingConfig{Mode: ModeNone, Budget: 0}
+		}
+		if value == "enabled" {
+			// DeepSeek with thinking enabled but no specific level - treat as auto
+			return ThinkingConfig{Mode: ModeAuto, Budget: -1}
 		}
 		return ThinkingConfig{Mode: ModeLevel, Level: ThinkingLevel(value)}
 	}
