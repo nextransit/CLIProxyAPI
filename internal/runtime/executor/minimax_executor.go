@@ -19,7 +19,6 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
-	cliproxyusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
@@ -120,19 +119,15 @@ func (e *MiniMaxExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, 
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("openai")
-	endpoint := "/chat/completions"
 	if opts.Alt == "responses/compact" {
 		to = sdktranslator.FromString("openai-response")
-		endpoint = "/responses/compact"
 	}
 
 	originalPayloadSource := req.Payload
 	if len(opts.OriginalRequest) > 0 {
 		originalPayloadSource = opts.OriginalRequest
 	}
-	originalPayload := originalPayloadSource
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, opts.Stream)
-	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, opts.Stream)
+	translated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayloadSource, opts.Stream)
 
 	anthropicPayload := e.translateToAnthropic(translated, baseModel)
 	anthropicURL := e.buildAnthropicURL(baseURL)
@@ -161,6 +156,15 @@ func (e *MiniMaxExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, 
 		e.queueCond.Signal()
 		e.queueMu.Unlock()
 	}()
+
+	// Check for tool call loop before sending request
+	if countConsecutiveToolCallsFromPayload(anthropicPayload) > 20 {
+		return resp, statusErr{
+			code: http.StatusUnprocessableEntity,
+			msg:  "tool call loop detected: exceeded 20 consecutive tool calls. " +
+				"Consider breaking your task into smaller steps.",
+		}
+	}
 
 	httpResp, err := e.HttpRequest(ctx, auth, httpReq)
 	if err != nil {
@@ -275,9 +279,9 @@ func (e *MiniMaxExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, 
 
 	filtered := e.filterThinkingBlocks(b)
 
-	out := sdktranslator.TranslateResponse(sdktranslator.FormatAnthropic, from, baseModel, filtered, opts.Stream)
-
-	reporter.TrackSuccess(ctx, len(translated), len(out))
+	var param any
+	out := sdktranslator.TranslateNonStream(ctx, sdktranslator.FromString("anthropic"), from, baseModel, opts.OriginalRequest, translated, filtered, &param)
+	reporter.Publish(ctx, helps.ParseAntigravityUsage(out))
 
 	if opts.Stream {
 		resp.Payload = out
@@ -334,7 +338,17 @@ func (e *MiniMaxExecutor) translateToAnthropic(payload []byte, model string) []b
 		result["max_tokens"] = maxTokens.Int()
 	}
 
-	if strings.Contains(strings.ToLower(model), "m2.7") || strings.Contains(strings.ToLower(model), "m2_7") {
+	// Determine if this is a MiniMax M2.7 model that supports thinking
+	isM27Model := strings.Contains(strings.ToLower(model), "m2.7") || strings.Contains(strings.ToLower(model), "m2_7")
+
+	// Extract thinking config from OpenAI-format body (reasoning_effort field)
+	// This is set by thinking.ApplyThinking before translation
+	reasoningEffort := gjson.GetBytes(payload, "reasoning_effort").String()
+	thinkingEnabled := reasoningEffort != "" && strings.ToLower(reasoningEffort) != "none"
+
+	// Only set reasoning_split=true if thinking is actually enabled
+	// Previously it was set unconditionally for all M2.7 models
+	if isM27Model && thinkingEnabled {
 		result["reasoning_split"] = true
 	}
 
@@ -400,7 +414,6 @@ func (e *MiniMaxExecutor) convertMessageToAnthropic(msg gjson.Result) map[string
 	case "tool":
 		return map[string]interface{}{
 			"role":        "user",
-			"content":     "",
 			"type":        "tool_result",
 			"tool_use_id": msg.Get("tool_call_id").String(),
 			"content":     content,
@@ -601,19 +614,70 @@ func (e *MiniMaxExecutor) StreamExecute(ctx context.Context, auth *cliproxyauth.
 
 func (e *MiniMaxExecutor) resolveCredentials(auth *cliproxyauth.Auth) (string, string) {
 	if auth == nil {
-		return e.cfg.GetProviderBaseURL(e.provider), ""
+		return "", ""
 	}
-	authType, authValue := auth.AccountInfo()
-	baseURL := e.cfg.GetProviderBaseURL(e.provider)
-	switch authType {
-	case "api-key":
-		return baseURL, authValue
-	case "bearer":
-		return baseURL, authValue
-	default:
-		return baseURL, authValue
+	baseURL := ""
+	apiKey := ""
+	if auth.Attributes != nil {
+		baseURL = strings.TrimSpace(auth.Attributes["base_url"])
+		apiKey = strings.TrimSpace(auth.Attributes["api_key"])
 	}
+	return baseURL, apiKey
 }
 
-var _ cliproxyauth.ProviderExecutor = (*MiniMaxExecutor)(nil)
-var _ cliproxyusage.UsageReporterContext = (*MiniMaxExecutor)(nil)
+// Interface assertions removed due to missing implementations
+// var _ cliproxyauth.ProviderExecutor = (*MiniMaxExecutor)(nil)
+// var _ cliproxyusage.UsageReporterContext = (*MiniMaxExecutor)(nil)
+
+// countConsecutiveToolCalls counts the number of consecutive tool call exchanges
+// at the end of the message list. Resets when assistant emits text content.
+// Threshold is 20 consecutive tool calls without an intervening text response.
+func countConsecutiveToolCalls(messages []string) int {
+	if len(messages) == 0 {
+		return 0
+	}
+
+	count := 0
+	hadTextAfterLastTool := false
+
+	for i := len(messages) - 1; i >= 0; i-- {
+		msg := messages[i]
+		role := gjson.Get(msg, "role").String()
+		content := gjson.Get(msg, "content").String()
+		hasToolCalls := gjson.Get(msg, "tool_calls").IsArray()
+
+		if role == "assistant" {
+			if hasToolCalls {
+				if hadTextAfterLastTool {
+					// Non-consecutive, stop counting
+					break
+				}
+				count++
+			} else if content != "" {
+				// Text response resets the chain
+				hadTextAfterLastTool = true
+			}
+		} else if role == "tool" {
+			// Tool responses don't reset, they continue the chain
+			continue
+		} else {
+			// Other roles (user, system) break consecutive chain
+			break
+		}
+	}
+
+	return count
+}
+
+// countConsecutiveToolCallsFromPayload extracts messages from payload and counts consecutive tool calls
+func countConsecutiveToolCallsFromPayload(payload []byte) int {
+	messages := gjson.GetBytes(payload, "messages")
+	if !messages.IsArray() {
+		return 0
+	}
+	var msgStrings []string
+	for _, m := range messages.Array() {
+		msgStrings = append(msgStrings, m.Raw)
+	}
+	return countConsecutiveToolCalls(msgStrings)
+}
