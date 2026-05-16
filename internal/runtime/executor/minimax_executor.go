@@ -798,13 +798,28 @@ func routeWebSearchToOpenRouter(payload []byte) ([]byte, bool) {
 	}
 
 	if len(newTools) == 0 {
-		payload, _ = sjson.DeleteBytes(payload, "tools")
+		if out, err := sjson.DeleteBytes(payload, "tools"); err != nil {
+			log.Debugf("routeWebSearchToOpenRouter: failed to delete tools: %v", err)
+			return payload, false
+		} else {
+			payload = out
+		}
 	} else {
-		payload, _ = sjson.SetBytes(payload, "tools", newTools)
+		if out, err := sjson.SetBytes(payload, "tools", newTools); err != nil {
+			log.Debugf("routeWebSearchToOpenRouter: failed to set tools: %v", err)
+			return payload, false
+		} else {
+			payload = out
+		}
 	}
 
 	// Add metadata to indicate OpenRouter routing
-	payload, _ = sjson.SetBytes(payload, "_meta.route_web_search_to_openrouter", true)
+	if out, err := sjson.SetBytes(payload, "_meta.route_web_search_to_openrouter", true); err != nil {
+		log.Debugf("routeWebSearchToOpenRouter: failed to set metadata: %v", err)
+		return payload, false
+	} else {
+		payload = out
+	}
 
 	return payload, true
 }

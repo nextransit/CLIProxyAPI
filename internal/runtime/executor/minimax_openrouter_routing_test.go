@@ -113,6 +113,11 @@ func TestRouteWebSearchToOpenRouter(t *testing.T) {
 				if toolCount != tt.expectTools {
 					t.Errorf("tool count = %d, want %d", toolCount, tt.expectTools)
 				}
+				// Verify metadata flag is set
+				metaVal := gjson.Get(string(result), "_meta.route_web_search_to_openrouter")
+				if !metaVal.Exists() || !metaVal.Bool() {
+					t.Errorf("expected _meta.route_web_search_to_openrouter to be true")
+				}
 			}
 		})
 	}
