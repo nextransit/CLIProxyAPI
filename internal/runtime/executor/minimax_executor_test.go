@@ -183,7 +183,8 @@ func TestMiniMaxExecutor_TranslateToAnthropic(t *testing.T) {
 				"messages": [
 					{"role": "user", "content": "hello"}
 				],
-				"max_tokens": 1000
+				"max_tokens": 1000,
+				"reasoning_effort": "high"
 			}`)
 
 			got := e.translateToAnthropic(payload, tt.model)
@@ -208,8 +209,77 @@ func TestMiniMaxExecutor_TranslateToAnthropic(t *testing.T) {
 			}
 
 			reasoningSplit := gjson.GetBytes(got, "reasoning_split")
-			if tt.model == "MiniMax-M2.7" && !reasoningSplit.Bool() {
-				t.Errorf("translateToAnthropic() should set reasoning_split=true for M2.7")
+			if tt.model == "MiniMax-M2.7" && !reasoningSplit.Exists() {
+				t.Errorf("translateToAnthropic() should set reasoning_split for M2.7")
+			}
+		})
+	}
+}
+
+func TestMiniMaxExecutor_TranslateToAnthropic_ThinkingConfig(t *testing.T) {
+	cfg := &config.Config{}
+	e := NewMiniMaxExecutor("minimax", cfg)
+
+	tests := []struct {
+		name           string
+		model          string
+		payload        string
+		wantReasoning  bool // whether reasoning_split should be set to true
+		reasoningGiven bool // whether reasoning_split key should exist at all
+	}{
+		{
+			name:          "M2.7 with thinking enabled",
+			model:         "MiniMax-M2.7",
+			payload:       `{"model":"test","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high"}`,
+			wantReasoning: true,
+			reasoningGiven: true,
+		},
+		{
+			name:          "M2.7 with thinking disabled",
+			model:         "MiniMax-M2.7",
+			payload:       `{"model":"test","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"none"}`,
+			wantReasoning: false,
+			reasoningGiven: false,
+		},
+		{
+			name:          "M2.7 without reasoning_effort",
+			model:         "MiniMax-M2.7",
+			payload:       `{"model":"test","messages":[{"role":"user","content":"hi"}]}`,
+			wantReasoning: false,
+			reasoningGiven: false,
+		},
+		{
+			name:          "M2.5 without reasoning_effort",
+			model:         "MiniMax-M2.5",
+			payload:       `{"model":"test","messages":[{"role":"user","content":"hi"}]}`,
+			wantReasoning: false,
+			reasoningGiven: false,
+		},
+		{
+			name:          "M2.7 with low thinking",
+			model:         "MiniMax-M2.7",
+			payload:       `{"model":"test","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"low"}`,
+			wantReasoning: true,
+			reasoningGiven: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := e.translateToAnthropic([]byte(tt.payload), tt.model)
+
+			reasoningSplit := gjson.GetBytes(got, "reasoning_split")
+
+			if tt.reasoningGiven {
+				if !reasoningSplit.Exists() {
+					t.Errorf("translateToAnthropic() reasoning_split should exist, got nothing")
+				} else if reasoningSplit.Bool() != tt.wantReasoning {
+					t.Errorf("translateToAnthropic() reasoning_split = %v, want %v", reasoningSplit.Bool(), tt.wantReasoning)
+				}
+			} else {
+				if reasoningSplit.Exists() {
+					t.Errorf("translateToAnthropic() reasoning_split should NOT exist, got %v", reasoningSplit.Bool())
+				}
 			}
 		})
 	}
