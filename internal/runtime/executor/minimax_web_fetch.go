@@ -46,8 +46,11 @@ func isLocalOrPrivateURL(rawURL string) bool {
 		if ip.IsPrivate() || ip.IsUnspecified() {
 			return true
 		}
-		// Link-local
-		if ip.IsLinkLocal() {
+		// Link-local (IPv4: 169.254.0.0/16, IPv6: fe80::/10)
+		if ip4 := ip.To4(); ip4 != nil && ip4[0] == 169 && ip4[1] == 254 {
+			return true
+		}
+		if ip.IsLinkLocalUnicast() {
 			return true
 		}
 		return false

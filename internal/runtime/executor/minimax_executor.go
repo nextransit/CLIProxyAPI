@@ -750,3 +750,14 @@ func FetchURLsInMessages(payload []byte) []byte {
 
 	return payload
 }
+
+// isMiniMaxContextWindowError checks if the response body indicates a MiniMax
+// context window exceeded error (code 2013), which can be recovered by
+// compacting the conversation history.
+func isMiniMaxContextWindowError(body []byte) bool {
+	if !bytes.Contains(body, []byte("2013")) {
+		return false
+	}
+	code := gjson.GetBytes(body, "error.code")
+	return code.Exists() && code.Int() == 2013
+}
