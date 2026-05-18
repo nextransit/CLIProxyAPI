@@ -179,6 +179,56 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		b, _ := helps.LimitedReadAll(httpResp.Body)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
+
+		// Handle 2013 context window exceeded with compact-retry
+		if isContextWindowExceeded(b) && httpResp.StatusCode == 400 {
+			compactLevels := []int{5, 3, 1}
+			currentPayload := translated
+			for retryIdx, maxItems := range compactLevels {
+				compacted := compactMessagesForRetry(currentPayload, maxItems)
+				if bytes.Equal(compacted, currentPayload) {
+					break
+				}
+				helps.LogWithRequestID(ctx).Debugf("openai compat executor: 2013 compact retry %d/%d to %d messages", retryIdx+1, len(compactLevels), maxItems)
+
+				retryReq, rErr := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(compacted))
+				if rErr != nil {
+					break
+				}
+				retryReq.Header.Set("Content-Type", "application/json")
+				if apiKey != "" {
+					retryReq.Header.Set("Authorization", "Bearer "+apiKey)
+				}
+				retryReq.Header.Set("User-Agent", "cli-proxy-openai-compat")
+
+				httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+				retryResp, rErr := httpClient.Do(retryReq)
+				if rErr != nil {
+					break
+				}
+				retryBody, _ := helps.LimitedReadAll(retryResp.Body)
+				retryResp.Body.Close()
+
+				if retryResp.StatusCode >= 200 && retryResp.StatusCode < 300 {
+					helps.LogWithRequestID(ctx).Debugf("openai compat executor: 2013 compact retry %d succeeded", retryIdx+1)
+					// Translate response
+					var param any
+					successBody := retryBody
+					out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, opts.OriginalRequest, compacted, successBody, &param)
+					resp = cliproxyexecutor.Response{Payload: out, Headers: retryResp.Header.Clone()}
+					return resp, nil
+				}
+
+				if isContextWindowExceeded(retryBody) {
+					helps.LogWithRequestID(ctx).Debugf("openai compat executor: 2013 compact retry %d still exceeded, trying harder compaction", retryIdx+1)
+					currentPayload = compacted
+					continue
+				}
+				break
+			}
+			helps.LogWithRequestID(ctx).Debugf("openai compat executor: 2013 compact retries exhausted")
+		}
+
 		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
 		return resp, err
 	}
@@ -297,6 +347,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("openai compat executor: close response body error: %v", errClose)
 		}
+
 		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
 		return nil, err
 	}
@@ -1142,4 +1193,63 @@ func debugLogMessageStructure(payload []byte, model string) {
 			}
 		}
 	}
+}
+
+// isContextWindowExceeded checks if the response body indicates a context
+// window exceeded error (code 2013 or message containing "context window").
+func isContextWindowExceeded(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	// MiniMax native format: {"error":{"code":2013,...}}
+	if code := gjson.GetBytes(body, "error.code"); code.Exists() && code.Int() == 2013 {
+		return true
+	}
+	// One-API / decard.cc format: message contains "context window exceeds limit (2013)"
+	msg := strings.ToLower(gjson.GetBytes(body, "error.message").String())
+	if strings.Contains(msg, "context window") && strings.Contains(msg, "2013") {
+		return true
+	}
+	return false
+}
+
+// compactMessagesForRetry keeps only the last maxItems messages from the
+// payload's messages array to reduce context window usage.
+func compactMessagesForRetry(payload []byte, maxItems int) []byte {
+	messages := gjson.GetBytes(payload, "messages")
+	if !messages.Exists() || !messages.IsArray() {
+		return payload
+	}
+	arr := messages.Array()
+	if len(arr) <= maxItems {
+		return payload
+	}
+	// Keep system message if present, plus the last maxItems items
+	var kept []gjson.Result
+	for _, msg := range arr {
+		role := strings.ToLower(strings.TrimSpace(msg.Get("role").String()))
+		if role == "system" {
+			kept = append(kept, msg)
+		}
+	}
+	start := len(arr) - maxItems
+	if start < 0 {
+		start = 0
+	}
+	kept = append(kept, arr[start:]...)
+
+	var buf bytes.Buffer
+	buf.WriteByte('[')
+	for i, item := range kept {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		buf.WriteString(item.Raw)
+	}
+	buf.WriteByte(']')
+	out, err := sjson.SetRawBytes(payload, "messages", buf.Bytes())
+	if err != nil {
+		return payload
+	}
+	return out
 }
