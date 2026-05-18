@@ -1,7 +1,6 @@
 package helps
 
 import (
-	"context"
 	"testing"
 	"time"
 
@@ -48,85 +47,87 @@ func TestParseOpenAIUsageResponses(t *testing.T) {
 	}
 }
 
-func TestParseOpenAIUsageIgnoresNullUsage(t *testing.T) {
+func TestParseOpenAIUsageWithPresenceReturnsFalseForMissingUsage(t *testing.T) {
+	data := []byte(`{"id":"resp_1","choices":[{"message":{"content":"hi"}}]}`)
+	detail, ok := ParseOpenAIUsageWithPresence(data)
+	if ok {
+		t.Fatalf("expected no usage detail, got %+v", detail)
+	}
+}
+
+func TestParseOpenAIUsageWithPresenceReturnsFalseForNullUsage(t *testing.T) {
 	data := []byte(`{"usage":null}`)
-	detail := ParseOpenAIUsage(data)
-	if detail != (usage.Detail{}) {
-		t.Fatalf("detail = %+v, want zero detail", detail)
+	detail, ok := ParseOpenAIUsageWithPresence(data)
+	if ok {
+		t.Fatalf("expected no usage detail, got %+v", detail)
+	}
+}
+
+func TestParseOpenAIUsageWithPresenceReturnsFalseForEmptyUsageObject(t *testing.T) {
+	data := []byte(`{"usage":{}}`)
+	detail, ok := ParseOpenAIUsageWithPresence(data)
+	if ok {
+		t.Fatalf("expected no usage detail, got %+v", detail)
+	}
+}
+
+func TestParseOpenAIUsageWithPresenceSupportsResponsesStyleFields(t *testing.T) {
+	data := []byte(`{"usage":{"input_tokens":10,"output_tokens":20,"total_tokens":30,"input_tokens_details":{"cached_tokens":7},"output_tokens_details":{"reasoning_tokens":9}}}`)
+	detail, ok := ParseOpenAIUsageWithPresence(data)
+	if !ok {
+		t.Fatalf("expected usage detail")
+	}
+	if detail.InputTokens != 10 {
+		t.Fatalf("input tokens = %d, want %d", detail.InputTokens, 10)
+	}
+	if detail.OutputTokens != 20 {
+		t.Fatalf("output tokens = %d, want %d", detail.OutputTokens, 20)
+	}
+	if detail.TotalTokens != 30 {
+		t.Fatalf("total tokens = %d, want %d", detail.TotalTokens, 30)
+	}
+	if detail.CachedTokens != 7 {
+		t.Fatalf("cached tokens = %d, want %d", detail.CachedTokens, 7)
+	}
+	if detail.ReasoningTokens != 9 {
+		t.Fatalf("reasoning tokens = %d, want %d", detail.ReasoningTokens, 9)
 	}
 }
 
 func TestParseOpenAIStreamUsageIgnoresNullUsage(t *testing.T) {
-	line := []byte(`data: {"id":"chunk_1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}],"usage":null}`)
+	line := []byte(`data: {"id":"x","usage":null}`)
 	if detail, ok := ParseOpenAIStreamUsage(line); ok {
-		t.Fatalf("ParseOpenAIStreamUsage() = (%+v, true), want false for null usage", detail)
+		t.Fatalf("expected no usage detail, got %+v", detail)
 	}
 }
 
-func TestParseOpenAIStreamUsageResponsesFields(t *testing.T) {
-	line := []byte(`data: {"id":"chunk_1","object":"chat.completion.chunk","choices":[],"usage":{"input_tokens":8,"output_tokens":5,"total_tokens":13,"input_tokens_details":{"cached_tokens":3},"output_tokens_details":{"reasoning_tokens":2}}}`)
+func TestParseOpenAIStreamUsageIgnoresEmptyUsageObject(t *testing.T) {
+	line := []byte(`data: {"id":"x","usage":{}}`)
+	if detail, ok := ParseOpenAIStreamUsage(line); ok {
+		t.Fatalf("expected no usage detail, got %+v", detail)
+	}
+}
+
+func TestParseOpenAIStreamUsageSupportsResponsesStyleFields(t *testing.T) {
+	line := []byte(`data: {"id":"x","usage":{"input_tokens":11,"output_tokens":13,"total_tokens":24,"input_tokens_details":{"cached_tokens":2},"output_tokens_details":{"reasoning_tokens":3}}}`)
 	detail, ok := ParseOpenAIStreamUsage(line)
 	if !ok {
-		t.Fatal("ParseOpenAIStreamUsage() ok = false, want true")
+		t.Fatalf("expected usage detail")
 	}
-	if detail.InputTokens != 8 {
-		t.Fatalf("input tokens = %d, want %d", detail.InputTokens, 8)
-	}
-	if detail.OutputTokens != 5 {
-		t.Fatalf("output tokens = %d, want %d", detail.OutputTokens, 5)
-	}
-	if detail.TotalTokens != 13 {
-		t.Fatalf("total tokens = %d, want %d", detail.TotalTokens, 13)
-	}
-	if detail.CachedTokens != 3 {
-		t.Fatalf("cached tokens = %d, want %d", detail.CachedTokens, 3)
-	}
-	if detail.ReasoningTokens != 2 {
-		t.Fatalf("reasoning tokens = %d, want %d", detail.ReasoningTokens, 2)
-	}
-}
-
-func TestParseGeminiCLIUsage_TopLevelUsageMetadata(t *testing.T) {
-	data := []byte(`{"usageMetadata":{"promptTokenCount":11,"candidatesTokenCount":7,"thoughtsTokenCount":3,"totalTokenCount":21,"cachedContentTokenCount":5}}`)
-	detail := ParseGeminiCLIUsage(data)
 	if detail.InputTokens != 11 {
 		t.Fatalf("input tokens = %d, want %d", detail.InputTokens, 11)
 	}
-	if detail.OutputTokens != 7 {
-		t.Fatalf("output tokens = %d, want %d", detail.OutputTokens, 7)
+	if detail.OutputTokens != 13 {
+		t.Fatalf("output tokens = %d, want %d", detail.OutputTokens, 13)
+	}
+	if detail.TotalTokens != 24 {
+		t.Fatalf("total tokens = %d, want %d", detail.TotalTokens, 24)
+	}
+	if detail.CachedTokens != 2 {
+		t.Fatalf("cached tokens = %d, want %d", detail.CachedTokens, 2)
 	}
 	if detail.ReasoningTokens != 3 {
 		t.Fatalf("reasoning tokens = %d, want %d", detail.ReasoningTokens, 3)
-	}
-	if detail.TotalTokens != 21 {
-		t.Fatalf("total tokens = %d, want %d", detail.TotalTokens, 21)
-	}
-	if detail.CachedTokens != 5 {
-		t.Fatalf("cached tokens = %d, want %d", detail.CachedTokens, 5)
-	}
-}
-
-func TestParseGeminiCLIStreamUsage_ResponseSnakeCaseUsageMetadata(t *testing.T) {
-	line := []byte(`data: {"response":{"usage_metadata":{"promptTokenCount":13,"candidatesTokenCount":2,"totalTokenCount":15}}}`)
-	detail, ok := ParseGeminiCLIStreamUsage(line)
-	if !ok {
-		t.Fatal("ParseGeminiCLIStreamUsage() ok = false, want true")
-	}
-	if detail.InputTokens != 13 {
-		t.Fatalf("input tokens = %d, want %d", detail.InputTokens, 13)
-	}
-	if detail.OutputTokens != 2 {
-		t.Fatalf("output tokens = %d, want %d", detail.OutputTokens, 2)
-	}
-	if detail.TotalTokens != 15 {
-		t.Fatalf("total tokens = %d, want %d", detail.TotalTokens, 15)
-	}
-}
-
-func TestParseGeminiCLIStreamUsage_IgnoresTrafficTypeOnlyUsageMetadata(t *testing.T) {
-	line := []byte(`data: {"response":{"usageMetadata":{"trafficType":"ON_DEMAND"}}}`)
-	if detail, ok := ParseGeminiCLIStreamUsage(line); ok {
-		t.Fatalf("ParseGeminiCLIStreamUsage() = (%+v, true), want false for traffic-only usage metadata", detail)
 	}
 }
 
@@ -146,33 +147,50 @@ func TestUsageReporterBuildRecordIncludesLatency(t *testing.T) {
 	}
 }
 
-func TestUsageReporterBuildRecordIncludesRequestedModelAlias(t *testing.T) {
-	ctx := usage.WithRequestedModelAlias(context.Background(), "client-gpt")
-	reporter := NewUsageReporter(ctx, "openai", "gpt-5.4", nil)
+func TestUsageReporterSetThinkingFromPayload_OpenAIReasoningEffort(t *testing.T) {
+	reporter := &UsageReporter{}
+	reporter.SetThinkingFromPayload([]byte(`{"reasoning_effort":"high"}`))
 
-	record := reporter.buildRecord(usage.Detail{TotalTokens: 3}, false)
-	if record.Model != "gpt-5.4" {
-		t.Fatalf("model = %q, want %q", record.Model, "gpt-5.4")
+	record := reporter.buildRecord(usage.Detail{}, false)
+	if record.Detail.Thinking == nil {
+		t.Fatal("thinking should not be nil")
 	}
-	if record.Alias != "client-gpt" {
-		t.Fatalf("alias = %q, want %q", record.Alias, "client-gpt")
+	if got := record.Detail.Thinking.Intensity; got != "high" {
+		t.Fatalf("intensity = %q, want %q", got, "high")
+	}
+	if got := record.Detail.Thinking.Mode; got != "level" {
+		t.Fatalf("mode = %q, want %q", got, "level")
+	}
+	if got := record.Detail.Thinking.Level; got != "high" {
+		t.Fatalf("level = %q, want %q", got, "high")
 	}
 }
 
-func TestUsageReporterBuildAdditionalModelRecordSkipsZeroTokens(t *testing.T) {
-	reporter := &UsageReporter{
-		provider:    "codex",
-		model:       "gpt-5.4",
-		requestedAt: time.Now(),
-	}
+func TestUsageReporterSetThinkingFromPayload_GeminiBudget(t *testing.T) {
+	reporter := &UsageReporter{}
+	reporter.SetThinkingFromPayload([]byte(`{"generationConfig":{"thinkingConfig":{"thinkingBudget":8192}}}`))
 
-	if _, ok := reporter.buildAdditionalModelRecord("gpt-image-2", usage.Detail{}); ok {
-		t.Fatalf("expected all-zero token usage to be skipped")
+	record := reporter.buildRecord(usage.Detail{}, false)
+	if record.Detail.Thinking == nil {
+		t.Fatal("thinking should not be nil")
 	}
-	if _, ok := reporter.buildAdditionalModelRecord("gpt-image-2", usage.Detail{InputTokens: 2}); !ok {
-		t.Fatalf("expected non-zero input token usage to be recorded")
+	if got := record.Detail.Thinking.Mode; got != "budget" {
+		t.Fatalf("mode = %q, want %q", got, "budget")
 	}
-	if _, ok := reporter.buildAdditionalModelRecord("gpt-image-2", usage.Detail{CachedTokens: 2}); !ok {
-		t.Fatalf("expected non-zero cached token usage to be recorded")
+	if record.Detail.Thinking.Budget == nil || *record.Detail.Thinking.Budget != 8192 {
+		t.Fatalf("budget = %v, want 8192", record.Detail.Thinking.Budget)
+	}
+}
+
+func TestUsageReporterSetThinkingFromPayload_ClaudeAdaptive(t *testing.T) {
+	reporter := &UsageReporter{}
+	reporter.SetThinkingFromPayload([]byte(`{"thinking":{"type":"adaptive"},"output_config":{"effort":"max"}}`))
+
+	record := reporter.buildRecord(usage.Detail{}, false)
+	if record.Detail.Thinking == nil {
+		t.Fatal("thinking should not be nil")
+	}
+	if got := record.Detail.Thinking.Level; got != "max" {
+		t.Fatalf("level = %q, want %q", got, "max")
 	}
 }
