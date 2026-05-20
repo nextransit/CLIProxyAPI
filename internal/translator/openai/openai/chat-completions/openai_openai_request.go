@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"strings"
 
+	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
-	log "github.com/sirupsen/logrus"
 )
 
 // ConvertOpenAIRequestToOpenAI passes through an OpenAI Chat Completions request,
