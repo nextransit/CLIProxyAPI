@@ -19,11 +19,11 @@ func TestGetLogFiles_SearchFiltersByFilename(t *testing.T) {
 
 	logDir := t.TempDir()
 	files := map[string]string{
-		"main.log":                     "current log",
-		"main.log.1":                   "rotated log",
-		"error-v1-chat-2026-test.log":  "request error log",
-		"v1-chat-2026-plain.log":       "request log",
-		"ignore-me.tmp":                "tmp",
+		"main.log":                    "current log",
+		"main.log.1":                  "rotated log",
+		"error-v1-chat-2026-test.log": "request error log",
+		"v1-chat-2026-plain.log":      "request log",
+		"ignore-me.tmp":               "tmp",
 	}
 	for name, content := range files {
 		if err := os.WriteFile(filepath.Join(logDir, name), []byte(content), 0o600); err != nil {
