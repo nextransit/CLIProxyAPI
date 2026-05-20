@@ -175,7 +175,7 @@ func (e *MiniMaxExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, 
 	if countConsecutiveToolCallsFromPayload(anthropicPayload) > maxConsecutiveToolCalls {
 		return resp, statusErr{
 			code: http.StatusUnprocessableEntity,
-			msg:  "tool call loop detected: exceeded 20 consecutive tool calls. " +
+			msg: "tool call loop detected: exceeded 20 consecutive tool calls. " +
 				"Consider breaking your task into smaller steps.",
 		}
 	}

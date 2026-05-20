@@ -30,7 +30,6 @@ func TestIsMiniMaxContextWindowError(t *testing.T) {
 		},
 		{"empty body", "", false},
 		{"unrelated error", `{"error":{"message":"bad request"}}`, false},
-
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

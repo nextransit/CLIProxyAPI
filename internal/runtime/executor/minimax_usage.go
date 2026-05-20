@@ -14,10 +14,10 @@ import (
 
 // MiniMaxUsageResponse represents the response from MiniMax usage API
 type MiniMaxUsageResponse struct {
-	BaseResp     *MiniMaxBaseResp       `json:"base_resp,omitempty"`
-	StatusCode   int                   `json:"status_code,omitempty"`
-	StatusMsg    string                `json:"status_msg,omitempty"`
-	ModelRemains []MiniMaxModelRemain  `json:"model_remains,omitempty"`
+	BaseResp     *MiniMaxBaseResp     `json:"base_resp,omitempty"`
+	StatusCode   int                  `json:"status_code,omitempty"`
+	StatusMsg    string               `json:"status_msg,omitempty"`
+	ModelRemains []MiniMaxModelRemain `json:"model_remains,omitempty"`
 }
 
 // MiniMaxBaseResp represents the base response structure
@@ -28,15 +28,15 @@ type MiniMaxBaseResp struct {
 
 // MiniMaxModelRemain represents usage information for a single model
 type MiniMaxModelRemain struct {
-	StartTime                  int64  `json:"start_time,omitempty"`
-	EndTime                    int64  `json:"end_time,omitempty"`
-	RemainsTime                int64  `json:"remains_time,omitempty"`
-	CurrentIntervalTotalCount  int64  `json:"current_interval_total_count,omitempty"`
-	CurrentIntervalUsageCount  int64  `json:"current_interval_usage_count,omitempty"`
-	ModelName                  string `json:"model_name,omitempty"`
-	CurrentWeeklyTotalCount    int64  `json:"current_weekly_total_count,omitempty"`
-	CurrentWeeklyUsageCount    int64  `json:"current_weekly_usage_count,omitempty"`
-	WeeklyRemainsTime          int64  `json:"weekly_remains_time,omitempty"`
+	StartTime                 int64  `json:"start_time,omitempty"`
+	EndTime                   int64  `json:"end_time,omitempty"`
+	RemainsTime               int64  `json:"remains_time,omitempty"`
+	CurrentIntervalTotalCount int64  `json:"current_interval_total_count,omitempty"`
+	CurrentIntervalUsageCount int64  `json:"current_interval_usage_count,omitempty"`
+	ModelName                 string `json:"model_name,omitempty"`
+	CurrentWeeklyTotalCount   int64  `json:"current_weekly_total_count,omitempty"`
+	CurrentWeeklyUsageCount   int64  `json:"current_weekly_usage_count,omitempty"`
+	WeeklyRemainsTime         int64  `json:"weekly_remains_time,omitempty"`
 }
 
 const (

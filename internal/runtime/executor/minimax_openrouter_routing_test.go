@@ -72,10 +72,10 @@ func TestContainsWebSearchTool(t *testing.T) {
 
 func TestRouteWebSearchToOpenRouter(t *testing.T) {
 	tests := []struct {
-		name          string
-		payload       string
-		expectRouted  bool
-		expectTools   int // expected number of tools after routing
+		name         string
+		payload      string
+		expectRouted bool
+		expectTools  int // expected number of tools after routing
 	}{
 		{
 			name:         "removes web_search tool",
