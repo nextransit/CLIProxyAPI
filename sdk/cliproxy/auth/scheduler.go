@@ -51,6 +51,7 @@ type scheduledAuthMeta struct {
 	auth              *Auth
 	providerKey       string
 	priority          int
+	weight            int
 	virtualParent     string
 	websocketEnabled  bool
 	supportedModelSet map[string]struct{}
@@ -130,8 +131,8 @@ func restoreReadyViewCursors(view *readyView, state readyViewCursorState) {
 	if view == nil {
 		return
 	}
-	if len(view.flat) > 0 {
-		view.cursor = normalizeCursor(state.cursor, len(view.flat))
+	if limit := view.cursorLimit(); limit > 0 {
+		view.cursor = normalizeCursor(state.cursor, limit)
 	}
 	if len(view.parentOrder) == 0 || len(view.children) == 0 {
 		return
@@ -379,7 +380,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 	for providerIndex, shard := range candidateShards {
 		segmentStarts[providerIndex] = totalWeight
 		if shard != nil {
-			weights[providerIndex] = shard.readyCountAtPriorityLocked(false, bestPriority)
+			weights[providerIndex] = shard.readyWeightAtPriorityLocked(false, bestPriority)
 		}
 		totalWeight += weights[providerIndex]
 		segmentEnds[providerIndex] = totalWeight
@@ -566,6 +567,7 @@ func buildScheduledAuthMeta(auth *Auth) *scheduledAuthMeta {
 		auth:              auth,
 		providerKey:       providerKey,
 		priority:          authPriority(auth),
+		weight:            authWeight(auth),
 		virtualParent:     virtualParent,
 		websocketEnabled:  authWebsocketsEnabled(auth),
 		supportedModelSet: supportedModelSetForAuth(auth.ID),
@@ -826,7 +828,7 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 	return picked.auth
 }
 
-func (m *modelScheduler) readyCountAtPriorityLocked(preferWebsocket bool, priority int) int {
+func (m *modelScheduler) readyWeightAtPriorityLocked(preferWebsocket bool, priority int) int {
 	if m == nil {
 		return 0
 	}
@@ -835,9 +837,9 @@ func (m *modelScheduler) readyCountAtPriorityLocked(preferWebsocket bool, priori
 		return 0
 	}
 	if preferWebsocket && len(bucket.ws.flat) > 0 {
-		return len(bucket.ws.flat)
+		return bucket.ws.readyWeight(nil)
 	}
-	return len(bucket.all.flat)
+	return bucket.all.readyWeight(nil)
 }
 
 // unavailableErrorLocked returns the correct unavailable or cooldown error for the shard.
@@ -1011,6 +1013,10 @@ func (v *readyView) pickRoundRobin(predicate func(*scheduledAuth) bool) *schedul
 	if len(v.flat) == 0 {
 		return nil
 	}
+	totalWeight := v.readyWeight(predicate)
+	if totalWeight > 0 && v.hasCustomWeight(predicate) {
+		return v.pickWeightedRoundRobin(totalWeight, predicate)
+	}
 	start := 0
 	if len(v.flat) > 0 {
 		start = v.cursor % len(v.flat)
@@ -1023,6 +1029,75 @@ func (v *readyView) pickRoundRobin(predicate func(*scheduledAuth) bool) *schedul
 		}
 		v.cursor = index + 1
 		return entry
+	}
+	return nil
+}
+
+func scheduledAuthWeight(entry *scheduledAuth) int {
+	if entry == nil || entry.meta == nil || entry.meta.weight <= 0 {
+		return 1
+	}
+	return entry.meta.weight
+}
+
+func (v *readyView) readyWeight(predicate func(*scheduledAuth) bool) int {
+	total := 0
+	for _, entry := range v.flat {
+		if predicate != nil && !predicate(entry) {
+			continue
+		}
+		total += scheduledAuthWeight(entry)
+	}
+	return total
+}
+
+func (v *readyView) hasCustomWeight(predicate func(*scheduledAuth) bool) bool {
+	for _, entry := range v.flat {
+		if predicate != nil && !predicate(entry) {
+			continue
+		}
+		if scheduledAuthWeight(entry) != 1 {
+			return true
+		}
+	}
+	return false
+}
+
+func (v *readyView) cursorLimit() int {
+	if len(v.flat) == 0 {
+		return 0
+	}
+	if len(v.parentOrder) > 1 && len(v.children) > 0 {
+		return len(v.flat)
+	}
+	totalWeight := v.readyWeight(nil)
+	if totalWeight > 0 && v.hasCustomWeight(nil) {
+		return totalWeight
+	}
+	return len(v.flat)
+}
+
+func (v *readyView) pickWeightedRoundRobin(totalWeight int, predicate func(*scheduledAuth) bool) *scheduledAuth {
+	if totalWeight <= 0 {
+		return nil
+	}
+	start := v.cursor % totalWeight
+	if start < 0 {
+		start += totalWeight
+	}
+	for offset := 0; offset < totalWeight; offset++ {
+		target := (start + offset) % totalWeight
+		cumulative := 0
+		for _, entry := range v.flat {
+			if predicate != nil && !predicate(entry) {
+				continue
+			}
+			cumulative += scheduledAuthWeight(entry)
+			if target < cumulative {
+				v.cursor = target + 1
+				return entry
+			}
+		}
 	}
 	return nil
 }

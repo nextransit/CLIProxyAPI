@@ -927,7 +927,7 @@ func authWeight(auth *Auth) int {
 		return 1
 	}
 	parsed, err := strconv.Atoi(raw)
-	if err != nil || parsed < 0 {
+	if err != nil || parsed <= 0 {
 		return 1
 	}
 	return parsed
