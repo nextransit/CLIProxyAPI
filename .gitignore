@@ -53,5 +53,7 @@ _bmad-output/*
 ._*
 tmp.txt
 .external/
+.antigravitycli/
+.sisyphus/
 Cli-Proxy-API-Management-Center/
 tmp/
