@@ -147,6 +147,15 @@ case "$choice" in
   2)
     echo "--- Building from Source and Running ---"
 
+    # Backup config.yaml before build
+    if [[ -f "config.yaml" ]]; then
+      BACKUP_DIR="${STATS_DIR}/config_backups"
+      mkdir -p "${BACKUP_DIR}"
+      BACKUP_FILE="${BACKUP_DIR}/config.yaml.$(date +%Y%m%d_%H%M%S)"
+      cp config.yaml "${BACKUP_FILE}"
+      echo "Config backed up to: ${BACKUP_FILE}"
+    fi
+
     # Get Version Information
     VERSION="$(git describe --tags --always --dirty)"
     COMMIT="$(git rev-parse --short HEAD)"
