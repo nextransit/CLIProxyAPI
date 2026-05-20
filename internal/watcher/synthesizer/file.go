@@ -133,13 +133,13 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 	perAccountExcluded := extractExcludedModelsFromMetadata(metadata)
 
 	a := &coreauth.Auth{
-		ID:       id,
-		Provider: provider,
-		Label:    label,
-		Prefix:   prefix,
-		Status:   status,
+		ID:            id,
+		Provider:      provider,
+		Label:         label,
+		Prefix:        prefix,
+		Status:        status,
 		StatusMessage: statusMessage,
-		Disabled: disabled,
+		Disabled:      disabled,
 		Attributes: map[string]string{
 			"source": fullPath,
 			"path":   fullPath,
