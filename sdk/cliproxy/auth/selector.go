@@ -322,14 +322,45 @@ func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, o
 	}
 
 	// Flat round-robin for non-grouped auths (original behavior).
+	// Check if any auth has weight != 1 for weighted round-robin
+	totalWeight := 0
+	hasWeight := false
+	for _, auth := range available {
+		w := authWeight(auth)
+		if w != 1 {
+			hasWeight = true
+		}
+		totalWeight += w
+	}
+
 	s.ensureCursorKey(key, limit)
 	index := s.cursors[key]
 	if index >= 2_147_483_640 {
 		index = 0
 	}
 	s.cursors[key] = index + 1
+
+	var selected *Auth
+	if hasWeight {
+		// Weighted round-robin: use cursor as offset into weighted selection
+		target := index % totalWeight
+		cumulative := 0
+		for i := range available {
+			cumulative += authWeight(available[i])
+			if target < cumulative {
+				selected = available[i]
+				break
+			}
+		}
+		if selected == nil {
+			selected = available[0]
+		}
+	} else {
+		selected = available[index%len(available)]
+	}
+
 	s.mu.Unlock()
-	return available[index%len(available)], nil
+	return selected, nil
 }
 
 // ensureCursorKey ensures the cursor map has capacity for the given key.
@@ -883,4 +914,21 @@ func extractResponsesAPIContent(content gjson.Result) string {
 // Deprecated: Use ExtractSessionID instead.
 func extractSessionID(payload []byte) string {
 	return ExtractSessionID(nil, payload, nil)
+}
+
+// authWeight returns the weight attribute from auth for weighted round-robin.
+// Higher values increase selection frequency. Defaults to 1.
+func authWeight(auth *Auth) int {
+	if auth == nil || auth.Attributes == nil {
+		return 1
+	}
+	raw := strings.TrimSpace(auth.Attributes["weight"])
+	if raw == "" {
+		return 1
+	}
+	parsed, err := strconv.Atoi(raw)
+	if err != nil || parsed < 0 {
+		return 1
+	}
+	return parsed
 }

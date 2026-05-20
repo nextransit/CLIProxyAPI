@@ -485,3 +485,25 @@ func (c *Client) DeleteField(path string) error {
 	_, _, err := c.doRequest("DELETE", "/v0/management/"+path, nil)
 	return err
 }
+
+// PatchOpenAICompatKey patches a single API key entry within an OpenAI compatibility provider.
+func (c *Client) PatchOpenAICompatKey(providerName string, keyIndex int, apiKey, proxyURL string, weight int) error {
+	path := fmt.Sprintf("/v0/management/openai-compatibility/key?provider_name=%s&key_index=%d",
+		url.QueryEscape(providerName), keyIndex)
+
+	body := map[string]any{
+		"value": map[string]any{
+			"api-key":   apiKey,
+			"proxy-url": proxyURL,
+			"weight":    weight,
+		},
+	}
+
+	jsonBody, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+
+	_, err = c.patch(path, strings.NewReader(string(jsonBody)))
+	return err
+}

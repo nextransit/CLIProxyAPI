@@ -34,6 +34,14 @@ type keysTabModel struct {
 	adding    bool
 	editIdx   int
 	editInput textinput.Model
+
+	// OpenAI Compat editing
+	editingCompat  bool
+	compatIdx      int             // index of the provider being edited
+	keyEditingIdx  int             // index of the key being edited (-1 = new key)
+	keyEditInput   textinput.Model // for API key
+	keyWeightInput textinput.Model // for weight
+	keyProxyInput  textinput.Model // for proxy URL
 }
 
 type keysDataMsg struct {
@@ -116,6 +124,11 @@ func (m keysTabModel) Update(msg tea.Msg) (keysTabModel, tea.Cmd) {
 		return m, m.fetchKeys
 
 	case tea.KeyMsg:
+		// ---- OpenAI Compat editing mode ----
+		if m.editingCompat {
+			return m.handleCompatEditInput(msg)
+		}
+
 		// ---- Editing / Adding mode ----
 		if m.editing || m.adding {
 			switch msg.String() {
@@ -181,67 +194,52 @@ func (m keysTabModel) Update(msg tea.Msg) (keysTabModel, tea.Cmd) {
 				m.viewport.SetContent(m.renderContent())
 				return m, nil
 			}
-			return m, nil
 		}
 
 		// ---- Normal mode ----
 		switch msg.String() {
+		case "r":
+			m.status = ""
+			return m, m.fetchKeys
+		case "a", "A":
+			m.adding = true
+			m.editInput.SetValue("")
+			m.editInput.Focus()
+			m.viewport.SetContent(m.renderContent())
+			return m, textinput.Blink
+		case "e", "E":
+			if m.cursor < len(m.keys) {
+				m.editing = true
+				m.editIdx = m.cursor
+				m.editInput.SetValue(m.keys[m.cursor])
+				m.editInput.Focus()
+				m.viewport.SetContent(m.renderContent())
+				return m, textinput.Blink
+			}
+		case "d", "D":
+			if m.cursor < len(m.keys) {
+				m.confirm = m.cursor
+				m.viewport.SetContent(m.renderContent())
+			}
+		case "c", "C":
+			if m.cursor < len(m.keys) {
+				if err := clipboard.WriteAll(m.keys[m.cursor]); err == nil {
+					m.status = successStyle.Render(T("copied"))
+				} else {
+					m.status = errorStyle.Render(T("copy_failed"))
+				}
+				m.viewport.SetContent(m.renderContent())
+			}
 		case "j", "down":
 			if len(m.keys) > 0 {
 				m.cursor = (m.cursor + 1) % len(m.keys)
 				m.viewport.SetContent(m.renderContent())
 			}
-			return m, nil
 		case "k", "up":
 			if len(m.keys) > 0 {
 				m.cursor = (m.cursor - 1 + len(m.keys)) % len(m.keys)
 				m.viewport.SetContent(m.renderContent())
 			}
-			return m, nil
-		case "a":
-			// Add new key
-			m.adding = true
-			m.editing = false
-			m.editInput.SetValue("")
-			m.editInput.Prompt = T("new_key_prompt")
-			m.editInput.Focus()
-			m.viewport.SetContent(m.renderContent())
-			return m, textinput.Blink
-		case "e":
-			// Edit selected key
-			if m.cursor < len(m.keys) {
-				m.editing = true
-				m.adding = false
-				m.editIdx = m.cursor
-				m.editInput.SetValue(m.keys[m.cursor])
-				m.editInput.Prompt = T("edit_key_prompt")
-				m.editInput.Focus()
-				m.viewport.SetContent(m.renderContent())
-				return m, textinput.Blink
-			}
-			return m, nil
-		case "d":
-			// Delete selected key
-			if m.cursor < len(m.keys) {
-				m.confirm = m.cursor
-				m.viewport.SetContent(m.renderContent())
-			}
-			return m, nil
-		case "c":
-			// Copy selected key to clipboard
-			if m.cursor < len(m.keys) {
-				key := m.keys[m.cursor]
-				if err := clipboard.WriteAll(key); err != nil {
-					m.status = errorStyle.Render(T("copy_failed") + ": " + err.Error())
-				} else {
-					m.status = successStyle.Render(T("copied"))
-				}
-				m.viewport.SetContent(m.renderContent())
-			}
-			return m, nil
-		case "r":
-			m.status = ""
-			return m, m.fetchKeys
 		default:
 			var cmd tea.Cmd
 			m.viewport, cmd = m.viewport.Update(msg)
@@ -252,6 +250,123 @@ func (m keysTabModel) Update(msg tea.Msg) (keysTabModel, tea.Cmd) {
 	var cmd tea.Cmd
 	m.viewport, cmd = m.viewport.Update(msg)
 	return m, cmd
+}
+
+// handleCompatEditInput handles keyboard input when editing OpenAI compat provider keys
+func (m keysTabModel) handleCompatEditInput(msg tea.KeyMsg) (keysTabModel, tea.Cmd) {
+	// Tab through fields: key -> proxy -> weight -> enter to save
+	switch msg.String() {
+	case "tab":
+		// Move focus between fields
+		if m.keyEditInput.Focused() {
+			m.keyEditInput.Blur()
+			m.keyProxyInput.Focus()
+		} else if m.keyProxyInput.Focused() {
+			m.keyProxyInput.Blur()
+			m.keyWeightInput.Focus()
+		} else if m.keyWeightInput.Focused() {
+			m.keyWeightInput.Blur()
+			m.keyEditInput.Focus()
+		}
+		m.viewport.SetContent(m.renderContent())
+		return m, nil
+	case "enter":
+		// Save and move to next key or exit
+		return m.saveCompatKeyEdit()
+	case "n", "N":
+		// Add new key to this provider
+		m.keyEditingIdx = len(getAPIKeyEntries(m.openai, m.compatIdx))
+		m.initCompatKeyInputs("")
+		return m, nil
+	case "esc":
+		m.editingCompat = false
+		m.keyEditingIdx = -1
+		m.keyEditInput.Blur()
+		m.keyProxyInput.Blur()
+		m.keyWeightInput.Blur()
+		m.viewport.SetContent(m.renderContent())
+		return m, nil
+	default:
+		// Update active input field
+		var cmd tea.Cmd
+		if m.keyEditInput.Focused() {
+			m.keyEditInput, cmd = m.keyEditInput.Update(msg)
+		} else if m.keyProxyInput.Focused() {
+			m.keyProxyInput, cmd = m.keyProxyInput.Update(msg)
+		} else if m.keyWeightInput.Focused() {
+			m.keyWeightInput, cmd = m.keyWeightInput.Update(msg)
+		}
+		m.viewport.SetContent(m.renderContent())
+		return m, cmd
+	}
+}
+
+func (m keysTabModel) initCompatKeyInputs(apiKey string) {
+	apiKeyInput := textinput.New()
+	apiKeyInput.CharLimit = 256
+	apiKeyInput.Prompt = "    API Key: "
+	apiKeyInput.Width = m.width - 20
+	apiKeyInput.SetValue(apiKey)
+	apiKeyInput.Focus()
+
+	proxyInput := textinput.New()
+	proxyInput.CharLimit = 256
+	proxyInput.Prompt = "    Proxy:  "
+	proxyInput.Width = m.width - 20
+
+	weightInput := textinput.New()
+	weightInput.CharLimit = 10
+	weightInput.Prompt = "    Weight: "
+	weightInput.Width = 10
+
+	m.keyEditInput = apiKeyInput
+	m.keyProxyInput = proxyInput
+	m.keyWeightInput = weightInput
+}
+
+func (m keysTabModel) saveCompatKeyEdit() (keysTabModel, tea.Cmd) {
+	providerName := getString(m.openai[m.compatIdx], "name")
+	apiKey := strings.TrimSpace(m.keyEditInput.Value())
+	proxyURL := strings.TrimSpace(m.keyProxyInput.Value())
+	weight := 1
+
+	if weightStr := strings.TrimSpace(m.keyWeightInput.Value()); weightStr != "" {
+		var w int
+		if _, err := fmt.Sscanf(weightStr, "%d", &w); err == nil && w >= 0 {
+			weight = w
+		}
+	}
+
+	// If no API key entered, just exit
+	if apiKey == "" && m.keyEditingIdx >= len(getAPIKeyEntries(m.openai, m.compatIdx)) {
+		m.editingCompat = false
+		m.keyEditingIdx = -1
+		m.viewport.SetContent(m.renderContent())
+		return m, nil
+	}
+
+	keyIdx := m.keyEditingIdx
+	m.keyEditInput.Blur()
+	m.keyProxyInput.Blur()
+	m.keyWeightInput.Blur()
+
+	return m, func() tea.Msg {
+		err := m.client.PatchOpenAICompatKey(providerName, keyIdx, apiKey, proxyURL, weight)
+		if err != nil {
+			return keyActionMsg{err: err}
+		}
+		return keyActionMsg{action: T("key_updated")}
+	}
+}
+
+func getAPIKeyEntries(openai []map[string]any, idx int) []any {
+	if idx < 0 || idx >= len(openai) {
+		return nil
+	}
+	if entries, ok := openai[idx]["api-key-entries"].([]any); ok {
+		return entries
+	}
+	return nil
 }
 
 func (m *keysTabModel) SetSize(w, h int) {
@@ -344,20 +459,94 @@ func (m keysTabModel) renderContent() string {
 	renderProviderKeys(&sb, "Codex API Keys", m.codex)
 	renderProviderKeys(&sb, "Vertex API Keys", m.vertex)
 
+	// ━━━ OpenAI Compatibility (editable) ━━━
 	if len(m.openai) > 0 {
 		renderSection(&sb, "OpenAI Compatibility", len(m.openai))
 		for i, entry := range m.openai {
 			name := getString(entry, "name")
 			baseURL := getString(entry, "base-url")
 			prefix := getString(entry, "prefix")
+			disabled := getBool(entry, "disabled")
+
 			info := name
 			if prefix != "" {
 				info += " (prefix: " + prefix + ")"
+			}
+			if disabled {
+				info += " [DISABLED]"
+			}
+			if baseURL != "" && len(baseURL) > 50 {
+				baseURL = baseURL[:47] + "..."
 			}
 			if baseURL != "" {
 				info += " → " + baseURL
 			}
 			sb.WriteString(fmt.Sprintf("  %d. %s\n", i+1, info))
+
+			// Show API key entries for this provider
+			entries := getAPIKeyEntries(m.openai, i)
+			if entries != nil && len(entries) > 0 {
+				for j, e := range entries {
+					entryMap, ok := e.(map[string]any)
+					if !ok {
+						continue
+					}
+					apiKey := getString(entryMap, "api-key")
+					proxyURL := getString(entryMap, "proxy-url")
+					weight := 1
+					if w, ok := entryMap["weight"].(float64); ok {
+						weight = int(w)
+					}
+
+					keyDisplay := maskKey(apiKey)
+					if len(keyDisplay) > 60 {
+						keyDisplay = keyDisplay[:57] + "..."
+					}
+					weightStr := ""
+					if weight != 1 {
+						weightStr = fmt.Sprintf(" [w:%d]", weight)
+					}
+					sb.WriteString(fmt.Sprintf("     %d. %s%s\n", j+1, keyDisplay, weightStr))
+					if proxyURL != "" {
+						proxyDisplay := proxyURL
+						if len(proxyDisplay) > 40 {
+							proxyDisplay = proxyDisplay[:37] + "..."
+						}
+						sb.WriteString(fmt.Sprintf("        proxy: %s\n", proxyDisplay))
+					}
+
+					// Show key edit fields
+					if m.editingCompat && m.compatIdx == i && m.keyEditingIdx == j {
+						sb.WriteString(m.keyEditInput.View())
+						sb.WriteString("\n")
+						sb.WriteString(m.keyProxyInput.View())
+						sb.WriteString("\n")
+						sb.WriteString(m.keyWeightInput.View())
+						sb.WriteString("\n")
+						sb.WriteString(helpStyle.Render("  Tab: next field | Enter: save | Esc: cancel"))
+						sb.WriteString("\n")
+					}
+				}
+			}
+
+			// Add new key fields
+			if m.editingCompat && m.compatIdx == i && m.keyEditingIdx == len(entries) {
+				sb.WriteString(helpStyle.Render("  + New key:"))
+				sb.WriteString("\n")
+				sb.WriteString(m.keyEditInput.View())
+				sb.WriteString("\n")
+				sb.WriteString(m.keyProxyInput.View())
+				sb.WriteString("\n")
+				sb.WriteString(m.keyWeightInput.View())
+				sb.WriteString("\n")
+				sb.WriteString(helpStyle.Render("  Tab: next field | Enter: save | Esc: cancel | N: next key"))
+				sb.WriteString("\n")
+			}
+
+			// Show add new key option
+			if !m.editingCompat || m.compatIdx != i {
+				sb.WriteString(fmt.Sprintf("     [%s]\n", helpStyle.Render("[e] edit keys")))
+			}
 		}
 		sb.WriteString("\n")
 	}

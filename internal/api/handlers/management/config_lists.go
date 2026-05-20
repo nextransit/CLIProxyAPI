@@ -3,6 +3,7 @@ package management
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -1714,4 +1715,95 @@ func normalizeAPIKeysList(keys []string) []string {
 		return nil
 	}
 	return out
+}
+
+// PatchOpenAICompatKey patches a single API key entry within an OpenAI compatibility provider.
+// URL params: provider_name (required), key_index (required)
+func (h *Handler) PatchOpenAICompatKey(c *gin.Context) {
+	providerName := strings.TrimSpace(c.Query("provider_name"))
+	keyIndexStr := strings.TrimSpace(c.Query("key_index"))
+
+	if providerName == "" {
+		c.JSON(400, gin.H{"error": "provider_name is required"})
+		return
+	}
+
+	keyIndex := -1
+	if keyIndexStr != "" {
+		var errParse error
+		keyIndex, errParse = strconv.Atoi(keyIndexStr)
+		if errParse != nil || keyIndex < 0 {
+			c.JSON(400, gin.H{"error": "invalid key_index"})
+			return
+		}
+	}
+
+	type keyPatch struct {
+		APIKey   *string `json:"api-key,omitempty"`
+		ProxyURL *string `json:"proxy-url,omitempty"`
+		Weight   *int    `json:"weight,omitempty"`
+	}
+
+	var body struct {
+		Value keyPatch `json:"value"`
+	}
+
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(400, gin.H{"error": "invalid body"})
+		return
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	// Find the provider
+	targetIndex := -1
+	for i := range h.cfg.OpenAICompatibility {
+		if strings.EqualFold(h.cfg.OpenAICompatibility[i].Name, providerName) {
+			targetIndex = i
+			break
+		}
+	}
+
+	if targetIndex == -1 {
+		c.JSON(404, gin.H{"error": "provider not found"})
+		return
+	}
+
+	entry := &h.cfg.OpenAICompatibility[targetIndex]
+
+	// Ensure APIKeyEntries slice exists
+	if len(entry.APIKeyEntries) == 0 {
+		c.JSON(400, gin.H{"error": "no api-key-entries in provider"})
+		return
+	}
+
+	// If key_index is -1, append a new key
+	if keyIndex == -1 {
+		keyIndex = len(entry.APIKeyEntries)
+		entry.APIKeyEntries = append(entry.APIKeyEntries, config.OpenAICompatibilityAPIKey{})
+	}
+
+	if keyIndex < 0 || keyIndex >= len(entry.APIKeyEntries) {
+		c.JSON(400, gin.H{"error": "key_index out of range"})
+		return
+	}
+
+	// Apply patch
+	if body.Value.APIKey != nil {
+		entry.APIKeyEntries[keyIndex].APIKey = strings.TrimSpace(*body.Value.APIKey)
+	}
+	if body.Value.ProxyURL != nil {
+		entry.APIKeyEntries[keyIndex].ProxyURL = strings.TrimSpace(*body.Value.ProxyURL)
+	}
+	if body.Value.Weight != nil {
+		w := *body.Value.Weight
+		if w < 0 {
+			w = 0
+		}
+		entry.APIKeyEntries[keyIndex].Weight = w
+	}
+
+	h.cfg.SanitizeOpenAICompatibility()
+	h.persistLocked(c)
 }

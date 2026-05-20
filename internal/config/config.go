@@ -488,6 +488,11 @@ type GeminiKey struct {
 	// ProxyURL optionally overrides the global proxy for this API key.
 	ProxyURL string `yaml:"proxy-url,omitempty" json:"proxy-url,omitempty"`
 
+	// Weight controls the selection probability in weighted round-robin.
+	// Higher values increase selection frequency. Defaults to 1.
+	// For example, weight 1:3 means key A is selected 1 time for every 3 times key B is selected.
+	Weight int `yaml:"weight,omitempty" json:"weight,omitempty"`
+
 	// Models defines upstream model names and aliases for request routing.
 	Models []GeminiModel `yaml:"models,omitempty" json:"models,omitempty"`
 
@@ -556,6 +561,11 @@ type OpenAICompatibilityAPIKey struct {
 
 	// ProxyURL overrides the global proxy setting for this API key if provided.
 	ProxyURL string `yaml:"proxy-url,omitempty" json:"proxy-url,omitempty"`
+
+	// Weight controls the selection probability in weighted round-robin.
+	// Higher values increase selection frequency. Defaults to 1.
+	// For example, weight 1:3 means key A is selected 1 time for every 3 times key B is selected.
+	Weight int `yaml:"weight,omitempty" json:"weight,omitempty"`
 }
 
 // OpenAICompatibilityModel represents a model configuration for OpenAI compatibility,

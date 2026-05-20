@@ -156,6 +156,10 @@ var zhStrings = map[string]string{
 	// ── API Keys ──
 	"keys_title":         "🔐 API 密钥",
 	"keys_help":          " [↑↓/jk] 导航 • [a] 添加 • [e] 编辑 • [d] 删除 • [c] 复制 • [r] 刷新",
+	"edit_compat_keys":   " [e] 编辑密钥 • [n] 新增密钥",
+	"compat_key_added":   " 密钥已添加",
+	"compat_key_updated": " 密钥已更新",
+	"weight_hint":        " 权重 (w:1=1次 w:3=3次)",
 	"no_keys":            "  无 API Key，按 [a] 添加",
 	"access_keys":        "Access API Keys",
 	"confirm_delete_key": "⚠ 确认删除 %s? [y/n]",
@@ -316,6 +320,10 @@ var enStrings = map[string]string{
 	// ── API Keys ──
 	"keys_title":         "🔐 API Keys",
 	"keys_help":          " [↑↓/jk] Navigate • [a] Add • [e] Edit • [d] Delete • [c] Copy • [r] Refresh",
+	"edit_compat_keys":   " [e] Edit keys • [n] New key",
+	"compat_key_added":   " Key added",
+	"compat_key_updated": " Key updated",
+	"weight_hint":        " Weight (w:1=1x w:3=3x)",
 	"no_keys":            "  No API Keys. Press [a] to add",
 	"access_keys":        "Access API Keys",
 	"confirm_delete_key": "⚠ Delete %s? [y/n]",
