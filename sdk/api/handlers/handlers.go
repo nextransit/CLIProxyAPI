@@ -312,7 +312,9 @@ func NewBaseAPIHandlers(cfg *config.SDKConfig, authManager *coreauth.Manager) *B
 func (h *BaseAPIHandler) UpdateClients(cfg *config.SDKConfig) { h.Cfg = cfg }
 
 // SetAPIKeyPolicyManager sets the API key policy manager for rate limiting.
-func (h *BaseAPIHandler) SetAPIKeyPolicyManager(manager *apikeypolicy.Manager) { h.APIKeyPolicyManager = manager }
+func (h *BaseAPIHandler) SetAPIKeyPolicyManager(manager *apikeypolicy.Manager) {
+	h.APIKeyPolicyManager = manager
+}
 
 // GetAlt extracts the 'alt' parameter from the request query string.
 // It checks both 'alt' and '$alt' parameters and returns the appropriate value.
