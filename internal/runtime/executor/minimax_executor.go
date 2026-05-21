@@ -243,9 +243,12 @@ func (e *MiniMaxExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, 
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("minimax executor: 2013 detected, will attempt compact retries")
 
-		compactLevels := []int{5, 3, 1}
-		currentPayload := anthropicPayload
+		// Step 0: Strip tools to save context space
+		currentPayload := stripToolsFromAnthropicPayload(anthropicPayload)
 
+		compactLevels := []int{5, 3, 1}
+
+		// Step 1: Try compacting message count progressively
 		for retryIdx, maxItems := range compactLevels {
 			compacted := e.compactAnthropicPayload(currentPayload, maxItems)
 			if bytes.Equal(compacted, currentPayload) {
@@ -283,7 +286,45 @@ func (e *MiniMaxExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, 
 			currentPayload = compacted
 		}
 
-		helps.LogWithRequestID(ctx).Debugf("minimax executor: all %d compact retries exhausted", len(compactLevels))
+		helps.LogWithRequestID(ctx).Debugf("minimax executor: all %d compact retries exhausted, attempting content truncation", len(compactLevels))
+
+		// Step 2: Last resort - truncate message content, then retry
+		truncated := truncateMessageContent(currentPayload, 128000)
+		if !bytes.Equal(truncated, currentPayload) {
+			truncReq, truncErr := http.NewRequestWithContext(ctx, http.MethodPost, anthropicURL, bytes.NewReader(truncated))
+			if truncErr == nil {
+				truncReq.Header.Set("Content-Type", "application/json")
+				truncReq.Header.Set("anthropic-version", "2023-06-01")
+				if apiKey != "" {
+					truncReq.Header.Set("x-api-key", apiKey)
+				}
+				if truncResp, truncErr := e.HttpRequest(ctx, auth, truncReq); truncErr == nil {
+					defer func() { _ = truncResp.Body.Close() }()
+					truncBody, _ := helps.LimitedReadAll(truncResp.Body)
+					helps.AppendAPIResponseChunk(ctx, e.cfg, truncBody)
+					if !isMiniMaxContextWindowError(truncBody) {
+						if truncResp.StatusCode != http.StatusOK {
+							err = statusErr{code: truncResp.StatusCode, msg: string(truncBody)}
+							return resp, err
+						}
+						filtered := e.filterThinkingBlocks(truncBody)
+						var param any
+						out := sdktranslator.TranslateNonStream(ctx, sdktranslator.FromString("anthropic"), from, baseModel, opts.OriginalRequest, translated, filtered, &param)
+						reporter.Publish(ctx, helps.ParseAntigravityUsage(out))
+						if opts.Stream {
+							resp.Payload = out
+						} else {
+							helps.AppendAPIResponseChunk(ctx, e.cfg, out)
+						}
+						return resp, nil
+					}
+				}
+			}
+		}
+		helps.LogWithRequestID(ctx).Debugf("minimax executor: 2013 all recovery strategies exhausted")
+		// Return the original 2013 error instead of falling through
+		err = statusErr{code: http.StatusBadRequest, msg: fmt.Sprintf("context window exceeded (2013) after all recovery attempts: %s", string(b))}
+		return resp, err
 	}
 
 	if httpResp.StatusCode != http.StatusOK {
@@ -754,10 +795,32 @@ func FetchURLsInMessages(payload []byte) []byte {
 // isMiniMaxContextWindowError checks if the response body indicates a MiniMax
 // context window exceeded error (code 2013), which can be recovered by
 // compacting the conversation history.
+// Handles both MiniMax native format (error.code=2013) and the plain JSON
+// format where 2013 appears in the error message.
 func isMiniMaxContextWindowError(body []byte) bool {
 	if !bytes.Contains(body, []byte("2013")) {
 		return false
 	}
-	code := gjson.GetBytes(body, "error.code")
-	return code.Exists() && code.Int() == 2013
+	// MiniMax native format: {"error":{"code":2013,...}}
+	if code := gjson.GetBytes(body, "error.code"); code.Exists() && code.Int() == 2013 {
+		return true
+	}
+	// Plain JSON format: {"error":{"message":"...context window exceeds limit (2013)..."}}
+	msg := strings.ToLower(gjson.GetBytes(body, "error.message").String())
+	if strings.Contains(msg, "context window") && strings.Contains(msg, "2013") {
+		return true
+	}
+	return false
+}
+
+// stripToolsFromAnthropicPayload removes tools from an Anthropic-format payload
+// to reduce context window usage.
+func stripToolsFromAnthropicPayload(payload []byte) []byte {
+	result := payload
+	var err error
+	result, err = sjson.DeleteBytes(result, "tools")
+	if err != nil {
+		return payload
+	}
+	return result
 }

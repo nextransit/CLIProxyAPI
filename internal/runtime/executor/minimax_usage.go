@@ -39,9 +39,12 @@ type MiniMaxModelRemain struct {
 	WeeklyRemainsTime         int64  `json:"weekly_remains_time,omitempty"`
 }
 
-const (
+var (
 	// MiniMaxUsageEndpoint is the API endpoint for querying MiniMax usage/quota
 	MiniMaxUsageEndpoint = "https://www.minimaxi.com/v1/api/openplatform/coding_plan/remains"
+)
+
+const (
 	// MiniMaxUsageTimeout is the default timeout for usage API calls
 	MiniMaxUsageTimeout = 10 * time.Second
 )

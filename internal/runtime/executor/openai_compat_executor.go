@@ -180,10 +180,15 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
 
-		// Handle 2013 context window exceeded with compact-retry
+		// Handle 2013 context window exceeded with progressive compaction.
+		// Strategy: strip tools → compact messages → truncate content (last resort).
 		if isContextWindowExceeded(b) && httpResp.StatusCode == 400 {
 			compactLevels := []int{5, 3, 1}
-			currentPayload := translated
+			// Step 0: Strip tools/tool_choice to reduce payload size
+			currentPayload := stripToolsFromPayload(translated)
+
+			// Step 1: Try compacting message count progressively
+		compactLoop:
 			for retryIdx, maxItems := range compactLevels {
 				compacted := compactMessagesForRetry(currentPayload, maxItems)
 				if bytes.Equal(compacted, currentPayload) {
@@ -211,10 +216,8 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 
 				if retryResp.StatusCode >= 200 && retryResp.StatusCode < 300 {
 					helps.LogWithRequestID(ctx).Debugf("openai compat executor: 2013 compact retry %d succeeded", retryIdx+1)
-					// Translate response
 					var param any
-					successBody := retryBody
-					out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, opts.OriginalRequest, compacted, successBody, &param)
+					out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, opts.OriginalRequest, compacted, retryBody, &param)
 					resp = cliproxyexecutor.Response{Payload: out, Headers: retryResp.Header.Clone()}
 					return resp, nil
 				}
@@ -224,9 +227,35 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 					currentPayload = compacted
 					continue
 				}
-				break
+				break compactLoop
 			}
-			helps.LogWithRequestID(ctx).Debugf("openai compat executor: 2013 compact retries exhausted")
+
+			// Step 2: Last resort - truncate message content
+			helps.LogWithRequestID(ctx).Debugf("openai compat executor: 2013 compact retries exhausted, attempting content truncation")
+			truncated := truncateMessageContent(currentPayload, 128000)
+			if !bytes.Equal(truncated, currentPayload) {
+				retryReq, rErr := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(truncated))
+				if rErr == nil {
+					retryReq.Header.Set("Content-Type", "application/json")
+					if apiKey != "" {
+						retryReq.Header.Set("Authorization", "Bearer "+apiKey)
+					}
+					retryReq.Header.Set("User-Agent", "cli-proxy-openai-compat")
+					httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+					if retryResp, rErr := httpClient.Do(retryReq); rErr == nil {
+						retryBody, _ := helps.LimitedReadAll(retryResp.Body)
+						retryResp.Body.Close()
+						if retryResp.StatusCode >= 200 && retryResp.StatusCode < 300 {
+							helps.LogWithRequestID(ctx).Debugf("openai compat executor: 2013 content truncation retry succeeded")
+							var param any
+							out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, opts.OriginalRequest, truncated, retryBody, &param)
+							resp = cliproxyexecutor.Response{Payload: out, Headers: retryResp.Header.Clone()}
+							return resp, nil
+						}
+					}
+				}
+			}
+			helps.LogWithRequestID(ctx).Debugf("openai compat executor: 2013 all recovery strategies exhausted")
 		}
 
 		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
@@ -1216,9 +1245,15 @@ func isContextWindowExceeded(body []byte) bool {
 // compactMessagesForRetry keeps only the last maxItems messages from the
 // payload's messages array to reduce context window usage.
 func compactMessagesForRetry(payload []byte, maxItems int) []byte {
-	messages := gjson.GetBytes(payload, "messages")
+	// Try "messages" field first (chat completions format), then "input" (responses API format)
+	msgField := "messages"
+	messages := gjson.GetBytes(payload, msgField)
 	if !messages.Exists() || !messages.IsArray() {
-		return payload
+		msgField = "input"
+		messages = gjson.GetBytes(payload, msgField)
+		if !messages.Exists() || !messages.IsArray() {
+			return payload
+		}
 	}
 	arr := messages.Array()
 	if len(arr) <= maxItems {
@@ -1247,9 +1282,81 @@ func compactMessagesForRetry(payload []byte, maxItems int) []byte {
 		buf.WriteString(item.Raw)
 	}
 	buf.WriteByte(']')
-	out, err := sjson.SetRawBytes(payload, "messages", buf.Bytes())
+	out, err := sjson.SetRawBytes(payload, msgField, buf.Bytes())
 	if err != nil {
 		return payload
 	}
 	return out
+}
+
+// stripToolsFromPayload removes tools and tool_choice fields from a payload
+// to reduce context window usage. This is useful as a first step before
+// compacting messages when the context window is exceeded.
+func stripToolsFromPayload(payload []byte) []byte {
+	result := payload
+	var err error
+	result, err = sjson.DeleteBytes(result, "tools")
+	if err != nil {
+		return payload
+	}
+	result, err = sjson.DeleteBytes(result, "tool_choice")
+	if err != nil {
+		return payload
+	}
+	result, err = sjson.DeleteBytes(result, "tool_functions")
+	if err != nil {
+		return payload
+	}
+	return result
+}
+
+// truncateMessageContent truncates the content of the last message
+// in the payload when it exceeds maxChars. This is a last-resort fallback
+// when even keeping a single message exceeds the context window.
+// It truncates the content and appends a truncation marker.
+func truncateMessageContent(payload []byte, maxChars int) []byte {
+	// Try "messages" field first (chat completions format)
+	messages := gjson.GetBytes(payload, "messages")
+	if messages.IsArray() {
+		return truncateMessagesArray(payload, "messages", messages.Array(), maxChars)
+	}
+	// Also try "input" field (responses API format)
+	input := gjson.GetBytes(payload, "input")
+	if input.IsArray() {
+		return truncateMessagesArray(payload, "input", input.Array(), maxChars)
+	}
+	return payload
+}
+
+func truncateMessagesArray(payload []byte, field string, msgs []gjson.Result, maxChars int) []byte {
+	if len(msgs) == 0 {
+		return payload
+	}
+
+	modified := false
+	for i := range msgs {
+		content := msgs[i].Get("content")
+		if !content.Exists() {
+			continue
+		}
+		contentStr := content.String()
+		if len(contentStr) <= maxChars {
+			continue
+		}
+		// Truncate: keep first 40% and last 40% to preserve context at both ends
+		headSize := maxChars * 40 / 100
+		tailSize := maxChars - headSize - 50 // reserve space for truncation marker
+		if tailSize < 100 {
+			headSize = maxChars - 150
+			tailSize = 100
+		}
+		marker := fmt.Sprintf("\n\n...[truncated %d chars, context window limit]...\n\n", len(contentStr)-maxChars)
+		truncated := contentStr[:headSize] + marker + contentStr[len(contentStr)-tailSize:]
+		payload, _ = sjson.SetBytes(payload, field+"."+fmt.Sprint(i)+".content", truncated)
+		modified = true
+	}
+	if !modified {
+		return payload
+	}
+	return payload
 }
