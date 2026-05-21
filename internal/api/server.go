@@ -708,6 +708,28 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 		return
 	}
 
+	// Serve the best available management.html asset.
+	// Priority: local assets/ (dev/deploy) > static/ (GitHub sync) > builtin shell.
+	serveFile := func(path string) bool {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			return false
+		}
+		if _, err := os.Stat(path); err == nil {
+			c.File(path)
+			return true
+		} else if !os.IsNotExist(err) {
+			log.WithError(err).Warnf("failed to stat management control panel asset candidate %s", path)
+		}
+		return false
+	}
+
+	// 1. assets/management.html — packed with the binary, always reflects the deployed build
+	if serveFile("assets/management.html") || serveFile("./assets/management.html") {
+		return
+	}
+
+	// 2. static/management.html — synced from GitHub releases (auto-updater)
 	filePath := managementasset.FilePath(s.configFilePath)
 	if strings.TrimSpace(filePath) != "" {
 		if _, err := os.Stat(filePath); err != nil {
@@ -720,24 +742,10 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 						cfg.RemoteManagement.PanelGitHubRepository,
 					)
 				}
-			} else {
-				log.WithError(err).Error("failed to stat management control panel asset")
-				c.AbortWithStatus(http.StatusInternalServerError)
-				return
 			}
 		}
-	}
-
-	for _, candidate := range []string{filePath, "assets/management.html", "./assets/management.html"} {
-		candidate = strings.TrimSpace(candidate)
-		if candidate == "" {
-			continue
-		}
-		if _, err := os.Stat(candidate); err == nil {
-			c.File(candidate)
+		if serveFile(filePath) {
 			return
-		} else if !os.IsNotExist(err) {
-			log.WithError(err).Warnf("failed to stat management control panel asset candidate %s", candidate)
 		}
 	}
 
