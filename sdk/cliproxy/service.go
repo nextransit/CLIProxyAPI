@@ -817,30 +817,93 @@ func (s *Service) initializeUsagePersistence(cfg *config.Config) {
 	if cfg == nil || !cfg.UsageStatisticsEnabled {
 		return
 	}
-	if err := internalusage.InitializePersistence(resolveUsagePersistenceDir(cfg, s.configPath)); err != nil {
+	dirs := resolveUsagePersistenceDirs(cfg, s.configPath)
+	if len(dirs) == 0 {
+		return
+	}
+	if err := internalusage.InitializePersistence(dirs[0]); err != nil {
 		log.WithError(err).Warn("failed to initialize usage statistics persistence")
+		return
+	}
+	if restored, err := restoreUsagePersistenceFallbacks(dirs[1:]); err != nil {
+		log.WithError(err).Warn("failed to restore fallback usage statistics")
+	} else if restored {
+		if errSave := internalusage.SaveStatistics(); errSave != nil {
+			log.WithError(errSave).Warn("failed to persist merged usage statistics")
+		}
 	}
 }
 
 func resolveUsagePersistenceDir(cfg *config.Config, configPath string) string {
-	if writablePath := util.WritablePath(); writablePath != "" {
-		return filepath.Join(writablePath, usagePersistenceDirName)
+	dirs := resolveUsagePersistenceDirs(cfg, configPath)
+	if len(dirs) == 0 {
+		return filepath.Join(os.TempDir(), usagePersistenceDirName)
 	}
-	if cfg != nil {
+	return dirs[0]
+}
+
+func resolveUsagePersistenceDirs(cfg *config.Config, configPath string) []string {
+	var dirs []string
+	addDir := func(dir string) {
+		dir = strings.TrimSpace(dir)
+		if dir == "" {
+			return
+		}
+		if absDir, err := filepath.Abs(dir); err == nil {
+			dir = absDir
+		}
+		dir = filepath.Clean(dir)
+		for _, existing := range dirs {
+			if existing == dir {
+				return
+			}
+		}
+		dirs = append(dirs, dir)
+	}
+	if writablePath := util.WritablePath(); writablePath != "" {
+		addDir(filepath.Join(writablePath, usagePersistenceDirName))
+	}
+	if cfg != nil && strings.TrimSpace(cfg.AuthDir) != "" {
 		if authDir, err := util.ResolveAuthDir(cfg.AuthDir); err == nil && strings.TrimSpace(authDir) != "" {
-			return filepath.Join(authDir, usagePersistenceDirName)
+			addDir(filepath.Join(authDir, usagePersistenceDirName))
 		}
 	}
 	if trimmedConfigPath := strings.TrimSpace(configPath); trimmedConfigPath != "" {
 		if absPath, err := filepath.Abs(trimmedConfigPath); err == nil {
 			trimmedConfigPath = absPath
 		}
-		return filepath.Join(filepath.Dir(trimmedConfigPath), usagePersistenceDirName)
+		addDir(filepath.Join(filepath.Dir(trimmedConfigPath), usagePersistenceDirName))
 	}
 	if wd, err := os.Getwd(); err == nil && strings.TrimSpace(wd) != "" {
-		return filepath.Join(wd, usagePersistenceDirName)
+		addDir(filepath.Join(wd, usagePersistenceDirName))
 	}
-	return filepath.Join(os.TempDir(), usagePersistenceDirName)
+	addDir(filepath.Join(os.TempDir(), usagePersistenceDirName))
+	return dirs
+}
+
+func restoreUsagePersistenceFallbacks(dirs []string) (bool, error) {
+	stats := internalusage.GetRequestStatistics()
+	restored := false
+	for _, dir := range dirs {
+		store := internalusage.NewFileStore(dir)
+		snapshot, err := store.Load()
+		if err != nil {
+			return restored, err
+		}
+		if snapshot.TotalRequests == 0 && snapshot.TotalTokens == 0 && len(snapshot.APIs) == 0 {
+			continue
+		}
+		before := stats.Snapshot()
+		result := stats.MergeSnapshot(snapshot)
+		after := stats.Snapshot()
+		if result.Added == 0 && after.TotalRequests == before.TotalRequests && after.TotalTokens == before.TotalTokens {
+			continue
+		}
+		restored = true
+		log.Infof("merged fallback usage statistics from %s: snapshot=%d requests/%d tokens, added=%d skipped=%d, totals=%d requests/%d tokens",
+			store.Path(), snapshot.TotalRequests, snapshot.TotalTokens, result.Added, result.Skipped, after.TotalRequests, after.TotalTokens)
+	}
+	return restored, nil
 }
 
 func (s *Service) ensureAuthDir() error {

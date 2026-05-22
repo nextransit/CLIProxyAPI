@@ -19,6 +19,25 @@ func TestResolveUsagePersistenceDir_PrefersWritablePath(t *testing.T) {
 	}
 }
 
+func TestResolveUsagePersistenceDirs_IncludesAuthDirFallbackWithWritablePath(t *testing.T) {
+	writableBase := t.TempDir()
+	authDir := filepath.Join(t.TempDir(), "auths")
+	t.Setenv("WRITABLE_PATH", writableBase)
+
+	got := resolveUsagePersistenceDirs(&config.Config{AuthDir: authDir}, filepath.Join(t.TempDir(), "config.yaml"))
+	wantPrimary := filepath.Join(writableBase, ".cliproxy-state")
+	wantFallback := filepath.Join(authDir, ".cliproxy-state")
+	if len(got) < 2 {
+		t.Fatalf("resolveUsagePersistenceDirs() len = %d, want at least 2: %#v", len(got), got)
+	}
+	if got[0] != wantPrimary {
+		t.Fatalf("primary dir = %q, want %q", got[0], wantPrimary)
+	}
+	if got[1] != wantFallback {
+		t.Fatalf("auth fallback dir = %q, want %q", got[1], wantFallback)
+	}
+}
+
 func TestResolveUsagePersistenceDir_PrefersAuthDir(t *testing.T) {
 	t.Setenv("WRITABLE_PATH", "")
 	home := t.TempDir()

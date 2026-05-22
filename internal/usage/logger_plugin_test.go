@@ -130,3 +130,93 @@ func TestRequestStatisticsMergeSnapshotDedupIgnoresLatency(t *testing.T) {
 		t.Fatalf("details len = %d, want 1", len(details))
 	}
 }
+
+func TestRequestStatisticsMergeSnapshotPreservesAggregateTotalsWhenDetailsAreIncomplete(t *testing.T) {
+	stats := NewRequestStatistics()
+	timestamp := time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC)
+	snapshot := StatisticsSnapshot{
+		TotalRequests: 3,
+		SuccessCount:  2,
+		FailureCount:  1,
+		TotalTokens:   1000,
+		APIs: map[string]APISnapshot{
+			"test-key": {
+				TotalRequests: 3,
+				TotalTokens:   1000,
+				Models: map[string]ModelSnapshot{
+					"gpt-5.4": {
+						TotalRequests: 3,
+						TotalTokens:   1000,
+						Details: []RequestDetail{{
+							Timestamp: timestamp,
+							Source:    "user@example.com",
+							AuthIndex: "0",
+							Tokens: TokenStats{
+								InputTokens:  40,
+								OutputTokens: 60,
+								TotalTokens:  100,
+							},
+						}},
+					},
+				},
+			},
+		},
+		RequestsByDay: map[string]int64{"2026-03-20": 3},
+		RequestsByHour: map[string]int64{
+			"12": 3,
+		},
+		TokensByDay: map[string]int64{"2026-03-20": 1000},
+		TokensByHour: map[string]int64{
+			"12": 1000,
+		},
+	}
+
+	result := stats.MergeSnapshot(snapshot)
+	if result.Added != 1 || result.Skipped != 0 {
+		t.Fatalf("merge result = %+v, want added=1 skipped=0", result)
+	}
+
+	got := stats.Snapshot()
+	if got.TotalRequests != 3 {
+		t.Fatalf("TotalRequests = %d, want 3", got.TotalRequests)
+	}
+	if got.SuccessCount != 2 {
+		t.Fatalf("SuccessCount = %d, want 2", got.SuccessCount)
+	}
+	if got.FailureCount != 1 {
+		t.Fatalf("FailureCount = %d, want 1", got.FailureCount)
+	}
+	if got.TotalTokens != 1000 {
+		t.Fatalf("TotalTokens = %d, want 1000", got.TotalTokens)
+	}
+	model := got.APIs["test-key"].Models["gpt-5.4"]
+	if model.TotalRequests != 3 {
+		t.Fatalf("model total requests = %d, want 3", model.TotalRequests)
+	}
+	if model.TotalTokens != 1000 {
+		t.Fatalf("model total tokens = %d, want 1000", model.TotalTokens)
+	}
+	if len(model.Details) != 1 {
+		t.Fatalf("details len = %d, want 1", len(model.Details))
+	}
+
+	result = stats.MergeSnapshot(snapshot)
+	if result.Added != 0 || result.Skipped != 1 {
+		t.Fatalf("second merge result = %+v, want added=0 skipped=1", result)
+	}
+
+	got = stats.Snapshot()
+	if got.TotalRequests != 3 {
+		t.Fatalf("after second merge TotalRequests = %d, want 3", got.TotalRequests)
+	}
+	if got.TotalTokens != 1000 {
+		t.Fatalf("after second merge TotalTokens = %d, want 1000", got.TotalTokens)
+	}
+	model = got.APIs["test-key"].Models["gpt-5.4"]
+	if model.TotalRequests != 3 {
+		t.Fatalf("after second merge model total requests = %d, want 3", model.TotalRequests)
+	}
+	if model.TotalTokens != 1000 {
+		t.Fatalf("after second merge model total tokens = %d, want 1000", model.TotalTokens)
+	}
+}

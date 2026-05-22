@@ -342,6 +342,11 @@ func (s *RequestStatistics) MergeSnapshot(snapshot StatisticsSnapshot) MergeResu
 			if modelName == "" {
 				modelName = "unknown"
 			}
+			modelStatsValue, ok := stats.Models[modelName]
+			if !ok || modelStatsValue == nil {
+				modelStatsValue = &modelStats{}
+				stats.Models[modelName] = modelStatsValue
+			}
 			for _, detail := range modelSnapshot.Details {
 				detail.Tokens = normaliseTokenStats(detail.Tokens)
 				detail.Thinking = normaliseThinkingValue(detail.Thinking)
@@ -360,8 +365,12 @@ func (s *RequestStatistics) MergeSnapshot(snapshot StatisticsSnapshot) MergeResu
 				s.recordImported(apiName, modelName, stats, detail)
 				result.Added++
 			}
+			s.preserveModelAggregates(stats, modelStatsValue, modelSnapshot)
 		}
+		s.preserveAPIAggregates(stats, apiSnapshot)
 	}
+	s.preserveSnapshotAggregates(snapshot)
+	s.preserveSnapshotBuckets(snapshot)
 
 	return result
 }
@@ -389,6 +398,101 @@ func (s *RequestStatistics) recordImported(apiName, modelName string, stats *api
 	s.requestsByHour[hourKey]++
 	s.tokensByDay[dayKey] += totalTokens
 	s.tokensByHour[hourKey] += totalTokens
+}
+
+func (s *RequestStatistics) preserveModelAggregates(stats *apiStats, modelStatsValue *modelStats, snapshot ModelSnapshot) {
+	if s == nil || stats == nil || modelStatsValue == nil {
+		return
+	}
+	if requestDelta := positiveInt64(snapshot.TotalRequests - modelStatsValue.TotalRequests); requestDelta > 0 {
+		modelStatsValue.TotalRequests += requestDelta
+		stats.TotalRequests += requestDelta
+		s.totalRequests += requestDelta
+	}
+
+	if tokenDelta := positiveInt64(snapshot.TotalTokens - modelStatsValue.TotalTokens); tokenDelta > 0 {
+		modelStatsValue.TotalTokens += tokenDelta
+		stats.TotalTokens += tokenDelta
+		s.totalTokens += tokenDelta
+	}
+}
+
+func (s *RequestStatistics) preserveAPIAggregates(stats *apiStats, snapshot APISnapshot) {
+	if s == nil || stats == nil {
+		return
+	}
+	if requestDelta := positiveInt64(snapshot.TotalRequests - stats.TotalRequests); requestDelta > 0 {
+		stats.TotalRequests += requestDelta
+		s.totalRequests += requestDelta
+	}
+	if tokenDelta := positiveInt64(snapshot.TotalTokens - stats.TotalTokens); tokenDelta > 0 {
+		stats.TotalTokens += tokenDelta
+		s.totalTokens += tokenDelta
+	}
+}
+
+func (s *RequestStatistics) preserveSnapshotAggregates(snapshot StatisticsSnapshot) {
+	if s == nil {
+		return
+	}
+	if requestDelta := positiveInt64(snapshot.TotalRequests - s.totalRequests); requestDelta > 0 {
+		s.totalRequests += requestDelta
+	}
+	if successDelta := positiveInt64(snapshot.SuccessCount - s.successCount); successDelta > 0 {
+		s.successCount += successDelta
+	}
+	if failureDelta := positiveInt64(snapshot.FailureCount - s.failureCount); failureDelta > 0 {
+		s.failureCount += failureDelta
+	}
+	if tokenDelta := positiveInt64(snapshot.TotalTokens - s.totalTokens); tokenDelta > 0 {
+		s.totalTokens += tokenDelta
+	}
+}
+
+func (s *RequestStatistics) preserveSnapshotBuckets(snapshot StatisticsSnapshot) {
+	if s == nil {
+		return
+	}
+	for day, requests := range snapshot.RequestsByDay {
+		if requests > s.requestsByDay[day] {
+			s.requestsByDay[day] = requests
+		}
+	}
+	for hour, requests := range snapshot.RequestsByHour {
+		parsedHour := parseHourKey(hour)
+		if requests > s.requestsByHour[parsedHour] {
+			s.requestsByHour[parsedHour] = requests
+		}
+	}
+	for day, tokens := range snapshot.TokensByDay {
+		if tokens > s.tokensByDay[day] {
+			s.tokensByDay[day] = tokens
+		}
+	}
+	for hour, tokens := range snapshot.TokensByHour {
+		parsedHour := parseHourKey(hour)
+		if tokens > s.tokensByHour[parsedHour] {
+			s.tokensByHour[parsedHour] = tokens
+		}
+	}
+}
+
+func positiveInt64(value int64) int64 {
+	if value < 0 {
+		return 0
+	}
+	return value
+}
+
+func parseHourKey(hour string) int {
+	var parsed int
+	if _, err := fmt.Sscanf(strings.TrimSpace(hour), "%d", &parsed); err != nil {
+		return 0
+	}
+	if parsed < 0 {
+		return 0
+	}
+	return parsed % 24
 }
 
 func dedupKey(apiName, modelName string, detail RequestDetail) string {
