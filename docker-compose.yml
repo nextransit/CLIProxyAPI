@@ -17,6 +17,8 @@ services:
       MANAGEMENT_PASSWORD: admin123
       # Force management panel static path to local custom asset directory.
       MANAGEMENT_STATIC_PATH: /CLIProxyAPI/assets
+      # Force usage statistics snapshot to auth dir (mounted volume) for persistence across rebuilds.
+      WRITABLE_PATH: /root/.cliproxyapi
     ports:
       - "8317:8317"
       - "8085:8085"
