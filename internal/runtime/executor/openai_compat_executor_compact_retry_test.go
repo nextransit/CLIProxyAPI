@@ -330,3 +330,63 @@ func TestCompactAnthropicPayloadWithStripAndTruncate(t *testing.T) {
 		t.Errorf("expected 5 messages after compact, got %d", len(msgsArr))
 	}
 }
+
+func TestIsContextWindowExceeded(t *testing.T) {
+	tests := []struct {
+		name           string
+		body           string
+		httpStatusCode int
+		want           bool
+	}{
+		{
+			"2013 with HTTP 400",
+			`{"error":{"type":"bad_request_error","message":"context window exceeds limit (2013)","http_code":"400"}}`,
+			400,
+			true,
+		},
+		{
+			"2013 with HTTP 500 but http_code 400 (the fix case)",
+			`{"type":"error","error":{"type":"bad_request_error","message":"invalid params, context window exceeds limit (2013)","http_code":"400"}}`,
+			500,
+			true,
+		},
+		{
+			"2013 without context window phrase",
+			`{"error":{"message":"something (2013)"}}`,
+			400,
+			false,
+		},
+		{
+			"context window without 2013",
+			`{"error":{"message":"context window exceeded"}}`,
+			400,
+			false,
+		},
+		{
+			"empty body",
+			"",
+			400,
+			false,
+		},
+		{
+			"unrelated error with HTTP 500",
+			`{"error":{"message":"bad request"}}`,
+			500,
+			false,
+		},
+		{
+			"error.code 2013 with HTTP 500 but http_code 400",
+			`{"error":{"code":2013,"message":"context exceeded"},"http_code":"400"}`,
+			500,
+			true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isContextWindowExceeded([]byte(tt.body), tt.httpStatusCode)
+			if got != tt.want {
+				t.Errorf("isContextWindowExceeded(%q, %d) = %v, want %v", tt.body, tt.httpStatusCode, got, tt.want)
+			}
+		})
+	}
+}

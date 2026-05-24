@@ -129,16 +129,17 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		// )
 		appendWebsocketTimelineEvent(&wsTimelineLog, "request", payload, time.Now())
 
+		requestModelName := strings.TrimSpace(gjson.GetBytes(payload, "model").String())
+		if requestModelName == "" {
+			requestModelName = strings.TrimSpace(gjson.GetBytes(lastRequest, "model").String())
+		}
+
 		allowIncrementalInputWithPreviousResponseID := false
 		if pinnedAuthID != "" && h != nil && h.AuthManager != nil {
 			if pinnedAuth, ok := h.AuthManager.GetByID(pinnedAuthID); ok && pinnedAuth != nil {
 				allowIncrementalInputWithPreviousResponseID = websocketUpstreamSupportsIncrementalInput(pinnedAuth.Attributes, pinnedAuth.Metadata)
 			}
 		} else {
-			requestModelName := strings.TrimSpace(gjson.GetBytes(payload, "model").String())
-			if requestModelName == "" {
-				requestModelName = strings.TrimSpace(gjson.GetBytes(lastRequest, "model").String())
-			}
 			allowIncrementalInputWithPreviousResponseID = h.websocketUpstreamSupportsIncrementalInputForModel(requestModelName)
 		}
 		if forceTranscriptReplayNextRequest {
@@ -148,11 +149,16 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		var requestJSON []byte
 		var updatedLastRequest []byte
 		var errMsg *interfaces.ErrorMessage
+		allowCompactionReplay := h.websocketUpstreamSupportsCompactionReplayForModel(requestModelName)
+		if forceTranscriptReplayNextRequest {
+			allowCompactionReplay = false
+		}
 		requestJSON, updatedLastRequest, errMsg = normalizeResponsesWebsocketRequestWithMode(
 			payload,
 			lastRequest,
 			lastResponseOutput,
 			allowIncrementalInputWithPreviousResponseID,
+			allowCompactionReplay,
 		)
 		if errMsg != nil {
 			h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
@@ -264,10 +270,16 @@ func websocketUpgradeHeaders(req *http.Request) http.Header {
 }
 
 func normalizeResponsesWebsocketRequest(rawJSON []byte, lastRequest []byte, lastResponseOutput []byte) ([]byte, []byte, *interfaces.ErrorMessage) {
-	return normalizeResponsesWebsocketRequestWithMode(rawJSON, lastRequest, lastResponseOutput, true)
+	return normalizeResponsesWebsocketRequestWithMode(rawJSON, lastRequest, lastResponseOutput, true, true)
 }
 
-func normalizeResponsesWebsocketRequestWithMode(rawJSON []byte, lastRequest []byte, lastResponseOutput []byte, allowIncrementalInputWithPreviousResponseID bool) ([]byte, []byte, *interfaces.ErrorMessage) {
+func normalizeResponsesWebsocketRequestWithMode(
+	rawJSON []byte,
+	lastRequest []byte,
+	lastResponseOutput []byte,
+	allowIncrementalInputWithPreviousResponseID bool,
+	allowCompactionReplay bool,
+) ([]byte, []byte, *interfaces.ErrorMessage) {
 	requestType := strings.TrimSpace(gjson.GetBytes(rawJSON, "type").String())
 	switch requestType {
 	case wsRequestTypeCreate:
@@ -275,10 +287,10 @@ func normalizeResponsesWebsocketRequestWithMode(rawJSON []byte, lastRequest []by
 		if len(lastRequest) == 0 {
 			return normalizeResponseCreateRequest(rawJSON)
 		}
-		return normalizeResponseSubsequentRequest(rawJSON, lastRequest, lastResponseOutput, allowIncrementalInputWithPreviousResponseID)
+		return normalizeResponseSubsequentRequest(rawJSON, lastRequest, lastResponseOutput, allowIncrementalInputWithPreviousResponseID, allowCompactionReplay)
 	case wsRequestTypeAppend:
 		// log.Infof("responses websocket: response.append request")
-		return normalizeResponseSubsequentRequest(rawJSON, lastRequest, lastResponseOutput, allowIncrementalInputWithPreviousResponseID)
+		return normalizeResponseSubsequentRequest(rawJSON, lastRequest, lastResponseOutput, allowIncrementalInputWithPreviousResponseID, allowCompactionReplay)
 	default:
 		return nil, lastRequest, &interfaces.ErrorMessage{
 			StatusCode: http.StatusBadRequest,
@@ -307,7 +319,13 @@ func normalizeResponseCreateRequest(rawJSON []byte) ([]byte, []byte, *interfaces
 	return normalized, bytes.Clone(normalized), nil
 }
 
-func normalizeResponseSubsequentRequest(rawJSON []byte, lastRequest []byte, lastResponseOutput []byte, allowIncrementalInputWithPreviousResponseID bool) ([]byte, []byte, *interfaces.ErrorMessage) {
+func normalizeResponseSubsequentRequest(
+	rawJSON []byte,
+	lastRequest []byte,
+	lastResponseOutput []byte,
+	allowIncrementalInputWithPreviousResponseID bool,
+	allowCompactionReplay bool,
+) ([]byte, []byte, *interfaces.ErrorMessage) {
 	if len(lastRequest) == 0 {
 		return nil, lastRequest, &interfaces.ErrorMessage{
 			StatusCode: http.StatusBadRequest,
@@ -330,6 +348,14 @@ func normalizeResponseSubsequentRequest(rawJSON []byte, lastRequest []byte, last
 	if shouldReplaceWebsocketTranscript(rawJSON, nextInput) {
 		normalized := normalizeResponseTranscriptReplacement(rawJSON, lastRequest)
 		return normalized, bytes.Clone(normalized), nil
+	}
+
+	if inputContainsFullTranscript(nextInput) {
+		if allowCompactionReplay {
+			normalized := normalizeResponseTranscriptReplacement(rawJSON, lastRequest)
+			return normalized, bytes.Clone(normalized), nil
+		}
+		return normalizeResponseSubsequentRequestMerged(rawJSON, lastRequest, lastResponseOutput, nextInput.Raw, true)
 	}
 
 	// Websocket v2 mode uses response.create with previous_response_id + incremental input.
@@ -357,25 +383,16 @@ func normalizeResponseSubsequentRequest(rawJSON []byte, lastRequest []byte, last
 		}
 	}
 
-	existingInput := gjson.GetBytes(lastRequest, "input")
-	mergedInput, errMerge := mergeJSONArrayRaw(existingInput.Raw, normalizeJSONArrayRaw(lastResponseOutput))
-	if errMerge != nil {
-		return nil, lastRequest, &interfaces.ErrorMessage{
-			StatusCode: http.StatusBadRequest,
-			Error:      fmt.Errorf("invalid previous response output: %w", errMerge),
-		}
-	}
+	return normalizeResponseSubsequentRequestMerged(rawJSON, lastRequest, lastResponseOutput, nextInput.Raw, false)
+}
 
-	mergedInput, errMerge = mergeJSONArrayRaw(mergedInput, nextInput.Raw)
+func normalizeResponseSubsequentRequestMerged(rawJSON []byte, lastRequest []byte, lastResponseOutput []byte, nextInputRaw string, stripCompaction bool) ([]byte, []byte, *interfaces.ErrorMessage) {
+	mergedInput, errMerge := mergeResponsesInputWithHistory(lastRequest, lastResponseOutput, nextInputRaw, stripCompaction)
 	if errMerge != nil {
 		return nil, lastRequest, &interfaces.ErrorMessage{
 			StatusCode: http.StatusBadRequest,
-			Error:      fmt.Errorf("invalid request input: %w", errMerge),
+			Error:      fmt.Errorf("failed to merge websocket input: %w", errMerge),
 		}
-	}
-	dedupedInput, errDedupeFunctionCalls := dedupeFunctionCallsByCallID(mergedInput)
-	if errDedupeFunctionCalls == nil {
-		mergedInput = dedupedInput
 	}
 
 	normalized, errDelete := sjson.DeleteBytes(rawJSON, "type")
@@ -412,26 +429,7 @@ func shouldReplaceWebsocketTranscript(rawJSON []byte, nextInput gjson.Result) bo
 	if requestType != wsRequestTypeCreate && requestType != wsRequestTypeAppend {
 		return false
 	}
-	if strings.TrimSpace(gjson.GetBytes(rawJSON, "previous_response_id").String()) != "" {
-		return false
-	}
-	if !nextInput.Exists() || !nextInput.IsArray() {
-		return false
-	}
-
-	for _, item := range nextInput.Array() {
-		switch strings.TrimSpace(item.Get("type").String()) {
-		case "function_call", "custom_tool_call":
-			return true
-		case "message":
-			role := strings.TrimSpace(item.Get("role").String())
-			if role == "assistant" {
-				return true
-			}
-		}
-	}
-
-	return false
+	return shouldReplaceResponsesTranscript(rawJSON, nextInput)
 }
 
 func normalizeResponseTranscriptReplacement(rawJSON []byte, lastRequest []byte) []byte {
@@ -588,6 +586,38 @@ func (h *OpenAIResponsesAPIHandler) websocketUpstreamSupportsIncrementalInputFor
 		}
 	}
 	return false
+}
+
+func (h *OpenAIResponsesAPIHandler) websocketUpstreamSupportsCompactionReplayForModel(modelName string) bool {
+	if h == nil || h.AuthManager == nil {
+		return false
+	}
+
+	resolvedModelName := modelName
+	initialSuffix := thinking.ParseSuffix(modelName)
+	if initialSuffix.ModelName == "auto" {
+		resolvedBase := util.ResolveAutoModel(initialSuffix.ModelName)
+		if initialSuffix.HasSuffix {
+			resolvedModelName = fmt.Sprintf("%s(%s)", resolvedBase, initialSuffix.RawSuffix)
+		} else {
+			resolvedModelName = resolvedBase
+		}
+	} else {
+		resolvedModelName = util.ResolveAutoModel(modelName)
+	}
+
+	parsed := thinking.ParseSuffix(resolvedModelName)
+	baseModel := strings.TrimSpace(parsed.ModelName)
+	providers := util.GetProviderName(baseModel)
+	if len(providers) == 0 && baseModel != resolvedModelName {
+		providers = util.GetProviderName(resolvedModelName)
+	}
+	if len(providers) != 1 {
+		return false
+	}
+
+	providerKey := strings.TrimSpace(strings.ToLower(providers[0]))
+	return providerKey == "codex"
 }
 
 func responsesWebsocketAuthAvailableForModel(auth *coreauth.Auth, modelName string, now time.Time) bool {

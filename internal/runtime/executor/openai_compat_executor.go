@@ -182,7 +182,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 
 		// Handle 2013 context window exceeded with progressive compaction.
 		// Strategy: strip tools → compact messages → truncate content (last resort).
-		if isContextWindowExceeded(b) && httpResp.StatusCode == 400 {
+		if isContextWindowExceeded(b, httpResp.StatusCode) {
 			compactLevels := []int{5, 3, 1}
 			// Step 0: Strip tools/tool_choice to reduce payload size
 			currentPayload := stripToolsFromPayload(translated)
@@ -222,7 +222,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 					return resp, nil
 				}
 
-				if isContextWindowExceeded(retryBody) {
+				if isContextWindowExceeded(retryBody, retryResp.StatusCode) {
 					helps.LogWithRequestID(ctx).Debugf("openai compat executor: 2013 compact retry %d still exceeded, trying harder compaction", retryIdx+1)
 					currentPayload = compacted
 					continue
@@ -377,8 +377,98 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			log.Errorf("openai compat executor: close response body error: %v", errClose)
 		}
 
-		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
-		return nil, err
+		// Handle 2013 context window exceeded with progressive compaction for streaming.
+		if isContextWindowExceeded(b, httpResp.StatusCode) {
+			compactLevels := []int{5, 3, 1}
+			// Step 0: Strip tools/tool_choice to reduce payload size
+			currentPayload := stripToolsFromPayload(translated)
+
+			// Step 1: Try compacting message count progressively
+		compactLoop:
+			for retryIdx, maxItems := range compactLevels {
+				compacted := compactMessagesForRetry(currentPayload, maxItems)
+				if bytes.Equal(compacted, currentPayload) {
+					break
+				}
+				helps.LogWithRequestID(ctx).Debugf("openai compat executor: 2013 compact retry %d/%d to %d messages", retryIdx+1, len(compactLevels), maxItems)
+
+				retryReq, rErr := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(compacted))
+				if rErr != nil {
+					break
+				}
+				retryReq.Header.Set("Content-Type", "application/json")
+				if apiKey != "" {
+					retryReq.Header.Set("Authorization", "Bearer "+apiKey)
+				}
+				retryReq.Header.Set("User-Agent", "cli-proxy-openai-compat")
+				util.ApplyCustomHeadersFromAttrs(retryReq, attrs)
+				retryReq.Header.Set("Accept", "text/event-stream")
+				retryReq.Header.Set("Cache-Control", "no-cache")
+
+				httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+				retryResp, rErr := httpClient.Do(retryReq)
+				if rErr != nil {
+					break
+				}
+				retryBody, _ := helps.LimitedReadAll(retryResp.Body)
+
+				if retryResp.StatusCode >= 200 && retryResp.StatusCode < 300 {
+					helps.LogWithRequestID(ctx).Debugf("openai compat executor: 2013 compact retry %d succeeded", retryIdx+1)
+					httpResp = retryResp
+					translated = compacted
+					break compactLoop
+				}
+
+				if isContextWindowExceeded(retryBody, retryResp.StatusCode) {
+					helps.LogWithRequestID(ctx).Debugf("openai compat executor: 2013 compact retry %d still exceeded, trying harder compaction", retryIdx+1)
+					currentPayload = compacted
+					retryResp.Body.Close()
+					continue
+				}
+				retryResp.Body.Close()
+				break compactLoop
+			}
+
+			// If we still have a non-2xx response after compact retries, check if we should try truncation
+			if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+				helps.LogWithRequestID(ctx).Debugf("openai compat executor: 2013 compact retries exhausted, attempting content truncation")
+				truncated := truncateMessageContent(currentPayload, 128000)
+				if !bytes.Equal(truncated, currentPayload) {
+					retryReq, rErr := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(truncated))
+					if rErr == nil {
+						retryReq.Header.Set("Content-Type", "application/json")
+						if apiKey != "" {
+							retryReq.Header.Set("Authorization", "Bearer "+apiKey)
+						}
+						retryReq.Header.Set("User-Agent", "cli-proxy-openai-compat")
+						util.ApplyCustomHeadersFromAttrs(retryReq, attrs)
+						retryReq.Header.Set("Accept", "text/event-stream")
+						retryReq.Header.Set("Cache-Control", "no-cache")
+						httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+						if retryResp, rErr := httpClient.Do(retryReq); rErr == nil {
+							if retryResp.StatusCode >= 200 && retryResp.StatusCode < 300 {
+								helps.LogWithRequestID(ctx).Debugf("openai compat executor: 2013 content truncation retry succeeded")
+								httpResp = retryResp
+								translated = truncated
+							} else {
+								retryResp.Body.Close()
+							}
+						}
+					}
+				}
+			}
+
+			// If still not successful, log and prepare to return error
+			if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+				helps.LogWithRequestID(ctx).Debugf("openai compat executor: 2013 all recovery strategies exhausted")
+				b, _ := helps.LimitedReadAll(httpResp.Body)
+				err = statusErr{code: httpResp.StatusCode, msg: string(b)}
+				return nil, err
+			}
+		} else {
+			err = statusErr{code: httpResp.StatusCode, msg: string(b)}
+			return nil, err
+		}
 	}
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
@@ -1226,10 +1316,25 @@ func debugLogMessageStructure(payload []byte, model string) {
 
 // isContextWindowExceeded checks if the response body indicates a context
 // window exceeded error (code 2013 or message containing "context window").
-func isContextWindowExceeded(body []byte) bool {
+// Also checks httpStatusCode for robustness against upstream inconsistency.
+func isContextWindowExceeded(body []byte, httpStatusCode int) bool {
 	if len(body) == 0 {
 		return false
 	}
+
+	// Check http_code field in body (One-API/decard.cc format may return 500 HTTP
+	// status while body contains http_code=400). Check both "http_code" and "error.http_code".
+	if httpCode := gjson.GetBytes(body, "http_code"); httpCode.Exists() && httpCode.Int() == 400 {
+		httpStatusCode = 400
+	} else if httpCode := gjson.GetBytes(body, "error.http_code"); httpCode.Exists() && httpCode.Int() == 400 {
+		httpStatusCode = 400
+	}
+
+	// Must have either HTTP 400 status or 2013 error code
+	if httpStatusCode != 400 {
+		return false
+	}
+
 	// MiniMax native format: {"error":{"code":2013,...}}
 	if code := gjson.GetBytes(body, "error.code"); code.Exists() && code.Int() == 2013 {
 		return true

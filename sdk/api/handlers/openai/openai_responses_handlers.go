@@ -50,6 +50,9 @@ type responsesSSEFramer struct {
 	outputItems          map[int][]byte
 	outputOrder          []int
 	unindexedOutputItems [][]byte
+	responseID           string
+	completedOutput      []byte
+	completed            bool
 }
 
 func (f *responsesSSEFramer) WriteChunk(w io.Writer, chunk []byte) {
@@ -111,6 +114,7 @@ func (f *responsesSSEFramer) repairFrame(frame []byte) []byte {
 		f.recordOutputItem(payload)
 	case "response.completed":
 		repaired := f.repairCompletedPayload(payload)
+		f.recordCompletedPayload(repaired)
 		if !bytes.Equal(repaired, payload) {
 			return responsesSSEFrameWithData(frame, repaired)
 		}
@@ -217,6 +221,12 @@ func (f *responsesSSEFramer) repairCompletedPayload(payload []byte) []byte {
 		return payload
 	}
 	return repaired
+}
+
+func (f *responsesSSEFramer) recordCompletedPayload(payload []byte) {
+	f.responseID = responsesResponseIDFromPayload(payload)
+	f.completedOutput = responsesResponseOutputFromPayload(payload)
+	f.completed = true
 }
 
 func responsesSSEFrameLen(chunk []byte) int {
@@ -446,16 +456,30 @@ func (h *OpenAIResponsesAPIHandler) Compact(c *gin.Context) {
 func (h *OpenAIResponsesAPIHandler) handleNonStreamingResponse(c *gin.Context, rawJSON []byte) {
 	c.Header("Content-Type", "application/json")
 
-	modelName := gjson.GetBytes(rawJSON, "model").String()
+	requestJSON, requestSnapshot, sessionKey, errMsg := h.prepareResponsesSessionRequest(c, rawJSON)
+	if errMsg != nil {
+		h.WriteErrorResponse(c, errMsg)
+		return
+	}
+
+	modelName := gjson.GetBytes(requestJSON, "model").String()
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 	stopKeepAlive := h.StartNonStreamingKeepAlive(c, cliCtx)
 
-	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
+	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, h.HandlerType(), modelName, requestJSON, "")
 	stopKeepAlive()
 	if errMsg != nil {
 		h.WriteErrorResponse(c, errMsg)
 		cliCancel(errMsg.Error)
 		return
+	}
+	if sessionKey != "" && len(requestSnapshot) > 0 {
+		defaultResponsesHTTPSessionCache.store(
+			sessionKey,
+			requestSnapshot,
+			responsesResponseOutputFromPayload(resp),
+			responsesResponseIDFromPayload(resp),
+		)
 	}
 	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 	_, _ = c.Writer.Write(resp)
@@ -483,9 +507,15 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 	}
 
 	// New core execution path
-	modelName := gjson.GetBytes(rawJSON, "model").String()
+	requestJSON, requestSnapshot, sessionKey, errMsg := h.prepareResponsesSessionRequest(c, rawJSON)
+	if errMsg != nil {
+		h.WriteErrorResponse(c, errMsg)
+		return
+	}
+
+	modelName := gjson.GetBytes(requestJSON, "model").String()
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
-	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
+	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, requestJSON, "")
 
 	setSSEHeaders := func() {
 		c.Header("Content-Type", "text/event-stream")
@@ -536,6 +566,9 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 
 			// Continue
 			h.forwardResponsesStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, framer)
+			if sessionKey != "" && len(requestSnapshot) > 0 && framer.completed {
+				defaultResponsesHTTPSessionCache.store(sessionKey, requestSnapshot, framer.completedOutput, framer.responseID)
+			}
 			return
 		}
 	}
