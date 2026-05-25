@@ -673,7 +673,8 @@ func ensureDeepSeekReasoningContent(payload []byte) ([]byte, error) {
 			continue
 		}
 
-		reasoningText := fallbackDeepSeekTextReasoning(msg, hasLatestReasoning, latestReasoning)
+		hasToolCalls := msg.Get("tool_calls").Exists() && msg.Get("tool_calls").IsArray() && len(msg.Get("tool_calls").Array()) > 0
+		reasoningText := fallbackDeepSeekReasoningForAssistant(msg, hasToolCalls, hasLatestReasoning, latestReasoning)
 		path := fmt.Sprintf("messages.%d.reasoning_content", msgIdx)
 		next, err := sjson.SetBytes(out, path, reasoningText)
 		if err != nil {
