@@ -1103,7 +1103,7 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 						if thinking == nil {
 							thinking = &registry.ThinkingSupport{Levels: []string{"low", "medium", "high"}}
 						}
-						ms = append(ms, &ModelInfo{
+						info := &ModelInfo{
 							ID:          modelID,
 							Object:      "model",
 							Created:     time.Now().Unix(),
@@ -1112,7 +1112,18 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 							DisplayName: modelID,
 							UserDefined: false,
 							Thinking:    thinking,
-						})
+						}
+						staticModelID := strings.TrimSpace(m.Name)
+						if staticModelID == "" {
+							staticModelID = strings.TrimSpace(modelID)
+						}
+						if staticModelID != "" {
+							if upstream := registry.LookupStaticModelInfo(staticModelID); upstream != nil {
+								info.ContextLength = upstream.ContextLength
+								info.MaxCompletionTokens = upstream.MaxCompletionTokens
+							}
+						}
+						ms = append(ms, info)
 					}
 					// Register and return
 					if len(ms) > 0 {
@@ -1460,6 +1471,15 @@ type modelEntry interface {
 	GetAlias() string
 }
 
+type thinkingModelEntry interface {
+	GetThinking() *registry.ThinkingSupport
+}
+
+type modelMetadataEntry interface {
+	GetContextLength() int
+	GetMaxCompletionTokens() int
+}
+
 func buildConfigModels[T modelEntry](models []T, ownedBy, modelType string) []*ModelInfo {
 	if len(models) == 0 {
 		return nil
@@ -1495,9 +1515,26 @@ func buildConfigModels[T modelEntry](models []T, ownedBy, modelType string) []*M
 			DisplayName: display,
 			UserDefined: true,
 		}
-		if name != "" {
-			if upstream := registry.LookupStaticModelInfo(name); upstream != nil && upstream.Thinking != nil {
+		staticModelID := name
+		if staticModelID == "" {
+			staticModelID = alias
+		}
+		if staticModelID != "" {
+			if upstream := registry.LookupStaticModelInfo(staticModelID); upstream != nil {
+				info.ContextLength = upstream.ContextLength
+				info.MaxCompletionTokens = upstream.MaxCompletionTokens
 				info.Thinking = upstream.Thinking
+			}
+		}
+		if thinkingModel, ok := any(model).(thinkingModelEntry); ok && thinkingModel.GetThinking() != nil {
+			info.Thinking = thinkingModel.GetThinking()
+		}
+		if metadataModel, ok := any(model).(modelMetadataEntry); ok {
+			if contextLength := metadataModel.GetContextLength(); contextLength > 0 {
+				info.ContextLength = contextLength
+			}
+			if maxCompletionTokens := metadataModel.GetMaxCompletionTokens(); maxCompletionTokens > 0 {
+				info.MaxCompletionTokens = maxCompletionTokens
 			}
 		}
 		out = append(out, info)

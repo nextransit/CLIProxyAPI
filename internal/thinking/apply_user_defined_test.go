@@ -53,3 +53,29 @@ func TestApplyThinking_UserDefinedClaudePreservesAdaptiveLevel(t *testing.T) {
 		})
 	}
 }
+
+func TestApplyThinking_UserDefinedClaudeWithThinkingClampsUnsupportedLevel(t *testing.T) {
+	reg := registry.GetGlobalRegistry()
+	clientID := "test-user-defined-claude-thinking-" + t.Name()
+	modelID := "minimax-claude/MiniMax-M2.7-highspeed"
+	reg.RegisterClient(clientID, "claude", []*registry.ModelInfo{{
+		ID:          modelID,
+		UserDefined: true,
+		Thinking:    &registry.ThinkingSupport{Levels: []string{"low", "medium", "high"}},
+	}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(clientID)
+	})
+
+	body := []byte(`{"thinking":{"type":"adaptive"},"output_config":{"effort":"max"}}`)
+	out, err := thinking.ApplyThinking(body, modelID, "claude", "claude", "claude")
+	if err != nil {
+		t.Fatalf("ApplyThinking() error = %v", err)
+	}
+	if got := gjson.GetBytes(out, "thinking.type").String(); got != "adaptive" {
+		t.Fatalf("thinking.type = %q, want %q, body=%s", got, "adaptive", string(out))
+	}
+	if got := gjson.GetBytes(out, "output_config.effort").String(); got != "high" {
+		t.Fatalf("output_config.effort = %q, want %q, body=%s", got, "high", string(out))
+	}
+}

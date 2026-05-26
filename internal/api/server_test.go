@@ -84,6 +84,25 @@ func TestHealthz(t *testing.T) {
 	})
 }
 
+func TestIsClaudeModelsUserAgent(t *testing.T) {
+	testCases := []struct {
+		userAgent string
+		want      bool
+	}{
+		{userAgent: "claude-cli/2.1.98 (external, cli)", want: true},
+		{userAgent: "claude-code/1.0", want: true},
+		{userAgent: " Claude-Code/1.0 ", want: true},
+		{userAgent: "curl/8.7.1", want: false},
+		{userAgent: "", want: false},
+	}
+
+	for _, tc := range testCases {
+		if got := isClaudeModelsUserAgent(tc.userAgent); got != tc.want {
+			t.Fatalf("isClaudeModelsUserAgent(%q) = %v, want %v", tc.userAgent, got, tc.want)
+		}
+	}
+}
+
 func TestAmpProviderModelRoutes(t *testing.T) {
 	testCases := []struct {
 		name         string

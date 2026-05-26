@@ -241,3 +241,110 @@ func (h *Handler) openAICompatibilityWithAuthIndex() []openAICompatibilityWithAu
 	}
 	return out
 }
+
+// authIndexDisplayMap returns a map from AuthIndex to display name (e.g., "Claude #1").
+// This is used to format usage statistics for display in the dashboard.
+func (h *Handler) authIndexDisplayMap() map[string]string {
+	out := map[string]string{}
+	if h == nil {
+		return out
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.cfg == nil {
+		return out
+	}
+
+	// Build id -> AuthIndex mapping from authManager (inlined from liveAuthIndexByID)
+	authIndexByID := map[string]string{}
+	if manager := h.authManager; manager != nil {
+		for _, auth := range manager.List() {
+			if auth == nil {
+				continue
+			}
+			id := strings.TrimSpace(auth.ID)
+			if id == "" {
+				continue
+			}
+			idx := strings.TrimSpace(auth.Index)
+			if idx == "" {
+				idx = auth.EnsureIndex()
+			}
+			if idx == "" {
+				continue
+			}
+			authIndexByID[id] = idx
+		}
+	}
+
+	idGen := synthesizer.NewStableIDGenerator()
+
+	// Claude keys
+	for i := range h.cfg.ClaudeKey {
+		entry := h.cfg.ClaudeKey[i]
+		if key := strings.TrimSpace(entry.APIKey); key != "" {
+			id, _ := idGen.Next("claude:apikey", key, entry.BaseURL)
+			if authIndex := authIndexByID[id]; authIndex != "" {
+				out[authIndex] = fmt.Sprintf("Claude #%d", i+1)
+			}
+		}
+	}
+
+	// Gemini keys
+	for i := range h.cfg.GeminiKey {
+		entry := h.cfg.GeminiKey[i]
+		if key := strings.TrimSpace(entry.APIKey); key != "" {
+			id, _ := idGen.Next("gemini:apikey", key, entry.BaseURL)
+			if authIndex := authIndexByID[id]; authIndex != "" {
+				out[authIndex] = fmt.Sprintf("Gemini #%d", i+1)
+			}
+		}
+	}
+
+	// Codex keys
+	for i := range h.cfg.CodexKey {
+		entry := h.cfg.CodexKey[i]
+		if key := strings.TrimSpace(entry.APIKey); key != "" {
+			id, _ := idGen.Next("codex:apikey", key, entry.BaseURL)
+			if authIndex := authIndexByID[id]; authIndex != "" {
+				out[authIndex] = fmt.Sprintf("Codex #%d", i+1)
+			}
+		}
+	}
+
+	// Vertex keys
+	for i := range h.cfg.VertexCompatAPIKey {
+		entry := h.cfg.VertexCompatAPIKey[i]
+		id, _ := idGen.Next("vertex:apikey", entry.APIKey, entry.BaseURL, entry.ProxyURL)
+		if authIndex := authIndexByID[id]; authIndex != "" {
+			out[authIndex] = fmt.Sprintf("Vertex #%d", i+1)
+		}
+	}
+
+	// OpenAI Compatibility
+	normalized := normalizedOpenAICompatibilityEntries(h.cfg.OpenAICompatibility)
+	for i, entry := range normalized {
+		providerName := strings.ToLower(strings.TrimSpace(entry.Name))
+		if providerName == "" {
+			providerName = "openai"
+		}
+		idKind := fmt.Sprintf("openai-compatibility:%s", providerName)
+		if len(entry.APIKeyEntries) == 0 {
+			id, _ := idGen.Next(idKind, entry.BaseURL)
+			if authIndex := authIndexByID[id]; authIndex != "" {
+				out[authIndex] = fmt.Sprintf("%s #%d", providerName, i+1)
+			}
+		} else {
+			for j := range entry.APIKeyEntries {
+				apiKeyEntry := entry.APIKeyEntries[j]
+				id, _ := idGen.Next(idKind, apiKeyEntry.APIKey, entry.BaseURL, apiKeyEntry.ProxyURL)
+				if authIndex := authIndexByID[id]; authIndex != "" {
+					out[authIndex] = fmt.Sprintf("%s #%d.%d", providerName, i+1, j+1)
+				}
+			}
+		}
+	}
+
+	return out
+}

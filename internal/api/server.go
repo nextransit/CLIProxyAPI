@@ -894,16 +894,20 @@ func (s *Server) watchKeepAlive() {
 	}
 }
 
+func isClaudeModelsUserAgent(userAgent string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(userAgent))
+	return strings.HasPrefix(normalized, "claude-cli") || strings.HasPrefix(normalized, "claude-code")
+}
+
 // unifiedModelsHandler creates a unified handler for the /v1/models endpoint
 // that routes to different handlers based on the User-Agent header.
-// If User-Agent starts with "claude-cli", it routes to Claude handler,
-// otherwise it routes to OpenAI handler.
+// Claude Code clients route to the Claude handler; all other clients route to
+// the OpenAI handler.
 func (s *Server) unifiedModelsHandler(openaiHandler *openai.OpenAIAPIHandler, claudeHandler *claude.ClaudeCodeAPIHandler) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		userAgent := c.GetHeader("User-Agent")
 
-		// Route to Claude handler if User-Agent starts with "claude-cli"
-		if strings.HasPrefix(userAgent, "claude-cli") {
+		if isClaudeModelsUserAgent(userAgent) {
 			// log.Debugf("Routing /v1/models to Claude handler for User-Agent: %s", userAgent)
 			claudeHandler.ClaudeModels(c)
 		} else {

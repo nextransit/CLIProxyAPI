@@ -28,8 +28,11 @@ type PayloadFilterRule = internalconfig.PayloadFilterRule
 type PayloadModelRule = internalconfig.PayloadModelRule
 
 type GeminiKey = internalconfig.GeminiKey
+type GeminiModel = internalconfig.GeminiModel
 type CodexKey = internalconfig.CodexKey
+type CodexModel = internalconfig.CodexModel
 type ClaudeKey = internalconfig.ClaudeKey
+type ClaudeModel = internalconfig.ClaudeModel
 type VertexCompatKey = internalconfig.VertexCompatKey
 type VertexCompatModel = internalconfig.VertexCompatModel
 type OpenAICompatibility = internalconfig.OpenAICompatibility

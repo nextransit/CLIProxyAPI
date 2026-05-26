@@ -46,11 +46,12 @@ func ShouldCloak(cloakMode string, userAgent string) bool {
 		return false
 	default: // "auto" or empty
 		// If client is Claude Code, don't cloak
-		return !strings.HasPrefix(userAgent, "claude-cli")
+		return !isClaudeCodeClient(userAgent)
 	}
 }
 
 // isClaudeCodeClient checks if the User-Agent indicates a Claude Code client.
 func isClaudeCodeClient(userAgent string) bool {
-	return strings.HasPrefix(userAgent, "claude-cli")
+	normalized := strings.ToLower(strings.TrimSpace(userAgent))
+	return strings.HasPrefix(normalized, "claude-cli") || strings.HasPrefix(normalized, "claude-code")
 }

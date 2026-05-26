@@ -113,7 +113,7 @@ func ApplyThinking(body []byte, model string, fromFormat string, toFormat string
 	// 3. Model capability check
 	// Unknown models are treated as user-defined so thinking config can still be applied.
 	// The upstream service is responsible for validating the configuration.
-	if IsUserDefinedModel(modelInfo) {
+	if IsUserDefinedModel(modelInfo) && (modelInfo == nil || modelInfo.Thinking == nil) {
 		return applyUserDefinedModel(body, modelInfo, fromFormat, providerFormat, suffixResult)
 	}
 	if modelInfo.Thinking == nil {

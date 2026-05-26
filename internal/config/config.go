@@ -413,10 +413,30 @@ type ClaudeModel struct {
 
 	// Alias is the client-facing model name that maps to Name.
 	Alias string `yaml:"alias" json:"alias"`
+
+	// ContextLength is the effective context window for this model, when known.
+	ContextLength int `yaml:"context-length,omitempty" json:"context_length,omitempty"`
+
+	// MaxTokens is the Anthropic-style max_tokens cap exposed to Claude Code.
+	MaxTokens int `yaml:"max-tokens,omitempty" json:"max_tokens,omitempty"`
+
+	// MaxCompletionTokens is accepted as an OpenAI-style alias for MaxTokens.
+	MaxCompletionTokens int `yaml:"max-completion-tokens,omitempty" json:"max_completion_tokens,omitempty"`
+
+	// Thinking configures the thinking/reasoning capability for this model.
+	Thinking *registry.ThinkingSupport `yaml:"thinking,omitempty" json:"thinking,omitempty"`
 }
 
-func (m ClaudeModel) GetName() string  { return m.Name }
-func (m ClaudeModel) GetAlias() string { return m.Alias }
+func (m ClaudeModel) GetName() string                        { return m.Name }
+func (m ClaudeModel) GetAlias() string                       { return m.Alias }
+func (m ClaudeModel) GetThinking() *registry.ThinkingSupport { return m.Thinking }
+func (m ClaudeModel) GetContextLength() int                  { return m.ContextLength }
+func (m ClaudeModel) GetMaxCompletionTokens() int {
+	if m.MaxCompletionTokens > 0 {
+		return m.MaxCompletionTokens
+	}
+	return m.MaxTokens
+}
 
 // CodexKey represents the configuration for a Codex API key,
 // including the API key itself and an optional base URL for the API endpoint.

@@ -20,6 +20,12 @@ type usageImportPayload struct {
 	Usage   usage.StatisticsSnapshot `json:"usage"`
 }
 
+// usageStatisticsResponse wraps StatisticsSnapshot and adds formatted source display names.
+type usageStatisticsResponse struct {
+	usage.StatisticsSnapshot
+	SourceDisplay map[string]string `json:"source_display"`
+}
+
 // GetUsageStatistics returns the in-memory request statistics snapshot.
 func (h *Handler) GetUsageStatistics(c *gin.Context) {
 	var snapshot usage.StatisticsSnapshot
@@ -30,10 +36,66 @@ func (h *Handler) GetUsageStatistics(c *gin.Context) {
 		}
 		snapshot = h.usageStats.Snapshot()
 	}
+
+	// Build AuthIndex -> display name mapping
+	displayMap := h.authIndexDisplayMap()
+
+	// Transform snapshot to replace AuthIndex with formatted display name
+	transformed := h.transformUsageSnapshotWithDisplayNames(&snapshot, displayMap)
+
 	c.JSON(http.StatusOK, gin.H{
-		"usage":           snapshot,
+		"usage":           transformed,
 		"failed_requests": snapshot.FailureCount,
 	})
+}
+
+// transformUsageSnapshotWithDisplayNames replaces AuthIndex with formatted display names.
+func (h *Handler) transformUsageSnapshotWithDisplayNames(snapshot *usage.StatisticsSnapshot, displayMap map[string]string) *usage.StatisticsSnapshot {
+	if snapshot == nil {
+		return nil
+	}
+
+	// Deep copy the snapshot to avoid modifying the original
+	result := &usage.StatisticsSnapshot{
+		TotalRequests:  snapshot.TotalRequests,
+		SuccessCount:   snapshot.SuccessCount,
+		FailureCount:  snapshot.FailureCount,
+		TotalTokens:   snapshot.TotalTokens,
+		RequestsByDay:  snapshot.RequestsByDay,
+		RequestsByHour: snapshot.RequestsByHour,
+		TokensByDay:    snapshot.TokensByDay,
+		TokensByHour:   snapshot.TokensByHour,
+		APIs:           make(map[string]usage.APISnapshot, len(snapshot.APIs)),
+	}
+
+	for apiKey, apiSnap := range snapshot.APIs {
+		apiCopy := usage.APISnapshot{
+			TotalRequests: apiSnap.TotalRequests,
+			TotalTokens:   apiSnap.TotalTokens,
+			Models:        make(map[string]usage.ModelSnapshot, len(apiSnap.Models)),
+		}
+		for modelName, modelSnap := range apiSnap.Models {
+			modelCopy := usage.ModelSnapshot{
+				TotalRequests: modelSnap.TotalRequests,
+				TotalTokens:   modelSnap.TotalTokens,
+				Details:       make([]usage.RequestDetail, len(modelSnap.Details)),
+			}
+			for i, detail := range modelSnap.Details {
+				detailCopy := detail
+				// Replace AuthIndex with formatted display name
+				if detailCopy.AuthIndex != "" {
+					if displayName, ok := displayMap[detailCopy.AuthIndex]; ok {
+						detailCopy.AuthIndex = displayName
+					}
+				}
+				modelCopy.Details[i] = detailCopy
+			}
+			apiCopy.Models[modelName] = modelCopy
+		}
+		result.APIs[apiKey] = apiCopy
+	}
+
+	return result
 }
 
 // ExportUsageStatistics returns a complete usage snapshot for backup/migration.

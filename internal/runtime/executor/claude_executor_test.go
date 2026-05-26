@@ -1433,6 +1433,29 @@ func TestEnsureModelMaxTokens_PreservesExplicitValue(t *testing.T) {
 	}
 }
 
+func TestEnsureModelMaxTokens_CapsExplicitValue(t *testing.T) {
+	reg := registry.GetGlobalRegistry()
+	clientID := "test-claude-cap-max-tokens-client"
+	modelID := "test-claude-cap-max-tokens-model"
+	reg.RegisterClient(clientID, "claude", []*registry.ModelInfo{{
+		ID:                  modelID,
+		Type:                "claude",
+		OwnedBy:             "anthropic",
+		Object:              "model",
+		Created:             time.Now().Unix(),
+		MaxCompletionTokens: 4096,
+		UserDefined:         true,
+	}})
+	defer reg.UnregisterClient(clientID)
+
+	input := []byte(`{"model":"test-claude-cap-max-tokens-model","max_tokens":32000,"messages":[{"role":"user","content":"hi"}]}`)
+	out := ensureModelMaxTokens(input, modelID)
+
+	if got := gjson.GetBytes(out, "max_tokens").Int(); got != 4096 {
+		t.Fatalf("max_tokens = %d, want %d", got, 4096)
+	}
+}
+
 func TestEnsureModelMaxTokens_SkipsUnregisteredModel(t *testing.T) {
 	input := []byte(`{"model":"test-claude-unregistered-model","messages":[{"role":"user","content":"hi"}]}`)
 	out := ensureModelMaxTokens(input, "test-claude-unregistered-model")

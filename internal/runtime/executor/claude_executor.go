@@ -2343,6 +2343,16 @@ func ensureModelMaxTokens(body []byte, modelID string) []byte {
 	}
 
 	if maxTokens := gjson.GetBytes(body, "max_tokens"); maxTokens.Exists() {
+		if maxTokens.Type == gjson.Number {
+			for _, provider := range registry.GetGlobalRegistry().GetModelProviders(strings.TrimSpace(modelID)) {
+				if strings.EqualFold(provider, "claude") {
+					if info := registry.GetGlobalRegistry().GetModelInfo(strings.TrimSpace(modelID), "claude"); info != nil && info.MaxCompletionTokens > 0 && int(maxTokens.Int()) > info.MaxCompletionTokens {
+						body, _ = sjson.SetBytes(body, "max_tokens", info.MaxCompletionTokens)
+					}
+					break
+				}
+			}
+		}
 		return body
 	}
 
