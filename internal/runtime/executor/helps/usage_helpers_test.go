@@ -194,3 +194,29 @@ func TestUsageReporterSetThinkingFromPayload_ClaudeAdaptive(t *testing.T) {
 		t.Fatalf("level = %q, want %q", got, "max")
 	}
 }
+
+func TestParseOpenAIUsage_DeepSeekCustomCache(t *testing.T) {
+	data := []byte(`{"usage":{"prompt_tokens":1000,"completion_tokens":200,"total_tokens":1200,"prompt_cache_hit_tokens":800,"prompt_cache_miss_tokens":200}}`)
+	detail := ParseOpenAIUsage(data)
+	if detail.InputTokens != 1000 {
+		t.Fatalf("input tokens = %d, want 1000", detail.InputTokens)
+	}
+	if detail.CachedTokens != 800 {
+		t.Fatalf("cached tokens = %d, want 800", detail.CachedTokens)
+	}
+}
+
+func TestParseOpenAIStreamUsage_DeepSeekCustomCache(t *testing.T) {
+	line := []byte(`data: {"id":"chatcmpl-test","usage":{"prompt_tokens":1000,"completion_tokens":200,"total_tokens":1200,"prompt_cache_hit_tokens":800,"prompt_cache_miss_tokens":200}}`)
+	detail, ok := ParseOpenAIStreamUsage(line)
+	if !ok {
+		t.Fatal("expected successful stream usage parse")
+	}
+	if detail.InputTokens != 1000 {
+		t.Fatalf("input tokens = %d, want 1000", detail.InputTokens)
+	}
+	if detail.CachedTokens != 800 {
+		t.Fatalf("cached tokens = %d, want 800", detail.CachedTokens)
+	}
+}
+
