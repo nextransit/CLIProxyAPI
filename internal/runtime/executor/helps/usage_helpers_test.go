@@ -71,6 +71,14 @@ func TestParseOpenAIUsageWithPresenceReturnsFalseForEmptyUsageObject(t *testing.
 	}
 }
 
+func TestParseOpenAIUsageWithPresenceReturnsFalseForZeroUsagePlaceholder(t *testing.T) {
+	data := []byte(`{"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}`)
+	detail, ok := ParseOpenAIUsageWithPresence(data)
+	if ok {
+		t.Fatalf("expected no usage detail, got %+v", detail)
+	}
+}
+
 func TestParseOpenAIUsageWithPresenceSupportsResponsesStyleFields(t *testing.T) {
 	data := []byte(`{"usage":{"input_tokens":10,"output_tokens":20,"total_tokens":30,"input_tokens_details":{"cached_tokens":7},"output_tokens_details":{"reasoning_tokens":9}}}`)
 	detail, ok := ParseOpenAIUsageWithPresence(data)
@@ -103,6 +111,13 @@ func TestParseOpenAIStreamUsageIgnoresNullUsage(t *testing.T) {
 
 func TestParseOpenAIStreamUsageIgnoresEmptyUsageObject(t *testing.T) {
 	line := []byte(`data: {"id":"x","usage":{}}`)
+	if detail, ok := ParseOpenAIStreamUsage(line); ok {
+		t.Fatalf("expected no usage detail, got %+v", detail)
+	}
+}
+
+func TestParseOpenAIStreamUsageIgnoresZeroUsagePlaceholder(t *testing.T) {
+	line := []byte(`data: {"id":"x","usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}`)
 	if detail, ok := ParseOpenAIStreamUsage(line); ok {
 		t.Fatalf("expected no usage detail, got %+v", detail)
 	}
@@ -166,6 +181,25 @@ func TestUsageReporterSetThinkingFromPayload_OpenAIReasoningEffort(t *testing.T)
 	}
 }
 
+func TestUsageReporterSetThinkingFromPayload_DisabledReasoningEffort(t *testing.T) {
+	reporter := &UsageReporter{}
+	reporter.SetThinkingFromPayload([]byte(`{"reasoning_effort":"disabled"}`))
+
+	record := reporter.buildRecord(usage.Detail{}, false)
+	if record.Detail.Thinking == nil {
+		t.Fatal("thinking should not be nil")
+	}
+	if got := record.Detail.Thinking.Intensity; got != "none" {
+		t.Fatalf("intensity = %q, want %q", got, "none")
+	}
+	if got := record.Detail.Thinking.Mode; got != "none" {
+		t.Fatalf("mode = %q, want %q", got, "none")
+	}
+	if got := record.Detail.Thinking.Level; got != "none" {
+		t.Fatalf("level = %q, want %q", got, "none")
+	}
+}
+
 func TestUsageReporterSetThinkingFromPayload_GeminiBudget(t *testing.T) {
 	reporter := &UsageReporter{}
 	reporter.SetThinkingFromPayload([]byte(`{"generationConfig":{"thinkingConfig":{"thinkingBudget":8192}}}`))
@@ -219,4 +253,3 @@ func TestParseOpenAIStreamUsage_DeepSeekCustomCache(t *testing.T) {
 		t.Fatalf("cached tokens = %d, want 800", detail.CachedTokens)
 	}
 }
-

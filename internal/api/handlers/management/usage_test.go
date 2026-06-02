@@ -170,3 +170,42 @@ func TestGetUsageStatistics_RestoresSnapshotFromStoreWhenMemoryEmpty(t *testing.
 		t.Fatalf("response usage.total_requests = %d, want 1", got)
 	}
 }
+
+func TestFilterUsageSnapshotByTimeRange(t *testing.T) {
+	now := time.Date(2026, 5, 31, 12, 0, 0, 0, time.UTC)
+	snapshot := usage.StatisticsSnapshot{
+		APIs: map[string]usage.APISnapshot{
+			"test-key": {
+				Models: map[string]usage.ModelSnapshot{
+					"gpt-5.5": {
+						Details: []usage.RequestDetail{
+							{
+								Timestamp: now.Add(-2 * time.Hour),
+								Tokens:    usage.TokenStats{TotalTokens: 100},
+							},
+							{
+								Timestamp: now.Add(-48 * time.Hour),
+								Failed:    true,
+								Tokens:    usage.TokenStats{TotalTokens: 900},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	filtered, ok := filterUsageSnapshotByTimeRange(snapshot, "24h", now)
+	if !ok {
+		t.Fatalf("filter ok = false, want true")
+	}
+	if filtered.TotalRequests != 1 {
+		t.Fatalf("total_requests = %d, want 1", filtered.TotalRequests)
+	}
+	if filtered.TotalTokens != 100 {
+		t.Fatalf("total_tokens = %d, want 100", filtered.TotalTokens)
+	}
+	if filtered.FailureCount != 0 || filtered.SuccessCount != 1 {
+		t.Fatalf("success/failure = %d/%d, want 1/0", filtered.SuccessCount, filtered.FailureCount)
+	}
+}

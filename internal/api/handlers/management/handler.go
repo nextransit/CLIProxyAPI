@@ -19,6 +19,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -50,6 +51,7 @@ type Handler struct {
 	logDir              string
 	postAuthHook        coreauth.PostAuthHook
 	apiKeyPolicyManager *apikeypolicy.Manager
+	textOpsStore        textOpsAnalyticsStore
 }
 
 // NewHandler creates a new management handler instance.
@@ -66,6 +68,15 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		tokenStore:          sdkAuth.GetTokenStore(),
 		allowRemoteOverride: envSecret != "",
 		envSecret:           envSecret,
+	}
+	store, errStore := initTextOpsAnalyticsStoreFromEnv()
+	if errStore != nil {
+		log.WithError(errStore).Warn("management: text_ops analytics store init failed, fallback to in-memory usage snapshot")
+	} else {
+		h.textOpsStore = store
+	}
+	if errPrices := loadModelPricesFromFile(configFilePath); errPrices != nil {
+		log.WithError(errPrices).Warn("management: load model prices failed")
 	}
 	h.startAttemptCleanup()
 	return h
@@ -153,6 +164,11 @@ func (h *Handler) SetPostAuthHook(hook coreauth.PostAuthHook) {
 // SetAPIKeyPolicyManager updates the API key policy runtime manager reference.
 func (h *Handler) SetAPIKeyPolicyManager(manager *apikeypolicy.Manager) {
 	h.apiKeyPolicyManager = manager
+}
+
+// SetTextOpsAnalyticsStore overrides the analytics store used by text-ops.
+func (h *Handler) SetTextOpsAnalyticsStore(store textOpsAnalyticsStore) {
+	h.textOpsStore = store
 }
 
 // Middleware enforces access control for management endpoints.

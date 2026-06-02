@@ -123,6 +123,8 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		}
 	}
 	reporter.SetThinkingFromPayload(translated)
+	translated = normalizeMiniMaxM3Request(translated, baseModel)
+	reporter.SetThinkingFromPayloadIfMissing(translated)
 
 	url := strings.TrimSuffix(baseURL, "/") + endpoint
 
@@ -217,6 +219,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 				if retryResp.StatusCode >= 200 && retryResp.StatusCode < 300 {
 					helps.LogWithRequestID(ctx).Debugf("openai compat executor: 2013 compact retry %d succeeded", retryIdx+1)
 					var param any
+					retryBody = sanitizeOpenAICompatThinkingResponse(baseModel, retryBody)
 					out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, opts.OriginalRequest, compacted, retryBody, &param)
 					resp = cliproxyexecutor.Response{Payload: out, Headers: retryResp.Header.Clone()}
 					return resp, nil
@@ -248,6 +251,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 						if retryResp.StatusCode >= 200 && retryResp.StatusCode < 300 {
 							helps.LogWithRequestID(ctx).Debugf("openai compat executor: 2013 content truncation retry succeeded")
 							var param any
+							retryBody = sanitizeOpenAICompatThinkingResponse(baseModel, retryBody)
 							out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, opts.OriginalRequest, truncated, retryBody, &param)
 							resp = cliproxyexecutor.Response{Payload: out, Headers: retryResp.Header.Clone()}
 							return resp, nil
@@ -266,6 +270,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
 	}
+	body = sanitizeOpenAICompatThinkingResponse(baseModel, body)
 	helps.AppendAPIResponseChunk(ctx, e.cfg, body)
 	if detail, hasUsage := helps.ParseOpenAIUsageWithPresence(body); hasUsage {
 		reporter.Publish(ctx, detail)
@@ -321,11 +326,13 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			return nil, err
 		}
 	}
+	reporter.SetThinkingFromPayload(translated)
+	translated = normalizeMiniMaxM3Request(translated, baseModel)
 
 	// Request usage data in the final streaming chunk so that token statistics
 	// are captured even when the upstream is an OpenAI-compatible provider.
 	translated, _ = sjson.SetBytes(translated, "stream_options.include_usage", true)
-	reporter.SetThinkingFromPayload(translated)
+	reporter.SetThinkingFromPayloadIfMissing(translated)
 
 	url := strings.TrimSuffix(baseURL, "/") + "/chat/completions"
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
@@ -481,6 +488,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		scanner := bufio.NewScanner(httpResp.Body)
 		scanner.Buffer(nil, 52_428_800) // 50MB
 		var param any
+		insideThinkBlock := false
 		estimatedUsage := estimateOpenAICompatPromptUsage(baseModel, translated)
 		for scanner.Scan() {
 			line := scanner.Bytes()
@@ -498,7 +506,11 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 
 			// OpenAI-compatible streams are SSE: lines typically prefixed with "data: ".
 			// Pass through translator; it yields one or more chunks for the target schema.
-			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, bytes.Clone(line), &param)
+			chunkLine := sanitizeOpenAICompatThinkingStreamLine(baseModel, bytes.Clone(line), &insideThinkBlock)
+			if len(chunkLine) == 0 {
+				continue
+			}
+			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, chunkLine, &param)
 			for i := range chunks {
 				select {
 				case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
@@ -578,6 +590,126 @@ func estimateOpenAICompatPromptUsage(model string, translated []byte) cliproxyus
 	}
 }
 
+func sanitizeOpenAICompatThinkingResponse(model string, body []byte) []byte {
+	if !isMiniMaxThinkingTagModel(model) || len(body) == 0 || !gjson.ValidBytes(body) {
+		return body
+	}
+	out := body
+	choices := gjson.GetBytes(body, "choices")
+	if !choices.IsArray() {
+		return body
+	}
+	for choiceIndex, choice := range choices.Array() {
+		out = sanitizeOpenAICompatThinkingStringField(out, choice, fmt.Sprintf("choices.%d.message.content", choiceIndex), "message.content")
+		out = sanitizeOpenAICompatThinkingStringField(out, choice, fmt.Sprintf("choices.%d.delta.content", choiceIndex), "delta.content")
+	}
+	return out
+}
+
+func sanitizeOpenAICompatThinkingStreamLine(model string, line []byte, insideThinkBlock *bool) []byte {
+	if !isMiniMaxThinkingTagModel(model) || len(line) == 0 {
+		return line
+	}
+	prefix := []byte("data:")
+	trimmed := bytes.TrimSpace(line)
+	if !bytes.HasPrefix(trimmed, prefix) {
+		return line
+	}
+	data := bytes.TrimSpace(trimmed[len(prefix):])
+	if bytes.Equal(data, []byte("[DONE]")) {
+		return line
+	}
+	cleaned := sanitizeOpenAICompatThinkingResponseWithState(model, data, insideThinkBlock)
+	if len(cleaned) == 0 || bytes.Equal(cleaned, data) {
+		return line
+	}
+	return append([]byte("data: "), cleaned...)
+}
+
+func sanitizeOpenAICompatThinkingResponseWithState(model string, body []byte, insideThinkBlock *bool) []byte {
+	if !isMiniMaxThinkingTagModel(model) || len(body) == 0 || !gjson.ValidBytes(body) {
+		return body
+	}
+	out := body
+	choices := gjson.GetBytes(body, "choices")
+	if !choices.IsArray() {
+		return body
+	}
+	for choiceIndex, choice := range choices.Array() {
+		out = sanitizeOpenAICompatThinkingStringFieldWithState(out, choice, fmt.Sprintf("choices.%d.message.content", choiceIndex), "message.content", insideThinkBlock)
+		out = sanitizeOpenAICompatThinkingStringFieldWithState(out, choice, fmt.Sprintf("choices.%d.delta.content", choiceIndex), "delta.content", insideThinkBlock)
+	}
+	return out
+}
+
+func sanitizeOpenAICompatThinkingStringField(out []byte, choice gjson.Result, path string, relativePath string) []byte {
+	return sanitizeOpenAICompatThinkingStringFieldWithState(out, choice, path, relativePath, nil)
+}
+
+func sanitizeOpenAICompatThinkingStringFieldWithState(out []byte, choice gjson.Result, path string, relativePath string, insideThinkBlock *bool) []byte {
+	field := choice.Get(relativePath)
+	if !field.Exists() || field.Type != gjson.String {
+		return out
+	}
+	raw := field.String()
+	cleaned := stripThinkTagTextWithState(raw, insideThinkBlock)
+	if cleaned == raw {
+		return out
+	}
+	updated, errSet := sjson.SetBytes(out, path, cleaned)
+	if errSet != nil {
+		return out
+	}
+	return updated
+}
+
+func isMiniMaxThinkingTagModel(model string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(model))
+	return strings.Contains(normalized, "minimax") &&
+		(strings.Contains(normalized, "m2.7") || strings.Contains(normalized, "m2_7") || strings.Contains(normalized, "m3"))
+}
+
+func stripThinkTagText(raw string) string {
+	return stripThinkTagTextWithState(raw, nil)
+}
+
+func stripThinkTagTextWithState(raw string, insideThinkBlock *bool) string {
+	text := strings.TrimSpace(raw)
+	var out strings.Builder
+	for {
+		lower := strings.ToLower(text)
+		if insideThinkBlock != nil && *insideThinkBlock {
+			endOnly := strings.Index(lower, "</think>")
+			if endOnly < 0 {
+				return strings.TrimSpace(out.String())
+			}
+			*insideThinkBlock = false
+			text = strings.TrimSpace(text[endOnly+len("</think>"):])
+			continue
+		}
+		start := strings.Index(lower, "<think>")
+		if start < 0 {
+			if endOnly := strings.Index(lower, "</think>"); endOnly >= 0 {
+				text = strings.TrimSpace(text[endOnly+len("</think>"):])
+				continue
+			}
+			out.WriteString(text)
+			break
+		}
+		out.WriteString(text[:start])
+		end := strings.Index(lower[start+len("<think>"):], "</think>")
+		if end < 0 {
+			if insideThinkBlock != nil {
+				*insideThinkBlock = true
+			}
+			return strings.TrimSpace(out.String())
+		}
+		end = start + len("<think>") + end + len("</think>")
+		text = strings.TrimSpace(text[end:])
+	}
+	return strings.TrimSpace(out.String())
+}
+
 // Refresh is a no-op for API-key based compatibility providers.
 func (e *OpenAICompatExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
 	log.Debugf("openai compat executor: refresh called")
@@ -639,6 +771,50 @@ func (e *OpenAICompatExecutor) overrideModel(payload []byte, model string) []byt
 // thinking-mode conversations, otherwise it returns 400.
 func isDeepSeekModel(model string) bool {
 	return strings.Contains(strings.ToLower(model), "deepseek")
+}
+
+func normalizeMiniMaxM3Request(payload []byte, model string) []byte {
+	if !isMiniMaxM3Model(model) || len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return payload
+	}
+
+	out := payload
+	if effort := gjson.GetBytes(out, "reasoning_effort"); effort.Exists() {
+		thinkingType := "adaptive"
+		value := strings.ToLower(strings.TrimSpace(effort.String()))
+		if value == "none" || value == "disabled" {
+			thinkingType = "disabled"
+		}
+		if updated, errSet := sjson.SetBytes(out, "thinking.type", thinkingType); errSet == nil {
+			out = updated
+		}
+		if updated, errDelete := sjson.DeleteBytes(out, "reasoning_effort"); errDelete == nil {
+			out = updated
+		}
+	}
+
+	thinking := gjson.GetBytes(out, "thinking")
+	if !thinking.Exists() || !thinking.IsObject() || gjson.GetBytes(out, "reasoning_split").Exists() {
+		return out
+	}
+	thinkingType := strings.ToLower(strings.TrimSpace(thinking.Get("type").String()))
+	if thinkingType == "" {
+		thinkingType = "adaptive"
+		if updated, errSet := sjson.SetBytes(out, "thinking.type", thinkingType); errSet == nil {
+			out = updated
+		}
+	}
+	if thinkingType != "disabled" {
+		if updated, errSet := sjson.SetBytes(out, "reasoning_split", true); errSet == nil {
+			out = updated
+		}
+	}
+	return out
+}
+
+func isMiniMaxM3Model(model string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(model))
+	return strings.Contains(normalized, "minimax") && strings.Contains(normalized, "m3")
 }
 
 // ensureDeepSeekReasoningContent ensures assistant messages have reasoning_content present.

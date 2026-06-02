@@ -14,6 +14,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	cliproxyusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
+	"github.com/tidwall/gjson"
 )
 
 type usageProbe struct {
@@ -93,16 +94,81 @@ func TestOpenAICompatExecutorFallbackUsageNonStream(t *testing.T) {
 	}
 }
 
+func TestOpenAICompatExecutorMiniMaxM3UsageThinkingFromClaudeRequest(t *testing.T) {
+	probe := &usageProbe{records: make(chan cliproxyusage.Record, 16)}
+	cliproxyusage.RegisterPlugin(probe)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if gjson.GetBytes(body, "reasoning_effort").Exists() {
+			t.Fatalf("reasoning_effort should be normalized away for MiniMax-M3, body=%s", string(body))
+		}
+		if got := gjson.GetBytes(body, "thinking.type").String(); got != "adaptive" {
+			t.Fatalf("thinking.type = %q, want adaptive, body=%s", got, string(body))
+		}
+		if got := gjson.GetBytes(body, "reasoning_split").Bool(); !got {
+			t.Fatalf("reasoning_split = %v, want true, body=%s", got, string(body))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-x","object":"chat.completion","usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3},"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL + "/v1",
+		"api_key":  "test",
+	}}
+	model := "MiniMax-M3"
+	started := time.Now()
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model: model,
+		Payload: []byte(`{
+			"model":"MiniMax-M3",
+			"max_tokens":128,
+			"thinking":{"type":"adaptive"},
+			"output_config":{"effort":"high"},
+			"messages":[{"role":"user","content":"hello"}]
+		}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+		Stream:       false,
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	record := waitUsageRecord(t, probe.records, "openai-compatibility", model, started)
+	if record.Detail.Thinking == nil {
+		t.Fatal("thinking should not be nil")
+	}
+	if got := record.Detail.Thinking.Intensity; got != "high" {
+		t.Fatalf("thinking intensity = %q, want high", got)
+	}
+	if got := record.Detail.Thinking.Mode; got != "level" {
+		t.Fatalf("thinking mode = %q, want level", got)
+	}
+	if got := record.Detail.Thinking.Level; got != "high" {
+		t.Fatalf("thinking level = %q, want high", got)
+	}
+}
+
 func TestOpenAICompatExecutorFallbackUsageStream(t *testing.T) {
 	probe := &usageProbe{records: make(chan cliproxyusage.Record, 16)}
 	cliproxyusage.RegisterPlugin(probe)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if !gjson.GetBytes(body, "stream_options.include_usage").Bool() {
+			t.Fatalf("stream_options.include_usage should be true, body=%s", string(body))
+		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		flusher, ok := w.(http.Flusher)
 		if !ok {
 			t.Fatalf("response writer does not support flushing")
 		}
+		_, _ = io.WriteString(w, "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"choices\":[],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":0}}\n\n")
+		flusher.Flush()
 		_, _ = io.WriteString(w, "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":null}]}\n\n")
 		flusher.Flush()
 		_, _ = io.WriteString(w, "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")

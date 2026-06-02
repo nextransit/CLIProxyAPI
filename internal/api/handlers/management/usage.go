@@ -3,6 +3,7 @@ package management
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -36,6 +37,9 @@ func (h *Handler) GetUsageStatistics(c *gin.Context) {
 		}
 		snapshot = h.usageStats.Snapshot()
 	}
+	if filtered, ok := filterUsageSnapshotByTimeRange(snapshot, c.Query("time_range"), time.Now().UTC()); ok {
+		snapshot = filtered
+	}
 
 	// Build AuthIndex -> display name mapping
 	displayMap := h.authIndexDisplayMap()
@@ -49,6 +53,96 @@ func (h *Handler) GetUsageStatistics(c *gin.Context) {
 	})
 }
 
+func filterUsageSnapshotByTimeRange(snapshot usage.StatisticsSnapshot, rawRange string, now time.Time) (usage.StatisticsSnapshot, bool) {
+	start, end, ok := resolveUsageSnapshotWindow(rawRange, now)
+	if !ok {
+		return snapshot, false
+	}
+	return filterUsageSnapshotByWindow(snapshot, start, end), true
+}
+
+func resolveUsageSnapshotWindow(rawRange string, now time.Time) (time.Time, time.Time, bool) {
+	key := strings.ToLower(strings.TrimSpace(rawRange))
+	if key == "" || key == "all" {
+		return time.Time{}, time.Time{}, false
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	now = now.UTC()
+	switch key {
+	case "today":
+		return time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC), now, true
+	case "7h":
+		return now.Add(-7 * time.Hour), now, true
+	case "24h":
+		return now.Add(-24 * time.Hour), now, true
+	case "7d":
+		return now.Add(-7 * 24 * time.Hour), now, true
+	case "30d":
+		return now.Add(-30 * 24 * time.Hour), now, true
+	default:
+		return time.Time{}, time.Time{}, false
+	}
+}
+
+func filterUsageSnapshotByWindow(snapshot usage.StatisticsSnapshot, start, end time.Time) usage.StatisticsSnapshot {
+	start = start.UTC()
+	end = end.UTC()
+	result := usage.StatisticsSnapshot{
+		APIs:           make(map[string]usage.APISnapshot),
+		RequestsByDay:  make(map[string]int64),
+		RequestsByHour: make(map[string]int64),
+		TokensByDay:    make(map[string]int64),
+		TokensByHour:   make(map[string]int64),
+	}
+
+	for apiName, apiSnapshot := range snapshot.APIs {
+		apiCopy := usage.APISnapshot{
+			Models: make(map[string]usage.ModelSnapshot),
+		}
+		for modelName, modelSnapshot := range apiSnapshot.Models {
+			modelCopy := usage.ModelSnapshot{
+				Details: make([]usage.RequestDetail, 0, len(modelSnapshot.Details)),
+			}
+			for _, detail := range modelSnapshot.Details {
+				timestamp := detail.Timestamp.UTC()
+				if timestamp.IsZero() || timestamp.Before(start) || timestamp.After(end) {
+					continue
+				}
+				modelCopy.Details = append(modelCopy.Details, detail)
+				modelCopy.TotalRequests++
+				modelCopy.TotalTokens += detail.Tokens.TotalTokens
+				apiCopy.TotalRequests++
+				apiCopy.TotalTokens += detail.Tokens.TotalTokens
+				result.TotalRequests++
+				result.TotalTokens += detail.Tokens.TotalTokens
+				if detail.Failed {
+					result.FailureCount++
+				} else {
+					result.SuccessCount++
+				}
+				dayKey := timestamp.Format("2006-01-02")
+				hourKey := timestamp.Format("15")
+				result.RequestsByDay[dayKey]++
+				result.RequestsByHour[hourKey]++
+				result.TokensByDay[dayKey] += detail.Tokens.TotalTokens
+				result.TokensByHour[hourKey] += detail.Tokens.TotalTokens
+			}
+			if modelCopy.TotalRequests == 0 {
+				continue
+			}
+			apiCopy.Models[modelName] = modelCopy
+		}
+		if apiCopy.TotalRequests == 0 {
+			continue
+		}
+		result.APIs[apiName] = apiCopy
+	}
+
+	return result
+}
+
 // transformUsageSnapshotWithDisplayNames replaces AuthIndex with formatted display names.
 func (h *Handler) transformUsageSnapshotWithDisplayNames(snapshot *usage.StatisticsSnapshot, displayMap map[string]string) *usage.StatisticsSnapshot {
 	if snapshot == nil {
@@ -59,8 +153,8 @@ func (h *Handler) transformUsageSnapshotWithDisplayNames(snapshot *usage.Statist
 	result := &usage.StatisticsSnapshot{
 		TotalRequests:  snapshot.TotalRequests,
 		SuccessCount:   snapshot.SuccessCount,
-		FailureCount:  snapshot.FailureCount,
-		TotalTokens:   snapshot.TotalTokens,
+		FailureCount:   snapshot.FailureCount,
+		TotalTokens:    snapshot.TotalTokens,
 		RequestsByDay:  snapshot.RequestsByDay,
 		RequestsByHour: snapshot.RequestsByHour,
 		TokensByDay:    snapshot.TokensByDay,

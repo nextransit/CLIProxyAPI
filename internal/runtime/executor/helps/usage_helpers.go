@@ -101,6 +101,14 @@ func (r *UsageReporter) SetThinkingFromPayload(payload []byte) {
 	r.thinking = parseThinkingFromPayload(payload)
 }
 
+// SetThinkingFromPayloadIfMissing extracts thinking settings only when none were captured earlier.
+func (r *UsageReporter) SetThinkingFromPayloadIfMissing(payload []byte) {
+	if r == nil || r.thinking != nil {
+		return
+	}
+	r.thinking = parseThinkingFromPayload(payload)
+}
+
 func normalizeUsageDetail(detail usage.Detail) usage.Detail {
 	if detail.TotalTokens == 0 {
 		total := detail.InputTokens + detail.OutputTokens + detail.ReasoningTokens
@@ -280,7 +288,7 @@ func buildThinkingFromEffort(raw string) *usage.Thinking {
 	}
 
 	switch value {
-	case "none":
+	case "none", "disabled":
 		return &usage.Thinking{Intensity: "none", Mode: "none", Level: "none"}
 	case "auto":
 		b := int64(-1)
@@ -459,6 +467,9 @@ func ParseOpenAIUsageWithPresence(data []byte) (usage.Detail, bool) {
 	if reasoning.Exists() {
 		detail.ReasoningTokens = reasoning.Int()
 	}
+	if isZeroUsageDetail(detail) {
+		return usage.Detail{}, false
+	}
 	return detail, true
 }
 
@@ -505,7 +516,18 @@ func ParseOpenAIStreamUsage(line []byte) (usage.Detail, bool) {
 	if reasoning.Exists() {
 		detail.ReasoningTokens = reasoning.Int()
 	}
+	if isZeroUsageDetail(detail) {
+		return usage.Detail{}, false
+	}
 	return detail, true
+}
+
+func isZeroUsageDetail(detail usage.Detail) bool {
+	return detail.InputTokens == 0 &&
+		detail.OutputTokens == 0 &&
+		detail.ReasoningTokens == 0 &&
+		detail.CachedTokens == 0 &&
+		detail.TotalTokens == 0
 }
 
 func ParseClaudeUsage(data []byte) usage.Detail {
