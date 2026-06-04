@@ -1043,6 +1043,40 @@ func assertStatusErr(t *testing.T, err error, want int) {
 	}
 }
 
+func TestClaudeExecutorMiniMax429CarriesRetryAfter(t *testing.T) {
+	body := `{"error":{"message":"usage limit exceeded, 5-hour usage limit reached for Token Plan Max (19834000/19834000 used), resets at 2026-06-04T15:00:00+08:00 (2056)"}}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(body))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "key-123",
+		"base_url": server.URL,
+	}}
+	payload := []byte(`{"model":"MiniMax-M3","messages":[{"role":"user","content":"hi"}]}`)
+
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "MiniMax-M3",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+	})
+	assertStatusErr(t, err, http.StatusTooManyRequests)
+
+	retryable, ok := err.(interface{ RetryAfter() *time.Duration })
+	if !ok {
+		t.Fatalf("error %T does not expose RetryAfter", err)
+	}
+	got := retryable.RetryAfter()
+	if got == nil || *got != 2056*time.Second {
+		t.Fatalf("RetryAfter() = %v, want 2056s", got)
+	}
+}
+
 func TestStripClaudeToolPrefixFromResponse_NestedToolReference(t *testing.T) {
 	input := []byte(`{"content":[{"type":"tool_result","tool_use_id":"toolu_123","content":[{"type":"tool_reference","tool_name":"proxy_mcp__nia__manage_resource"}]}]}`)
 	out := stripClaudeToolPrefixFromResponse(input, "proxy_")

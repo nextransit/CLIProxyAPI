@@ -182,12 +182,35 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
 
-		// Handle 2013 context window exceeded with progressive compaction.
-		// Strategy: strip tools → compact messages → truncate content (last resort).
-		if isContextWindowExceeded(b, httpResp.StatusCode) {
+		// Handle MiniMax 2013 errors with progressive payload reduction.
+		// Strategy: strip tools -> compact messages -> truncate content (last resort).
+		if shouldAttemptOpenAICompat2013Recovery(b, httpResp.StatusCode, baseModel, translated) {
 			compactLevels := []int{5, 3, 1}
-			// Step 0: Strip tools/tool_choice to reduce payload size
 			currentPayload := stripToolsFromPayload(translated)
+			if !bytes.Equal(currentPayload, translated) {
+				helps.LogWithRequestID(ctx).Debugf("openai compat executor: 2013 retry with tools stripped")
+				retryReq, rErr := buildOpenAICompatRetryRequest(ctx, url, apiKey, currentPayload, attrs, false)
+				if rErr == nil {
+					httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+					if retryResp, rErr := httpClient.Do(retryReq); rErr == nil {
+						retryBody, _ := helps.LimitedReadAll(retryResp.Body)
+						if errClose := retryResp.Body.Close(); errClose != nil {
+							log.Errorf("openai compat executor: close 2013 retry response body error: %v", errClose)
+						}
+						if retryResp.StatusCode >= 200 && retryResp.StatusCode < 300 {
+							helps.LogWithRequestID(ctx).Debugf("openai compat executor: 2013 tools-stripped retry succeeded")
+							var param any
+							retryBody = sanitizeOpenAICompatThinkingResponse(baseModel, retryBody)
+							out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, opts.OriginalRequest, currentPayload, retryBody, &param)
+							resp = cliproxyexecutor.Response{Payload: out, Headers: retryResp.Header.Clone()}
+							return resp, nil
+						}
+						if !shouldAttemptOpenAICompat2013Recovery(retryBody, retryResp.StatusCode, baseModel, currentPayload) {
+							helps.LogWithRequestID(ctx).Debugf("openai compat executor: 2013 tools-stripped retry returned non-recoverable status %d", retryResp.StatusCode)
+						}
+					}
+				}
+			}
 
 			// Step 1: Try compacting message count progressively
 		compactLoop:
@@ -198,15 +221,10 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 				}
 				helps.LogWithRequestID(ctx).Debugf("openai compat executor: 2013 compact retry %d/%d to %d messages", retryIdx+1, len(compactLevels), maxItems)
 
-				retryReq, rErr := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(compacted))
+				retryReq, rErr := buildOpenAICompatRetryRequest(ctx, url, apiKey, compacted, attrs, false)
 				if rErr != nil {
 					break
 				}
-				retryReq.Header.Set("Content-Type", "application/json")
-				if apiKey != "" {
-					retryReq.Header.Set("Authorization", "Bearer "+apiKey)
-				}
-				retryReq.Header.Set("User-Agent", "cli-proxy-openai-compat")
 
 				httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 				retryResp, rErr := httpClient.Do(retryReq)
@@ -225,7 +243,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 					return resp, nil
 				}
 
-				if isContextWindowExceeded(retryBody, retryResp.StatusCode) {
+				if shouldAttemptOpenAICompat2013Recovery(retryBody, retryResp.StatusCode, baseModel, compacted) {
 					helps.LogWithRequestID(ctx).Debugf("openai compat executor: 2013 compact retry %d still exceeded, trying harder compaction", retryIdx+1)
 					currentPayload = compacted
 					continue
@@ -237,13 +255,8 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 			helps.LogWithRequestID(ctx).Debugf("openai compat executor: 2013 compact retries exhausted, attempting content truncation")
 			truncated := truncateMessageContent(currentPayload, 128000)
 			if !bytes.Equal(truncated, currentPayload) {
-				retryReq, rErr := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(truncated))
+				retryReq, rErr := buildOpenAICompatRetryRequest(ctx, url, apiKey, truncated, attrs, false)
 				if rErr == nil {
-					retryReq.Header.Set("Content-Type", "application/json")
-					if apiKey != "" {
-						retryReq.Header.Set("Authorization", "Bearer "+apiKey)
-					}
-					retryReq.Header.Set("User-Agent", "cli-proxy-openai-compat")
 					httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 					if retryResp, rErr := httpClient.Do(retryReq); rErr == nil {
 						retryBody, _ := helps.LimitedReadAll(retryResp.Body)
@@ -262,7 +275,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 			helps.LogWithRequestID(ctx).Debugf("openai compat executor: 2013 all recovery strategies exhausted")
 		}
 
-		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
+		err = statusErr{code: httpResp.StatusCode, msg: string(b), retryAfter: helps.ParseRetryAfter(httpResp, b)}
 		return resp, err
 	}
 	body, err := helps.LimitedReadAll(httpResp.Body)
@@ -384,40 +397,61 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			log.Errorf("openai compat executor: close response body error: %v", errClose)
 		}
 
-		// Handle 2013 context window exceeded with progressive compaction for streaming.
-		if isContextWindowExceeded(b, httpResp.StatusCode) {
+		// Handle MiniMax 2013 errors with progressive payload reduction for streaming.
+		if shouldAttemptOpenAICompat2013Recovery(b, httpResp.StatusCode, baseModel, translated) {
+			lastFailureStatus := httpResp.StatusCode
+			lastFailureBody := b
+			lastFailureRetryAfter := helps.ParseRetryAfter(httpResp, b)
 			compactLevels := []int{5, 3, 1}
-			// Step 0: Strip tools/tool_choice to reduce payload size
 			currentPayload := stripToolsFromPayload(translated)
+			if !bytes.Equal(currentPayload, translated) {
+				helps.LogWithRequestID(ctx).Debugf("openai compat executor: 2013 streaming retry with tools stripped")
+				retryReq, rErr := buildOpenAICompatRetryRequest(ctx, url, apiKey, currentPayload, attrs, true)
+				if rErr == nil {
+					httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+					if retryResp, rErr := httpClient.Do(retryReq); rErr == nil {
+						if retryResp.StatusCode >= 200 && retryResp.StatusCode < 300 {
+							helps.LogWithRequestID(ctx).Debugf("openai compat executor: 2013 streaming tools-stripped retry succeeded")
+							httpResp = retryResp
+							translated = currentPayload
+						} else {
+							retryBody, _ := helps.LimitedReadAll(retryResp.Body)
+							lastFailureStatus = retryResp.StatusCode
+							lastFailureBody = retryBody
+							lastFailureRetryAfter = helps.ParseRetryAfter(retryResp, retryBody)
+							if errClose := retryResp.Body.Close(); errClose != nil {
+								log.Errorf("openai compat executor: close 2013 streaming retry response body error: %v", errClose)
+							}
+							if !shouldAttemptOpenAICompat2013Recovery(retryBody, retryResp.StatusCode, baseModel, currentPayload) {
+								helps.LogWithRequestID(ctx).Debugf("openai compat executor: 2013 streaming tools-stripped retry returned non-recoverable status %d", retryResp.StatusCode)
+							}
+						}
+					}
+				}
+			}
 
 			// Step 1: Try compacting message count progressively
 		compactLoop:
 			for retryIdx, maxItems := range compactLevels {
+				if httpResp.StatusCode >= 200 && httpResp.StatusCode < 300 {
+					break compactLoop
+				}
 				compacted := compactMessagesForRetry(currentPayload, maxItems)
 				if bytes.Equal(compacted, currentPayload) {
 					break
 				}
 				helps.LogWithRequestID(ctx).Debugf("openai compat executor: 2013 compact retry %d/%d to %d messages", retryIdx+1, len(compactLevels), maxItems)
 
-				retryReq, rErr := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(compacted))
+				retryReq, rErr := buildOpenAICompatRetryRequest(ctx, url, apiKey, compacted, attrs, true)
 				if rErr != nil {
 					break
 				}
-				retryReq.Header.Set("Content-Type", "application/json")
-				if apiKey != "" {
-					retryReq.Header.Set("Authorization", "Bearer "+apiKey)
-				}
-				retryReq.Header.Set("User-Agent", "cli-proxy-openai-compat")
-				util.ApplyCustomHeadersFromAttrs(retryReq, attrs)
-				retryReq.Header.Set("Accept", "text/event-stream")
-				retryReq.Header.Set("Cache-Control", "no-cache")
 
 				httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 				retryResp, rErr := httpClient.Do(retryReq)
 				if rErr != nil {
 					break
 				}
-				retryBody, _ := helps.LimitedReadAll(retryResp.Body)
 
 				if retryResp.StatusCode >= 200 && retryResp.StatusCode < 300 {
 					helps.LogWithRequestID(ctx).Debugf("openai compat executor: 2013 compact retry %d succeeded", retryIdx+1)
@@ -426,13 +460,21 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 					break compactLoop
 				}
 
-				if isContextWindowExceeded(retryBody, retryResp.StatusCode) {
+				retryBody, _ := helps.LimitedReadAll(retryResp.Body)
+				lastFailureStatus = retryResp.StatusCode
+				lastFailureBody = retryBody
+				lastFailureRetryAfter = helps.ParseRetryAfter(retryResp, retryBody)
+				if shouldAttemptOpenAICompat2013Recovery(retryBody, retryResp.StatusCode, baseModel, compacted) {
 					helps.LogWithRequestID(ctx).Debugf("openai compat executor: 2013 compact retry %d still exceeded, trying harder compaction", retryIdx+1)
 					currentPayload = compacted
-					retryResp.Body.Close()
+					if errClose := retryResp.Body.Close(); errClose != nil {
+						log.Errorf("openai compat executor: close 2013 streaming compact retry response body error: %v", errClose)
+					}
 					continue
 				}
-				retryResp.Body.Close()
+				if errClose := retryResp.Body.Close(); errClose != nil {
+					log.Errorf("openai compat executor: close 2013 streaming compact retry response body error: %v", errClose)
+				}
 				break compactLoop
 			}
 
@@ -441,16 +483,8 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 				helps.LogWithRequestID(ctx).Debugf("openai compat executor: 2013 compact retries exhausted, attempting content truncation")
 				truncated := truncateMessageContent(currentPayload, 128000)
 				if !bytes.Equal(truncated, currentPayload) {
-					retryReq, rErr := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(truncated))
+					retryReq, rErr := buildOpenAICompatRetryRequest(ctx, url, apiKey, truncated, attrs, true)
 					if rErr == nil {
-						retryReq.Header.Set("Content-Type", "application/json")
-						if apiKey != "" {
-							retryReq.Header.Set("Authorization", "Bearer "+apiKey)
-						}
-						retryReq.Header.Set("User-Agent", "cli-proxy-openai-compat")
-						util.ApplyCustomHeadersFromAttrs(retryReq, attrs)
-						retryReq.Header.Set("Accept", "text/event-stream")
-						retryReq.Header.Set("Cache-Control", "no-cache")
 						httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 						if retryResp, rErr := httpClient.Do(retryReq); rErr == nil {
 							if retryResp.StatusCode >= 200 && retryResp.StatusCode < 300 {
@@ -458,7 +492,13 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 								httpResp = retryResp
 								translated = truncated
 							} else {
-								retryResp.Body.Close()
+								retryBody, _ := helps.LimitedReadAll(retryResp.Body)
+								lastFailureStatus = retryResp.StatusCode
+								lastFailureBody = retryBody
+								lastFailureRetryAfter = helps.ParseRetryAfter(retryResp, retryBody)
+								if errClose := retryResp.Body.Close(); errClose != nil {
+									log.Errorf("openai compat executor: close 2013 streaming truncation retry response body error: %v", errClose)
+								}
 							}
 						}
 					}
@@ -468,12 +508,11 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			// If still not successful, log and prepare to return error
 			if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 				helps.LogWithRequestID(ctx).Debugf("openai compat executor: 2013 all recovery strategies exhausted")
-				b, _ := helps.LimitedReadAll(httpResp.Body)
-				err = statusErr{code: httpResp.StatusCode, msg: string(b)}
+				err = statusErr{code: lastFailureStatus, msg: string(lastFailureBody), retryAfter: lastFailureRetryAfter}
 				return nil, err
 			}
 		} else {
-			err = statusErr{code: httpResp.StatusCode, msg: string(b)}
+			err = statusErr{code: httpResp.StatusCode, msg: string(b), retryAfter: helps.ParseRetryAfter(httpResp, b)}
 			return nil, err
 		}
 	}
@@ -815,6 +854,74 @@ func normalizeMiniMaxM3Request(payload []byte, model string) []byte {
 func isMiniMaxM3Model(model string) bool {
 	normalized := strings.ToLower(strings.TrimSpace(model))
 	return strings.Contains(normalized, "minimax") && strings.Contains(normalized, "m3")
+}
+
+func isMiniMaxCompatModel(model string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(model))
+	return strings.Contains(normalized, "minimax")
+}
+
+func buildOpenAICompatRetryRequest(ctx context.Context, url string, apiKey string, payload []byte, attrs map[string]string, stream bool) (*http.Request, error) {
+	retryReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	retryReq.Header.Set("Content-Type", "application/json")
+	if apiKey != "" {
+		retryReq.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	retryReq.Header.Set("User-Agent", "cli-proxy-openai-compat")
+	util.ApplyCustomHeadersFromAttrs(retryReq, attrs)
+	if stream {
+		retryReq.Header.Set("Accept", "text/event-stream")
+		retryReq.Header.Set("Cache-Control", "no-cache")
+	}
+	return retryReq, nil
+}
+
+func shouldAttemptOpenAICompat2013Recovery(body []byte, httpStatusCode int, model string, payload []byte) bool {
+	if isContextWindowExceeded(body, httpStatusCode) {
+		return true
+	}
+	if !isMiniMaxCompatModel(model) || !isMiniMaxAmbiguous2013Error(body, httpStatusCode) {
+		return false
+	}
+	return len(payload) > 1<<20 || hasOpenAICompatTools(payload)
+}
+
+func isMiniMaxAmbiguous2013Error(body []byte, httpStatusCode int) bool {
+	if len(body) == 0 {
+		return false
+	}
+	if httpCode := gjson.GetBytes(body, "http_code"); httpCode.Exists() && httpCode.Int() == 400 {
+		httpStatusCode = 400
+	} else if httpCode := gjson.GetBytes(body, "error.http_code"); httpCode.Exists() && httpCode.Int() == 400 {
+		httpStatusCode = 400
+	}
+	if httpStatusCode != http.StatusBadRequest {
+		return false
+	}
+	for _, path := range []string{"error.code", "code"} {
+		if code := gjson.GetBytes(body, path); code.Exists() && code.Int() == 2013 {
+			return true
+		}
+	}
+	msg := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.message").String()))
+	if msg == "" {
+		msg = strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "message").String()))
+	}
+	return strings.Contains(msg, "2013") && strings.Contains(msg, "invalid params")
+}
+
+func hasOpenAICompatTools(payload []byte) bool {
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return false
+	}
+	tools := gjson.GetBytes(payload, "tools")
+	if tools.IsArray() && len(tools.Array()) > 0 {
+		return true
+	}
+	return gjson.GetBytes(payload, "tool_choice").Exists() || gjson.GetBytes(payload, "tool_functions").Exists()
 }
 
 // ensureDeepSeekReasoningContent ensures assistant messages have reasoning_content present.

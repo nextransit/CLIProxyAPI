@@ -2,12 +2,21 @@ package executor
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
+	"github.com/tidwall/gjson"
 )
 
 func TestIsMiniMaxContextWindowError(t *testing.T) {
@@ -388,5 +397,186 @@ func TestIsContextWindowExceeded(t *testing.T) {
 				t.Errorf("isContextWindowExceeded(%q, %d) = %v, want %v", tt.body, tt.httpStatusCode, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestShouldAttemptOpenAICompat2013RecoveryMiniMaxAmbiguousLargePayload(t *testing.T) {
+	body := []byte(`{"type":"error","error":{"type":"bad_request_error","message":"invalid params, 400 (2013)","http_code":"400"}}`)
+	payload := []byte(`{"model":"MiniMax-M3","messages":[{"role":"user","content":"` + strings.Repeat("x", 1<<20) + `"}]}`)
+
+	if !shouldAttemptOpenAICompat2013Recovery(body, http.StatusBadRequest, "MiniMax-M3", payload) {
+		t.Fatal("expected MiniMax ambiguous 2013 with large payload to trigger recovery")
+	}
+	if shouldAttemptOpenAICompat2013Recovery(body, http.StatusBadRequest, "gpt-test", payload) {
+		t.Fatal("expected non-MiniMax ambiguous 2013 to stay non-recoverable")
+	}
+}
+
+func TestOpenAICompatExecutorMiniMaxAmbiguous2013RetriesStrippedTools(t *testing.T) {
+	var calls int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		call := atomic.AddInt32(&calls, 1)
+		switch call {
+		case 1:
+			if !gjson.GetBytes(body, "tools").Exists() {
+				t.Fatalf("first request should include tools, body=%s", string(body))
+			}
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"type":"error","error":{"type":"bad_request_error","message":"invalid params, 400 (2013)","http_code":"400"}}`))
+		case 2:
+			if gjson.GetBytes(body, "tools").Exists() {
+				t.Fatalf("retry request should strip tools, body=%s", string(body))
+			}
+			if gjson.GetBytes(body, "tool_choice").Exists() {
+				t.Fatalf("retry request should strip tool_choice, body=%s", string(body))
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"chatcmpl-x","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
+		default:
+			t.Fatalf("unexpected retry call %d", call)
+		}
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL + "/v1",
+		"api_key":  "test",
+	}}
+
+	resp, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model: "MiniMax-M3",
+		Payload: []byte(`{
+			"model":"MiniMax-M3",
+			"messages":[{"role":"user","content":"hi"}],
+			"tools":[{"type":"function","function":{"name":"bad_tool","description":"test","parameters":{"type":"object","properties":{}}}}],
+			"tool_choice":"auto"
+		}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai"),
+		Stream:       false,
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if !bytes.Contains(resp.Payload, []byte(`"content":"ok"`)) {
+		t.Fatalf("response payload = %s, want assistant content", string(resp.Payload))
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("calls = %d, want 2", got)
+	}
+}
+
+func TestOpenAICompatExecutorMiniMaxAmbiguous2013StreamRetryKeepsSuccessBody(t *testing.T) {
+	var calls int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		call := atomic.AddInt32(&calls, 1)
+		switch call {
+		case 1:
+			if !gjson.GetBytes(body, "tools").Exists() {
+				t.Fatalf("first request should include tools, body=%s", string(body))
+			}
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"type":"error","error":{"type":"bad_request_error","message":"invalid params, 400 (2013)","http_code":"400"}}`))
+		case 2:
+			if gjson.GetBytes(body, "tools").Exists() {
+				t.Fatalf("retry request should strip tools, body=%s", string(body))
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":null}]}\n\n")
+			_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		default:
+			t.Fatalf("unexpected retry call %d", call)
+		}
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL + "/v1",
+		"api_key":  "test",
+	}}
+
+	stream, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model: "MiniMax-M3",
+		Payload: []byte(`{
+			"model":"MiniMax-M3",
+			"messages":[{"role":"user","content":"hi"}],
+			"tools":[{"type":"function","function":{"name":"bad_tool","description":"test","parameters":{"type":"object","properties":{}}}}],
+			"tool_choice":"auto"
+		}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai"),
+		Stream:       true,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+	var got bytes.Buffer
+	for chunk := range stream.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error: %v", chunk.Err)
+		}
+		got.Write(chunk.Payload)
+	}
+	if !strings.Contains(got.String(), `"content":"ok"`) {
+		t.Fatalf("stream payload = %s, want content chunk", got.String())
+	}
+	if gotCalls := atomic.LoadInt32(&calls); gotCalls != 2 {
+		t.Fatalf("calls = %d, want 2", gotCalls)
+	}
+}
+
+func TestOpenAICompatExecutorMiniMaxAmbiguous2013StreamRetryExhaustedKeepsFailureBody(t *testing.T) {
+	var calls int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		call := atomic.AddInt32(&calls, 1)
+		w.WriteHeader(http.StatusBadRequest)
+		switch call {
+		case 1:
+			if !gjson.GetBytes(body, "tools").Exists() {
+				t.Fatalf("first request should include tools, body=%s", string(body))
+			}
+			_, _ = w.Write([]byte(`{"type":"error","error":{"type":"bad_request_error","message":"initial invalid params, 400 (2013)","http_code":"400"}}`))
+		case 2:
+			if gjson.GetBytes(body, "tools").Exists() {
+				t.Fatalf("retry request should strip tools, body=%s", string(body))
+			}
+			_, _ = w.Write([]byte(`{"type":"error","error":{"type":"bad_request_error","message":"retry still invalid params, 400 (2013)","http_code":"400"}}`))
+		default:
+			t.Fatalf("unexpected retry call %d", call)
+		}
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL + "/v1",
+		"api_key":  "test",
+	}}
+
+	_, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model: "MiniMax-M3",
+		Payload: []byte(`{
+			"model":"MiniMax-M3",
+			"messages":[{"role":"user","content":"hi"}],
+			"tools":[{"type":"function","function":{"name":"bad_tool","description":"test","parameters":{"type":"object","properties":{}}}}],
+			"tool_choice":"auto"
+		}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai"),
+		Stream:       true,
+	})
+	if err == nil {
+		t.Fatal("ExecuteStream() expected error")
+	}
+	if !strings.Contains(err.Error(), "retry still invalid params") {
+		t.Fatalf("ExecuteStream() error = %v, want retry failure body", err)
+	}
+	if gotCalls := atomic.LoadInt32(&calls); gotCalls != 2 {
+		t.Fatalf("calls = %d, want 2", gotCalls)
 	}
 }

@@ -279,7 +279,7 @@ func (e *MiniMaxExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, 
 			helps.LogWithRequestID(ctx).Debugf("minimax executor: retry %d failed with status %d", retryIdx+1, retryResp.StatusCode)
 
 			if !isMiniMaxContextWindowError(retryBody) {
-				err = statusErr{code: retryResp.StatusCode, msg: string(retryBody)}
+				err = statusErr{code: retryResp.StatusCode, msg: string(retryBody), retryAfter: helps.ParseRetryAfter(retryResp, retryBody)}
 				return resp, err
 			}
 
@@ -304,7 +304,7 @@ func (e *MiniMaxExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, 
 					helps.AppendAPIResponseChunk(ctx, e.cfg, truncBody)
 					if !isMiniMaxContextWindowError(truncBody) {
 						if truncResp.StatusCode != http.StatusOK {
-							err = statusErr{code: truncResp.StatusCode, msg: string(truncBody)}
+							err = statusErr{code: truncResp.StatusCode, msg: string(truncBody), retryAfter: helps.ParseRetryAfter(truncResp, truncBody)}
 							return resp, err
 						}
 						filtered := e.filterThinkingBlocks(truncBody)
@@ -328,7 +328,7 @@ func (e *MiniMaxExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, 
 	}
 
 	if httpResp.StatusCode != http.StatusOK {
-		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
+		err = statusErr{code: httpResp.StatusCode, msg: string(b), retryAfter: helps.ParseRetryAfter(httpResp, b)}
 		return
 	}
 
@@ -636,7 +636,7 @@ func (e *MiniMaxExecutor) StreamExecute(ctx context.Context, auth *cliproxyauth.
 	if httpResp.StatusCode != http.StatusOK {
 		b, _ := helps.LimitedReadAll(httpResp.Body)
 		errCh := make(chan cliproxyexecutor.StreamChunk, 1)
-		errCh <- cliproxyexecutor.StreamChunk{Err: statusErr{code: httpResp.StatusCode, msg: string(b)}}
+		errCh <- cliproxyexecutor.StreamChunk{Err: statusErr{code: httpResp.StatusCode, msg: string(b), retryAfter: helps.ParseRetryAfter(httpResp, b)}}
 		close(errCh)
 		return cliproxyexecutor.StreamResult{Chunks: errCh}
 	}
