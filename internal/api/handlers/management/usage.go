@@ -37,7 +37,7 @@ func (h *Handler) GetUsageStatistics(c *gin.Context) {
 		}
 		snapshot = h.usageStats.Snapshot()
 	}
-	if filtered, ok := filterUsageSnapshotByTimeRange(snapshot, c.Query("time_range"), time.Now().UTC()); ok {
+	if filtered, ok := filterUsageSnapshotByTimeRange(snapshot, c.Query("time_range"), time.Now()); ok {
 		snapshot = filtered
 	}
 
@@ -67,12 +67,11 @@ func resolveUsageSnapshotWindow(rawRange string, now time.Time) (time.Time, time
 		return time.Time{}, time.Time{}, false
 	}
 	if now.IsZero() {
-		now = time.Now().UTC()
+		now = time.Now()
 	}
-	now = now.UTC()
 	switch key {
 	case "today":
-		return time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC), now, true
+		return time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location()), now, true
 	case "7h":
 		return now.Add(-7 * time.Hour), now, true
 	case "24h":
@@ -87,8 +86,7 @@ func resolveUsageSnapshotWindow(rawRange string, now time.Time) (time.Time, time
 }
 
 func filterUsageSnapshotByWindow(snapshot usage.StatisticsSnapshot, start, end time.Time) usage.StatisticsSnapshot {
-	start = start.UTC()
-	end = end.UTC()
+	bucketLocation := start.Location()
 	result := usage.StatisticsSnapshot{
 		APIs:           make(map[string]usage.APISnapshot),
 		RequestsByDay:  make(map[string]int64),
@@ -106,7 +104,7 @@ func filterUsageSnapshotByWindow(snapshot usage.StatisticsSnapshot, start, end t
 				Details: make([]usage.RequestDetail, 0, len(modelSnapshot.Details)),
 			}
 			for _, detail := range modelSnapshot.Details {
-				timestamp := detail.Timestamp.UTC()
+				timestamp := detail.Timestamp
 				if timestamp.IsZero() || timestamp.Before(start) || timestamp.After(end) {
 					continue
 				}
@@ -122,8 +120,9 @@ func filterUsageSnapshotByWindow(snapshot usage.StatisticsSnapshot, start, end t
 				} else {
 					result.SuccessCount++
 				}
-				dayKey := timestamp.Format("2006-01-02")
-				hourKey := timestamp.Format("15")
+				bucketTimestamp := timestamp.In(bucketLocation)
+				dayKey := bucketTimestamp.Format("2006-01-02")
+				hourKey := bucketTimestamp.Format("15")
 				result.RequestsByDay[dayKey]++
 				result.RequestsByHour[hourKey]++
 				result.TokensByDay[dayKey] += detail.Tokens.TotalTokens

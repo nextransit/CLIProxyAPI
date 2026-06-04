@@ -71,12 +71,10 @@ prepare_runtime_config() {
       echo "Adjusted proxy-url for local run: host.docker.internal -> ${LOCAL_PROXY_HOST}"
     fi
 
-    # Fix auth-dir: Docker mounts ~/.cliproxyapi to /root/.cliproxyapi in container
-    # On macOS, rewrite /root/.cliproxyapi to user's home, removing /auths suffix
-    if grep -Eq '^[[:space:]]*auth-dir:[[:space:]]*.*/root/.cliproxyapi.*$' "$RUNTIME_CONFIG_PATH"; then
+    if grep -Eq '^[[:space:]]*auth-dir:[[:space:]]*.*/CLIProxyAPI/\.data.*$' "$RUNTIME_CONFIG_PATH"; then
       home_dir="$(eval echo ~)"
-      sed -i '' 's|/root/.cliproxyapi/auths|'"$home_dir"'/.cliproxyapi|g' "$RUNTIME_CONFIG_PATH"
-      echo "Adjusted auth-dir for local run: /root/.cliproxyapi/auths -> ${home_dir}/.cliproxyapi"
+      sed -i '' 's|/CLIProxyAPI/\.data/auths|'"$home_dir"'/.cliproxyapi|g' "$RUNTIME_CONFIG_PATH"
+      echo "Adjusted auth-dir for local run: /CLIProxyAPI/.data/auths -> ${home_dir}/.cliproxyapi"
     fi
   fi
 

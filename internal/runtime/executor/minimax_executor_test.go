@@ -16,9 +16,11 @@ func TestMiniMaxExecutor_IsMiniMaxModel(t *testing.T) {
 		model     string
 		isMiniMax bool
 	}{
+		{"MiniMax-M3", true},
 		{"MiniMax-M2.7", true},
 		{"MiniMax-M2.5", true},
 		{"MiniMax-M2.1", true},
+		{"minimaxai/minimax-m3", true},
 		{"minimaxai/minimax-m2.7", true},
 		{"minimaxai/minimax-m2.5", true},
 		{"MiniMax-M2.7-highspeed", true},

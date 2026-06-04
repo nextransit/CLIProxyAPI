@@ -209,3 +209,49 @@ func TestFilterUsageSnapshotByTimeRange(t *testing.T) {
 		t.Fatalf("success/failure = %d/%d, want 1/0", filtered.SuccessCount, filtered.FailureCount)
 	}
 }
+
+func TestFilterUsageSnapshotByTimeRangeTodayUsesLocalDay(t *testing.T) {
+	localZone := time.FixedZone("Asia/Shanghai", 8*60*60)
+	now := time.Date(2026, 6, 4, 10, 0, 0, 0, localZone)
+	snapshot := usage.StatisticsSnapshot{
+		APIs: map[string]usage.APISnapshot{
+			"test-key": {
+				Models: map[string]usage.ModelSnapshot{
+					"gpt-5.5": {
+						Details: []usage.RequestDetail{
+							{
+								Timestamp: time.Date(2026, 6, 4, 7, 30, 0, 0, localZone),
+								Tokens:    usage.TokenStats{TotalTokens: 100},
+							},
+							{
+								Timestamp: time.Date(2026, 6, 4, 9, 30, 0, 0, localZone),
+								Tokens:    usage.TokenStats{TotalTokens: 200},
+							},
+							{
+								Timestamp: time.Date(2026, 6, 3, 23, 30, 0, 0, localZone),
+								Tokens:    usage.TokenStats{TotalTokens: 900},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	filtered, ok := filterUsageSnapshotByTimeRange(snapshot, "today", now)
+	if !ok {
+		t.Fatalf("filter ok = false, want true")
+	}
+	if filtered.TotalRequests != 2 {
+		t.Fatalf("total_requests = %d, want 2", filtered.TotalRequests)
+	}
+	if filtered.TotalTokens != 300 {
+		t.Fatalf("total_tokens = %d, want 300", filtered.TotalTokens)
+	}
+	if got := filtered.RequestsByDay["2026-06-04"]; got != 2 {
+		t.Fatalf("requests_by_day[2026-06-04] = %d, want 2", got)
+	}
+	if got := filtered.TokensByDay["2026-06-04"]; got != 300 {
+		t.Fatalf("tokens_by_day[2026-06-04] = %d, want 300", got)
+	}
+}

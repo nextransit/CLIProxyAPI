@@ -1123,6 +1123,12 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 								info.MaxCompletionTokens = upstream.MaxCompletionTokens
 							}
 						}
+						if contextLength := m.GetContextLength(); contextLength > 0 {
+							info.ContextLength = contextLength
+						}
+						if maxCompletionTokens := m.GetMaxCompletionTokens(); maxCompletionTokens > 0 {
+							info.MaxCompletionTokens = maxCompletionTokens
+						}
 						ms = append(ms, info)
 					}
 					// Register and return

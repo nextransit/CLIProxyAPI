@@ -521,6 +521,13 @@
             return num.toLocaleString('zh-CN');
         }
 
+        function formatLocalDateKey(date = new Date()) {
+            const year = date.getFullYear();
+            const month = String(date.getMonth() + 1).padStart(2, '0');
+            const day = String(date.getDate()).padStart(2, '0');
+            return `${year}-${month}-${day}`;
+        }
+
         function showError(message) {
             const el = document.getElementById('errorMessage');
             el.textContent = message;
@@ -628,7 +635,7 @@
             document.getElementById('reasoningTokens').textContent = formatNumber(reasoningTokens);
             document.getElementById('cachedTokens').textContent = formatNumber(cachedTokens);
 
-            const today = new Date().toISOString().split('T')[0];
+            const today = formatLocalDateKey();
             const todayRequests = (usage.requests_by_day && usage.requests_by_day[today]) || 0;
             const todayTokens = (usage.tokens_by_day && usage.tokens_by_day[today]) || 0;
             document.getElementById('todayRequests').textContent = formatNumber(todayRequests);
@@ -869,7 +876,7 @@
                 const url = URL.createObjectURL(blob);
                 const a = document.createElement('a');
                 a.href = url;
-                a.download = `usage_statistics_${new Date().toISOString().split('T')[0]}.json`;
+                a.download = `usage_statistics_${formatLocalDateKey()}.json`;
                 document.body.appendChild(a);
                 a.click();
                 document.body.removeChild(a);

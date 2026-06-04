@@ -112,6 +112,96 @@ func TestRegisterModelsForAuth_UnknownModelHasNoStaticMeta(t *testing.T) {
 	}
 }
 
+func TestRegisterModelsForAuth_OpenAICompatibilityModelMetadataOverride(t *testing.T) {
+	service := &Service{
+		cfg: &config.Config{
+			OpenAICompatibility: []config.OpenAICompatibility{{
+				Name: "minimax",
+				Models: []config.OpenAICompatibilityModel{{
+					Name:                "MiniMax-M3",
+					Alias:               "MiniMax-M3",
+					ContextLength:       1000000,
+					MaxCompletionTokens: 32768,
+				}},
+			}},
+		},
+	}
+	auth := &coreauth.Auth{
+		ID:         "auth-openai-compat-meta",
+		Provider:   "openai-compatibility",
+		Status:     coreauth.StatusActive,
+		Label:      "minimax",
+		Attributes: map[string]string{"auth_kind": "api_key"},
+	}
+
+	registry := GlobalModelRegistry()
+	registry.UnregisterClient(auth.ID)
+	t.Cleanup(func() {
+		registry.UnregisterClient(auth.ID)
+	})
+
+	service.registerModelsForAuth(auth)
+
+	models := registry.GetAvailableModelsByProvider("minimax")
+	for _, m := range models {
+		if m == nil || m.ID != "MiniMax-M3" {
+			continue
+		}
+		if m.ContextLength != 1000000 {
+			t.Fatalf("context length = %d, want 1000000", m.ContextLength)
+		}
+		if m.MaxCompletionTokens != 32768 {
+			t.Fatalf("max completion tokens = %d, want 32768", m.MaxCompletionTokens)
+		}
+		return
+	}
+	t.Fatal("expected to find registered model MiniMax-M3")
+}
+
+func TestRegisterModelsForAuth_InheritsMiniMaxM3StaticMetadata(t *testing.T) {
+	service := &Service{
+		cfg: &config.Config{
+			OpenAICompatibility: []config.OpenAICompatibility{{
+				Name: "minimax",
+				Models: []config.OpenAICompatibilityModel{{
+					Name:  "MiniMax-M3",
+					Alias: "MiniMax-M3",
+				}},
+			}},
+		},
+	}
+	auth := &coreauth.Auth{
+		ID:         "auth-minimax-m3-static-meta",
+		Provider:   "openai-compatibility",
+		Status:     coreauth.StatusActive,
+		Label:      "minimax",
+		Attributes: map[string]string{"auth_kind": "api_key"},
+	}
+
+	registry := GlobalModelRegistry()
+	registry.UnregisterClient(auth.ID)
+	t.Cleanup(func() {
+		registry.UnregisterClient(auth.ID)
+	})
+
+	service.registerModelsForAuth(auth)
+
+	models := registry.GetAvailableModelsByProvider("minimax")
+	for _, m := range models {
+		if m == nil || m.ID != "MiniMax-M3" {
+			continue
+		}
+		if m.ContextLength != 1000000 {
+			t.Fatalf("context length = %d, want 1000000", m.ContextLength)
+		}
+		if m.MaxCompletionTokens != 32768 {
+			t.Fatalf("max completion tokens = %d, want 32768", m.MaxCompletionTokens)
+		}
+		return
+	}
+	t.Fatal("expected to find registered model MiniMax-M3")
+}
+
 func TestRegisterModelsForAuth_ClaudeConfigModelKeepsThinkingMetadata(t *testing.T) {
 	service := &Service{
 		cfg: &config.Config{

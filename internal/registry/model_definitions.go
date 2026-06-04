@@ -7,6 +7,7 @@ import (
 )
 
 const codexBuiltinImageModelID = "gpt-image-2"
+const minimaxM3ModelID = "MiniMax-M3"
 
 // staticModelsJSON mirrors the top-level structure of models.json.
 type staticModelsJSON struct {
@@ -94,6 +95,33 @@ func codexBuiltinImageModelInfo() *ModelInfo {
 		Type:        "openai",
 		DisplayName: "GPT Image 2",
 		Version:     codexBuiltinImageModelID,
+	}
+}
+
+func minimaxM3ModelInfo() *ModelInfo {
+	return &ModelInfo{
+		ID:                  minimaxM3ModelID,
+		Object:              "model",
+		OwnedBy:             "minimax",
+		Type:                "minimax",
+		DisplayName:         "MiniMax-M3",
+		Version:             minimaxM3ModelID,
+		Description:         "MiniMax M3",
+		ContextLength:       1000000,
+		MaxCompletionTokens: 32768,
+		Thinking: &ThinkingSupport{
+			Levels: []string{"low", "medium", "high"},
+		},
+	}
+}
+
+func lookupBuiltinStaticModelInfo(modelID string) *ModelInfo {
+	normalized := strings.ToLower(strings.TrimSpace(modelID))
+	switch normalized {
+	case "minimax-m3", "minimax-claude/minimax-m3", "minimax/minimax-m3":
+		return minimaxM3ModelInfo()
+	default:
+		return nil
 	}
 }
 
@@ -196,6 +224,10 @@ func GetStaticModelDefinitionsByChannel(channel string) []*ModelInfo {
 func LookupStaticModelInfo(modelID string) *ModelInfo {
 	if modelID == "" {
 		return nil
+	}
+
+	if model := lookupBuiltinStaticModelInfo(modelID); model != nil {
+		return model
 	}
 
 	data := getModels()

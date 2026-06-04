@@ -27,6 +27,20 @@ func TestCodexStaticModelsIncludeGPT55(t *testing.T) {
 	assertGPT55ModelInfo(t, "lookup", model)
 }
 
+func TestLookupStaticModelInfoIncludesMiniMaxM3(t *testing.T) {
+	model := LookupStaticModelInfo("MiniMax-M3")
+	if model == nil {
+		t.Fatal("expected LookupStaticModelInfo to find MiniMax-M3")
+	}
+	assertMiniMaxM3ModelInfo(t, "lookup", model)
+
+	aliasModel := LookupStaticModelInfo("minimax-claude/MiniMax-M3")
+	if aliasModel == nil {
+		t.Fatal("expected LookupStaticModelInfo to find minimax-claude/MiniMax-M3")
+	}
+	assertMiniMaxM3ModelInfo(t, "alias lookup", aliasModel)
+}
+
 func findModelInfo(models []*ModelInfo, id string) *ModelInfo {
 	for _, model := range models {
 		if model != nil && model.ID == id {
@@ -34,6 +48,26 @@ func findModelInfo(models []*ModelInfo, id string) *ModelInfo {
 		}
 	}
 	return nil
+}
+
+func assertMiniMaxM3ModelInfo(t *testing.T, source string, model *ModelInfo) {
+	t.Helper()
+
+	if model.ID != "MiniMax-M3" {
+		t.Fatalf("%s id mismatch: got %q", source, model.ID)
+	}
+	if model.OwnedBy != "minimax" {
+		t.Fatalf("%s owned_by mismatch: got %q", source, model.OwnedBy)
+	}
+	if model.ContextLength != 1000000 {
+		t.Fatalf("%s context length mismatch: got %d", source, model.ContextLength)
+	}
+	if model.MaxCompletionTokens != 32768 {
+		t.Fatalf("%s max completion tokens mismatch: got %d", source, model.MaxCompletionTokens)
+	}
+	if model.Thinking == nil {
+		t.Fatalf("%s missing thinking support", source)
+	}
 }
 
 func assertGPT55ModelInfo(t *testing.T, source string, model *ModelInfo) {

@@ -53,9 +53,11 @@ func NewMiniMaxExecutor(provider string, cfg *config.Config) *MiniMaxExecutor {
 		cfg:           cfg,
 		maxConcurrent: 3,
 		modelPatterns: []string{
+			"MiniMax-M3",
 			"MiniMax-M2.7",
 			"MiniMax-M2.5",
 			"MiniMax-M2.1",
+			"minimaxai/minimax-m3",
 			"minimaxai/minimax-m2.7",
 			"minimaxai/minimax-m2.5",
 		},

@@ -597,13 +597,21 @@ type OpenAICompatibilityModel struct {
 	// Alias is the model name alias that clients will use to reference this model.
 	Alias string `yaml:"alias" json:"alias"`
 
+	// ContextLength is the effective context window for this model, when known.
+	ContextLength int `yaml:"context-length,omitempty" json:"context_length,omitempty"`
+
+	// MaxCompletionTokens is the maximum output token cap exposed for this model.
+	MaxCompletionTokens int `yaml:"max-completion-tokens,omitempty" json:"max_completion_tokens,omitempty"`
+
 	// Thinking configures the thinking/reasoning capability for this model.
 	// If nil, the model defaults to level-based reasoning with levels ["low", "medium", "high"].
 	Thinking *registry.ThinkingSupport `yaml:"thinking,omitempty" json:"thinking,omitempty"`
 }
 
-func (m OpenAICompatibilityModel) GetName() string  { return m.Name }
-func (m OpenAICompatibilityModel) GetAlias() string { return m.Alias }
+func (m OpenAICompatibilityModel) GetName() string             { return m.Name }
+func (m OpenAICompatibilityModel) GetAlias() string            { return m.Alias }
+func (m OpenAICompatibilityModel) GetContextLength() int       { return m.ContextLength }
+func (m OpenAICompatibilityModel) GetMaxCompletionTokens() int { return m.MaxCompletionTokens }
 
 // LoadConfig reads a YAML configuration file from the given path,
 // unmarshals it into a Config struct, applies environment variable overrides,
