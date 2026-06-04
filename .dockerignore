@@ -23,8 +23,22 @@ config.yaml
 .external/*
 Cli-Proxy-API-Management-Center/*
 
-# Development/editor
-bin/*
+# Pre-built Go binaries left over from local builds
+# (the builder only needs cmd/, internal/, sdk/ and go.mod/go.sum)
+cli-proxy-api
+cliproxy
+CLIProxyAPI-linux
+*.bundle
+nohup.out
+test_file_access.txt
+tmp.txt
+
+# Local build/test scratch
+tmp/*
+test/*
+offline-patches/*
+
+# Editor / agent scratch state
 .vscode/*
 .claude/*
 .codex/*
@@ -37,3 +51,7 @@ bin/*
 .bmad/*
 _bmad/*
 _bmad-output/*
+.playwright-cli/*
+.crush/*
+.sisyphus/*
+.antigravitycli/

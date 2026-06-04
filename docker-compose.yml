@@ -16,7 +16,15 @@ services:
       # Force management panel static path to local custom asset directory.
       MANAGEMENT_STATIC_PATH: /CLIProxyAPI/assets
       # Force usage statistics snapshot to auth dir (mounted volume) for persistence across rebuilds.
-      WRITABLE_PATH: /root/.cliproxyapi
+      WRITABLE_PATH: /CLIProxyAPI/.data
+      # Go runtime tuning: cap the heap so the process does not balloon to several GB
+      # when many concurrent requests allocate short-lived buffers, and trigger GC
+      # more aggressively to keep the resident set small. Cap logical CPU usage so
+      # the GC does not pull every available vCPU under load.
+      # See: https://pkg.go.dev/runtime/debug#SetMemoryLimit
+      GOMEMLIMIT: ${GOMEMLIMIT:-512MiB}
+      GOGC: ${GOGC:-50}
+      GOMAXPROCS: ${GOMAXPROCS:-4}
     ports:
       - "8317:8317"
       - "8085:8085"
@@ -32,6 +40,6 @@ services:
         bind:
           create_host_path: false
       - ${CLI_PROXY_ASSETS_PATH:-./assets}:/CLIProxyAPI/assets
-      - ${CLI_PROXY_AUTH_PATH:-~/.cliproxyapi}:/root/.cliproxyapi
+      - ${CLI_PROXY_AUTH_PATH:-~/.cliproxyapi}:/CLIProxyAPI/.data
       - ${CLI_PROXY_LOG_PATH:-./logs}:/CLIProxyAPI/logs
     restart: unless-stopped
