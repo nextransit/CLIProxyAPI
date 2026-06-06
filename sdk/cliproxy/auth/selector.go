@@ -479,8 +479,9 @@ var sessionPattern = regexp.MustCompile(`_session_([a-f0-9-]+)$`)
 // It extracts session ID from multiple sources and maintains session-to-auth
 // mappings with automatic failover when the bound auth becomes unavailable.
 type SessionAffinitySelector struct {
-	fallback Selector
-	cache    *SessionCache
+	fallback    Selector
+	cache       *SessionCache
+	maxRequests int
 }
 
 // SessionAffinityConfig configures the session affinity selector.
@@ -509,8 +510,9 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 		cfg.TTL = time.Hour
 	}
 	return &SessionAffinitySelector{
-		fallback: cfg.Fallback,
-		cache:    NewSessionCache(cfg.TTL),
+		fallback:    cfg.Fallback,
+		cache:       NewSessionCache(cfg.TTL),
+		maxRequests: cfg.MaxRequests,
 	}
 }
 
@@ -541,21 +543,28 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 
 	cacheKey := provider + "::" + primaryID + "::" + model
 
-	if cachedAuthID, ok := s.cache.GetAndRefresh(cacheKey); ok {
-		for _, auth := range available {
-			if auth.ID == cachedAuthID {
-				entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
-				return auth, nil
+	if cachedAuthID, count, ok := s.cache.GetAndRefresh(cacheKey); ok {
+		// When MaxRequests > 0 and the per-session counter has reached the
+		// threshold, ignore the cached auth and fall through to the fallback
+		// (weighted) selector so the session re-rotates.
+		if s.maxRequests <= 0 || count < s.maxRequests {
+			for _, auth := range available {
+				if auth.ID == cachedAuthID {
+					entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s count=%d", truncateSessionID(primaryID), auth.ID, provider, model, count)
+					return auth, nil
+				}
 			}
+			// Cached auth not available, reselect via fallback selector for even distribution
+			auth, err := s.fallback.Pick(ctx, provider, model, opts, auths)
+			if err != nil {
+				return nil, err
+			}
+			s.cache.Set(cacheKey, auth.ID)
+			entry.Infof("session-affinity: cache hit but auth unavailable, reselected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+			return auth, nil
 		}
-		// Cached auth not available, reselect via fallback selector for even distribution
-		auth, err := s.fallback.Pick(ctx, provider, model, opts, auths)
-		if err != nil {
-			return nil, err
-		}
-		s.cache.Set(cacheKey, auth.ID)
-		entry.Infof("session-affinity: cache hit but auth unavailable, reselected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
-		return auth, nil
+		// count >= maxRequests: deliberately fall through to fallback selector.
+		entry.Infof("session-affinity: rotation threshold reached | session=%s count=%d >= %d, reselecting via weighted selector", truncateSessionID(primaryID), count, s.maxRequests)
 	}
 
 	if fallbackID != "" && fallbackID != primaryID {
