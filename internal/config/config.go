@@ -89,6 +89,12 @@ type Config struct {
 	// Routing controls credential selection behavior.
 	Routing RoutingConfig `yaml:"routing" json:"routing"`
 
+	// SessionAffinityMaxRequests controls how many requests a session can stick to
+	// the same auth before being forced to re-rotate via the weighted selector.
+	// 0 disables the counter and reverts to the legacy "always sticky for the
+	// full TTL" behavior. Default when not set: 20.
+	SessionAffinityMaxRequests int `yaml:"session-affinity-max-requests,omitempty" json:"session-affinity-max-requests,omitempty"`
+
 	// WebsocketAuth enables or disables authentication for the WebSocket API.
 	WebsocketAuth bool `yaml:"ws-auth" json:"ws-auth"`
 
@@ -372,6 +378,11 @@ type ClaudeKey struct {
 	// Higher values are preferred; defaults to 0.
 	Priority int `yaml:"priority,omitempty" json:"priority,omitempty"`
 
+	// Weight controls the selection probability in weighted round-robin.
+	// Higher values increase selection frequency. Defaults to 1.
+	// For example, weight 1:3 means key A is selected 1 time for every 3 times key B is selected.
+	Weight int `yaml:"weight,omitempty" json:"weight,omitempty"`
+
 	// Prefix optionally namespaces models for this credential (e.g., "teamA/claude-sonnet-4").
 	Prefix string `yaml:"prefix,omitempty" json:"prefix,omitempty"`
 
@@ -447,6 +458,11 @@ type CodexKey struct {
 	// Priority controls selection preference when multiple credentials match.
 	// Higher values are preferred; defaults to 0.
 	Priority int `yaml:"priority,omitempty" json:"priority,omitempty"`
+
+	// Weight controls the selection probability in weighted round-robin.
+	// Higher values increase selection frequency. Defaults to 1.
+	// For example, weight 1:3 means key A is selected 1 time for every 3 times key B is selected.
+	Weight int `yaml:"weight,omitempty" json:"weight,omitempty"`
 
 	// Prefix optionally namespaces models for this credential (e.g., "teamA/gpt-5-codex").
 	Prefix string `yaml:"prefix,omitempty" json:"prefix,omitempty"`
