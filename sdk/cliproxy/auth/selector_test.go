@@ -1228,31 +1228,43 @@ func TestSessionCache_GetAndRefresh(t *testing.T) {
 	cache.Set("session1", "auth1")
 
 	// Verify initial value
-	got, ok := cache.GetAndRefresh("session1")
+	got, count, ok := cache.GetAndRefresh("session1")
 	if !ok || got != "auth1" {
 		t.Fatalf("GetAndRefresh() = %q, %v, want auth1, true", got, ok)
+	}
+	if count != 1 {
+		t.Fatalf("GetAndRefresh() count = %d, want 1", count)
 	}
 
 	// Wait half TTL and access again (should refresh)
 	time.Sleep(60 * time.Millisecond)
-	got, ok = cache.GetAndRefresh("session1")
+	got, count, ok = cache.GetAndRefresh("session1")
 	if !ok || got != "auth1" {
 		t.Fatalf("GetAndRefresh() after 60ms = %q, %v, want auth1, true", got, ok)
+	}
+	if count != 2 {
+		t.Fatalf("GetAndRefresh() count after 60ms = %d, want 2", count)
 	}
 
 	// Wait another 60ms (total 120ms from original, but TTL refreshed at 60ms)
 	// Entry should still be valid because TTL was refreshed
 	time.Sleep(60 * time.Millisecond)
-	got, ok = cache.GetAndRefresh("session1")
+	got, count, ok = cache.GetAndRefresh("session1")
 	if !ok || got != "auth1" {
 		t.Fatalf("GetAndRefresh() after refresh = %q, %v, want auth1, true (TTL should have been refreshed)", got, ok)
+	}
+	if count != 3 {
+		t.Fatalf("GetAndRefresh() count after refresh = %d, want 3", count)
 	}
 
 	// Now wait full TTL without access
 	time.Sleep(110 * time.Millisecond)
-	got, ok = cache.GetAndRefresh("session1")
+	got, count, ok = cache.GetAndRefresh("session1")
 	if ok {
 		t.Fatalf("GetAndRefresh() after expiry = %q, %v, want '', false", got, ok)
+	}
+	if count != 0 {
+		t.Fatalf("GetAndRefresh() count after expiry = %d, want 0", count)
 	}
 }
 
