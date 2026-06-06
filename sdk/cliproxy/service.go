@@ -672,9 +672,16 @@ func (s *Service) Run(ctx context.Context) error {
 						ttl = parsed
 					}
 				}
+				maxRequests := 20
+				if s.cfg != nil {
+					if v := s.cfg.SessionAffinityMaxRequests; v > 0 {
+						maxRequests = v
+					}
+				}
 				selector = coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
-					Fallback: selector,
-					TTL:      ttl,
+					Fallback:    selector,
+					TTL:         ttl,
+					MaxRequests: maxRequests,
 				})
 			}
 
