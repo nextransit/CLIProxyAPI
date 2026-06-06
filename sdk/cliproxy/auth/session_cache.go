@@ -5,10 +5,12 @@ import (
 	"time"
 )
 
-// sessionEntry stores auth binding with expiration.
+// sessionEntry stores auth binding with expiration and a per-session request
+// counter used to drive the weighted-rotation policy.
 type sessionEntry struct {
-	authID    string
-	expiresAt time.Time
+	authID       string
+	expiresAt    time.Time
+	requestCount int
 }
 
 // SessionCache provides TTL-based session to auth mapping with automatic cleanup.
@@ -55,40 +57,42 @@ func (c *SessionCache) Get(sessionID string) (string, bool) {
 	return entry.authID, true
 }
 
-// GetAndRefresh retrieves the auth ID bound to a session and refreshes TTL on hit.
-// This extends the binding lifetime for active sessions.
-func (c *SessionCache) GetAndRefresh(sessionID string) (string, bool) {
+// GetAndRefresh retrieves the auth ID bound to a session and refreshes TTL on
+// hit. It also returns the post-increment request count so callers can
+// implement a "rotate after N requests" policy.
+func (c *SessionCache) GetAndRefresh(sessionID string) (authID string, count int, ok bool) {
 	if sessionID == "" {
-		return "", false
+		return "", 0, false
 	}
 	now := time.Now()
 	c.mu.Lock()
-	entry, ok := c.entries[sessionID]
-	if !ok {
-		c.mu.Unlock()
-		return "", false
+	defer c.mu.Unlock()
+	entry, exists := c.entries[sessionID]
+	if !exists {
+		return "", 0, false
 	}
 	if now.After(entry.expiresAt) {
 		delete(c.entries, sessionID)
-		c.mu.Unlock()
-		return "", false
+		return "", 0, false
 	}
-	// Refresh TTL on successful access
+	// Refresh TTL and increment counter atomically.
 	entry.expiresAt = now.Add(c.ttl)
+	entry.requestCount++
 	c.entries[sessionID] = entry
-	c.mu.Unlock()
-	return entry.authID, true
+	return entry.authID, entry.requestCount, true
 }
 
-// Set binds a session to an auth ID with TTL refresh.
+// Set binds a session to an auth ID with TTL refresh. It resets the
+// per-session request counter; the next GetAndRefresh will report count=1.
 func (c *SessionCache) Set(sessionID, authID string) {
 	if sessionID == "" || authID == "" {
 		return
 	}
 	c.mu.Lock()
 	c.entries[sessionID] = sessionEntry{
-		authID:    authID,
-		expiresAt: time.Now().Add(c.ttl),
+		authID:       authID,
+		expiresAt:    time.Now().Add(c.ttl),
+		requestCount: 0,
 	}
 	c.mu.Unlock()
 }
