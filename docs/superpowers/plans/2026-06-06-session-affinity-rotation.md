@@ -348,19 +348,19 @@ Run: `grep -rn "GetAndRefresh" sdk/cliproxy/auth/` and find the existing test th
 
 - [ ] **Step 2: Update the test to use new signature**
 
-For each existing test call like:
+The only direct test of `GetAndRefresh` in the codebase is `TestSessionCache_GetAndRefresh` in `sdk/cliproxy/auth/selector_test.go:1222` (verify with `grep -n "GetAndRefresh" sdk/cliproxy/auth/`). Update every call site in that test from:
 
 ```go
 authID, ok := cache.GetAndRefresh("session-1")
 ```
 
-Replace with:
+to:
 
 ```go
 authID, count, ok := cache.GetAndRefresh("session-1")
 ```
 
-And add an assertion that `count` increments across calls (e.g., `if count != 1 { t.Fatalf("...") }` on first call, `if count != 2 { t.Fatalf("...") }` on second).
+Add an assertion that `count` increments across calls: on the first call assert `count == 1`; on the second assert `count == 2`.
 
 - [ ] **Step 3: Run the test and verify it passes**
 
@@ -459,8 +459,19 @@ func TestSessionAffinity_StickyForNRequests_ThenReselectsViaWeightedSelector(t *
 		t.Fatalf("expected rotation to pick auth-B (only available via fallback) on Nth request, got %s", next.ID)
 	}
 	_ = rec
-	_ = time.Second
 }
+```
+
+Add the missing import to the test file's import block:
+
+```go
+import (
+    "context"
+    "testing"
+    "time"
+
+    cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+)
 ```
 
 - [ ] **Step 2: Run the test and verify it passes**
