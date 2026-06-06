@@ -487,6 +487,9 @@ type SessionAffinitySelector struct {
 type SessionAffinityConfig struct {
 	Fallback Selector
 	TTL      time.Duration
+	// MaxRequests forces a session to re-rotate through the fallback selector
+	// after this many requests. 0 keeps the legacy sticky-until-TTL behavior.
+	MaxRequests int
 }
 
 // NewSessionAffinitySelector creates a new session-aware selector.
