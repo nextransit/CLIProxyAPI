@@ -818,10 +818,12 @@ func normalizeMiniMaxM3Request(payload []byte, model string) []byte {
 	}
 
 	out := payload
+	out = removeMiniMaxM3UnsupportedThinkingFields(out)
+	out = normalizeMiniMaxM3ToolChoice(out)
 	if effort := gjson.GetBytes(out, "reasoning_effort"); effort.Exists() {
 		thinkingType := "adaptive"
 		value := strings.ToLower(strings.TrimSpace(effort.String()))
-		if value == "none" || value == "disabled" {
+		if value == "none" || value == "disabled" || value == "0" {
 			thinkingType = "disabled"
 		}
 		if updated, errSet := sjson.SetBytes(out, "thinking.type", thinkingType); errSet == nil {
@@ -842,9 +844,51 @@ func normalizeMiniMaxM3Request(payload []byte, model string) []byte {
 		if updated, errSet := sjson.SetBytes(out, "thinking.type", thinkingType); errSet == nil {
 			out = updated
 		}
+	} else if thinkingType == "none" || thinkingType == "0" {
+		thinkingType = "disabled"
+		if updated, errSet := sjson.SetBytes(out, "thinking.type", thinkingType); errSet == nil {
+			out = updated
+		}
+	} else if thinkingType != "disabled" && thinkingType != "adaptive" {
+		thinkingType = "adaptive"
+		if updated, errSet := sjson.SetBytes(out, "thinking.type", thinkingType); errSet == nil {
+			out = updated
+		}
 	}
 	if thinkingType != "disabled" {
 		if updated, errSet := sjson.SetBytes(out, "reasoning_split", true); errSet == nil {
+			out = updated
+		}
+	}
+	return out
+}
+
+func normalizeMiniMaxM3ToolChoice(payload []byte) []byte {
+	toolChoiceType := strings.ToLower(strings.TrimSpace(gjson.GetBytes(payload, "tool_choice.type").String()))
+	if toolChoiceType != "any" && toolChoiceType != "tool" {
+		return payload
+	}
+	out, errSet := sjson.SetBytes(payload, "tool_choice.type", "auto")
+	if errSet != nil {
+		return payload
+	}
+	return out
+}
+
+func removeMiniMaxM3UnsupportedThinkingFields(payload []byte) []byte {
+	out := payload
+	for _, path := range []string{"output_config.effort", "thinking.budget_tokens"} {
+		if !gjson.GetBytes(out, path).Exists() {
+			continue
+		}
+		updated, errDelete := sjson.DeleteBytes(out, path)
+		if errDelete != nil {
+			continue
+		}
+		out = updated
+	}
+	if outputConfig := gjson.GetBytes(out, "output_config"); outputConfig.Exists() && outputConfig.IsObject() && len(outputConfig.Map()) == 0 {
+		if updated, errDeleteOutputConfig := sjson.DeleteBytes(out, "output_config"); errDeleteOutputConfig == nil {
 			out = updated
 		}
 	}
@@ -1052,6 +1096,7 @@ type openAICompatToolRepairStats struct {
 	MovedToolMessages           int
 	SynthesizedToolMessages     int
 	DroppedOrphanToolMessages   int
+	PreservedOrphanToolMessages int
 	NormalizedToolContents      int
 	NormalizedToolArguments     int
 	PatchedToolMessageIDs       int
@@ -1064,6 +1109,7 @@ func (s openAICompatToolRepairStats) changed() bool {
 	return s.MovedToolMessages > 0 ||
 		s.SynthesizedToolMessages > 0 ||
 		s.DroppedOrphanToolMessages > 0 ||
+		s.PreservedOrphanToolMessages > 0 ||
 		s.NormalizedToolContents > 0 ||
 		s.NormalizedToolArguments > 0 ||
 		s.PatchedToolMessageIDs > 0 ||
@@ -1113,6 +1159,7 @@ func normalizeOpenAICompatToolMessages(payload []byte) ([]byte, error) {
 		"moved_tool_messages":             stats.MovedToolMessages,
 		"synthesized_tool_messages":       stats.SynthesizedToolMessages,
 		"dropped_orphan_tool_messages":    stats.DroppedOrphanToolMessages,
+		"preserved_orphan_tool_messages":  stats.PreservedOrphanToolMessages,
 		"normalized_tool_contents":        stats.NormalizedToolContents,
 		"normalized_tool_arguments":       stats.NormalizedToolArguments,
 		"patched_tool_message_ids":        stats.PatchedToolMessageIDs,
@@ -1132,6 +1179,7 @@ func normalizeOpenAICompatMessageSequence(rawMessages []json.RawMessage) ([]json
 
 	toolRefs := collectOpenAICompatToolMessageRefs(rawMessages)
 	usedTools := make(map[int]bool)
+	preservedTools := make(map[int]bool)
 	skippedMessages := make(map[int]bool)
 	normalized := make([]json.RawMessage, 0, len(rawMessages))
 
@@ -1142,6 +1190,16 @@ func normalizeOpenAICompatMessageSequence(rawMessages []json.RawMessage) ([]json
 
 		role := openAICompatMessageRole(raw)
 		if role == "tool" {
+			if openAICompatToolMessageReferencedByFutureAssistant(rawMessages, msgIdx, raw) {
+				continue
+			}
+			orphanMessage, ok := convertOpenAICompatOrphanToolMessage(raw)
+			if ok {
+				normalized = append(normalized, orphanMessage)
+				preservedTools[msgIdx] = true
+				stats.PreservedOrphanToolMessages++
+				continue
+			}
 			continue
 		}
 
@@ -1197,12 +1255,69 @@ func normalizeOpenAICompatMessageSequence(rawMessages []json.RawMessage) ([]json
 	}
 
 	for msgIdx, raw := range rawMessages {
-		if openAICompatMessageRole(raw) == "tool" && !usedTools[msgIdx] {
+		if openAICompatMessageRole(raw) == "tool" && !usedTools[msgIdx] && !preservedTools[msgIdx] {
 			stats.DroppedOrphanToolMessages++
 		}
 	}
 
 	return normalized, stats, nil
+}
+
+func openAICompatToolMessageReferencedByFutureAssistant(rawMessages []json.RawMessage, msgIdx int, raw json.RawMessage) bool {
+	ids := openAICompatToolMessageIDs(raw)
+	if len(ids) == 0 {
+		return false
+	}
+	for idx := msgIdx + 1; idx < len(rawMessages); idx++ {
+		if openAICompatMessageRole(rawMessages[idx]) != "assistant" {
+			continue
+		}
+		toolCalls := gjson.GetBytes(rawMessages[idx], "tool_calls")
+		if !toolCalls.IsArray() {
+			continue
+		}
+		for _, toolCall := range toolCalls.Array() {
+			toolCallID := strings.TrimSpace(toolCall.Get("id").String())
+			if toolCallID == "" {
+				toolCallID = strings.TrimSpace(toolCall.Get("call_id").String())
+			}
+			if toolCallID != "" && ids[toolCallID] {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func openAICompatToolMessageIDs(raw json.RawMessage) map[string]bool {
+	ids := make(map[string]bool)
+	for _, id := range []string{
+		strings.TrimSpace(gjson.GetBytes(raw, "tool_call_id").String()),
+		strings.TrimSpace(gjson.GetBytes(raw, "call_id").String()),
+	} {
+		if id != "" {
+			ids[id] = true
+		}
+	}
+	return ids
+}
+
+func convertOpenAICompatOrphanToolMessage(raw json.RawMessage) (json.RawMessage, bool) {
+	content := openAICompatToolMessageContentString(raw)
+	if strings.TrimSpace(content) == "" {
+		return nil, false
+	}
+	toolCallID := strings.TrimSpace(gjson.GetBytes(raw, "tool_call_id").String())
+	if toolCallID == "" {
+		toolCallID = strings.TrimSpace(gjson.GetBytes(raw, "call_id").String())
+	}
+	prefix := "Tool result"
+	if toolCallID != "" {
+		prefix = fmt.Sprintf("Tool result (%s)", toolCallID)
+	}
+	msg := []byte(`{"role":"user","content":""}`)
+	msg, _ = sjson.SetBytes(msg, "content", prefix+":\n"+content)
+	return json.RawMessage(msg), true
 }
 
 func collectOpenAICompatToolMessageRefs(rawMessages []json.RawMessage) map[string][]openAICompatToolMessageRef {
@@ -1464,6 +1579,13 @@ func openAICompatMessageContentString(raw json.RawMessage) string {
 		return strings.Join(parts, "\n")
 	}
 	return openAICompatJSONResultString(content)
+}
+
+func openAICompatToolMessageContentString(raw json.RawMessage) string {
+	if content := gjson.GetBytes(raw, "content"); content.Exists() {
+		return openAICompatMessageContentString(raw)
+	}
+	return openAICompatJSONResultString(gjson.GetBytes(raw, "output"))
 }
 
 func openAICompatJSONResultString(value gjson.Result) string {

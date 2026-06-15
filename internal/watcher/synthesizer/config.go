@@ -67,6 +67,9 @@ func (s *ConfigSynthesizer) synthesizeGeminiKeys(ctx *SynthesisContext) []*corea
 		if entry.Priority != 0 {
 			attrs["priority"] = strconv.Itoa(entry.Priority)
 		}
+		if entry.Weight > 0 {
+			attrs["weight"] = strconv.Itoa(entry.Weight)
+		}
 		if base != "" {
 			attrs["base_url"] = base
 		}
@@ -122,6 +125,9 @@ func (s *ConfigSynthesizer) synthesizeClaudeKeys(ctx *SynthesisContext) []*corea
 		if ck.Priority != 0 {
 			attrs["priority"] = strconv.Itoa(ck.Priority)
 		}
+		if ck.Weight > 0 {
+			attrs["weight"] = strconv.Itoa(ck.Weight)
+		}
 		if base != "" {
 			attrs["base_url"] = base
 		}
@@ -176,6 +182,9 @@ func (s *ConfigSynthesizer) synthesizeCodexKeys(ctx *SynthesisContext) []*coreau
 		}
 		if ck.Priority != 0 {
 			attrs["priority"] = strconv.Itoa(ck.Priority)
+		}
+		if ck.Weight > 0 {
+			attrs["weight"] = strconv.Itoa(ck.Weight)
 		}
 		if ck.BaseURL != "" {
 			attrs["base_url"] = ck.BaseURL

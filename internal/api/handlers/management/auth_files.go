@@ -2739,6 +2739,77 @@ func (h *Handler) GetAuthStatus(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "wait"})
 }
 
+// ResumeAuthFile clears in-memory per-model cooldown and registry-side
+// suspension for an auth so it immediately returns to rotation. Useful when an
+// upstream 404 / 400 / 401 pinned a credential out of rotation but the operator
+// has already fixed the underlying issue and does not want to wait for the
+// cooldown to elapse or restart the service.
+//
+// Body: { "name": "<auth id, auth index, or file name>", "models": ["optional", "model", "list"] }
+//   - name:   required. The auth id (preferred), auth index, or filename to resume.
+//   - models: optional. When provided, only the listed models are reset. When
+//     empty/missing, every per-model cooldown for the auth is cleared.
+func (h *Handler) ResumeAuthFile(c *gin.Context) {
+	if h.authManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
+		return
+	}
+
+	var req struct {
+		Name   string   `json:"name"`
+		Models []string `json:"models"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
+		return
+	}
+
+	// Resolve the auth by id first, then by auth index or filename, mirroring
+	// the existing PatchAuthFileStatus behavior so the management UI can use
+	// stable runtime identifiers.
+	var targetAuth *coreauth.Auth
+	if auth, ok := h.authManager.GetByID(name); ok {
+		targetAuth = auth
+	} else {
+		for _, auth := range h.authManager.List() {
+			if auth.FileName == name || auth.Index == name {
+				targetAuth = auth
+				break
+			}
+		}
+	}
+	if targetAuth == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
+		return
+	}
+
+	cleared, err := h.authManager.ResumeAuthModels(c.Request.Context(), targetAuth.ID, req.Models)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to resume auth: %v", err)})
+		return
+	}
+	if cleared == 0 && len(req.Models) > 0 {
+		c.JSON(http.StatusOK, gin.H{
+			"status":  "ok",
+			"name":    name,
+			"cleared": 0,
+			"message": "no matching model states were present for this auth",
+		})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"status":  "ok",
+		"name":    name,
+		"cleared": cleared,
+	})
+}
+
 // PopulateAuthContext extracts request info and adds it to the context
 func PopulateAuthContext(ctx context.Context, c *gin.Context) context.Context {
 	info := &coreauth.RequestInfo{

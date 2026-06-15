@@ -349,6 +349,81 @@ func (m *Manager) SetSelector(selector Selector) {
 	}
 }
 
+// ResumeAuthModels clears in-memory per-model Unavailable / NextRetryAfter state
+// and the registry-side client suspension for the given auth, so the routing
+// layer immediately retries it instead of waiting for the cooldown to elapse.
+//
+// If models is empty, all per-model state is reset for the auth. Otherwise only
+// the listed models (matched case-insensitively on the canonical model key) are
+// reset. The auth-level Unavailable / NextRetryAfter are recomputed afterwards
+// so other models keep their existing cooldowns.
+//
+// Returns the number of model states that were actually cleared.
+func (m *Manager) ResumeAuthModels(ctx context.Context, authID string, models []string) (int, error) {
+	if m == nil || authID == "" {
+		return 0, nil
+	}
+
+	target := make(map[string]struct{}, len(models))
+	for _, raw := range models {
+		key := strings.ToLower(strings.TrimSpace(raw))
+		if key == "" {
+			continue
+		}
+		target[key] = struct{}{}
+	}
+
+	var (
+		snapshot      *Auth
+		cleared       int
+		clearedModels []string
+	)
+	now := time.Now()
+
+	m.mu.Lock()
+	auth, ok := m.auths[authID]
+	if !ok || auth == nil {
+		m.mu.Unlock()
+		return 0, nil
+	}
+	for modelKey, state := range auth.ModelStates {
+		if state == nil {
+			continue
+		}
+		if len(target) > 0 {
+			key := strings.ToLower(strings.TrimSpace(modelKey))
+			if _, match := target[key]; !match {
+				continue
+			}
+		}
+		resetModelState(state, now)
+		cleared++
+		clearedModels = append(clearedModels, modelKey)
+	}
+	if cleared > 0 {
+		if !hasModelError(auth, now) {
+			auth.LastError = nil
+			auth.StatusMessage = ""
+			auth.Status = StatusActive
+		}
+		auth.UpdatedAt = now
+		updateAggregatedAvailability(auth, now)
+		_ = m.persist(ctx, auth)
+		snapshot = auth.Clone()
+	}
+	m.mu.Unlock()
+
+	if snapshot != nil && m.scheduler != nil {
+		m.scheduler.upsertAuth(snapshot)
+	}
+	// Clear the registry-side suspension snapshot per model so the model is
+	// reported as available immediately, not after the next reconcile.
+	for _, modelKey := range clearedModels {
+		registry.GetGlobalRegistry().ResumeClientModel(authID, modelKey)
+	}
+	return cleared, nil
+}
+
 // SetStore swaps the underlying persistence store.
 func (m *Manager) SetStore(store Store) {
 	m.mu.Lock()
@@ -1131,6 +1206,15 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 				auth.ModelStates = existing.ModelStates
 			}
 		}
+		// If the auth transitioned to a disabled state, drop all session
+		// bindings pointing at it so subsequent requests re-bind to a
+		// healthy key instead of looping through "cache hit but auth
+		// unavailable, reselected" on every call.
+		authJustDisabled := (!existing.Disabled || existing.Status != StatusDisabled) &&
+			(auth.Disabled || auth.Status == StatusDisabled)
+		if authJustDisabled {
+			m.invalidateSelectorBindingsLocked(auth.ID)
+		}
 	}
 	auth.EnsureIndex()
 	authClone := auth.Clone()
@@ -1144,6 +1228,22 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	_ = m.persist(ctx, auth)
 	m.hook.OnAuthUpdated(ctx, auth.Clone())
 	return auth.Clone(), nil
+}
+
+// invalidateSelectorBindingsLocked asks the configured selector to drop any
+// session bindings it holds for the given auth. Currently a no-op for the
+// built-in round-robin / fill-first selectors; the session-affinity selector
+// uses it to release cached bindings when an auth becomes unavailable.
+func (m *Manager) invalidateSelectorBindingsLocked(authID string) {
+	if authID == "" {
+		return
+	}
+	type bindingInvalidator interface {
+		InvalidateAuth(authID string)
+	}
+	if inv, ok := m.selector.(bindingInvalidator); ok && inv != nil {
+		inv.InvalidateAuth(authID)
+	}
 }
 
 // Load resets manager state from the backing store.
@@ -2080,13 +2180,18 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 								shouldSuspendModel = true
 							}
 						case 404:
+							// 404 is treated as a per-model, time-bounded cooldown rather than
+							// a hard client suspension. Most 404s on /v1/responses come from
+							// an upstream that simply does not have the requested model
+							// (e.g. a proxy that exposes only a subset of models), which is
+							// a transient or scope-specific issue, not a credential failure.
+							// A short retry window lets routing fall back quickly when the
+							// upstream regains the model or a different credential succeeds,
+							// without pinning the entire auth out of rotation for 12h.
 							if disableCooling {
 								state.NextRetryAfter = time.Time{}
 							} else {
-								next := now.Add(12 * time.Hour)
-								state.NextRetryAfter = next
-								suspendReason = "not_found"
-								shouldSuspendModel = true
+								state.NextRetryAfter = now.Add(30 * time.Minute)
 							}
 						case 429:
 							var next time.Time
@@ -2128,7 +2233,17 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 
 					auth.Status = StatusError
 					auth.UpdatedAt = now
-					updateAggregatedAvailability(auth, now)
+					// Only aggregate the per-model state into auth-level
+					// availability for failures that should knock the entire
+					// credential out of rotation. A 404 here means the upstream
+					// simply does not expose the requested model, which is a
+					// scope-specific issue, not a credential failure, so we
+					// keep the auth usable for other models.
+					if shouldAggregateAvailability(result.Error) {
+						updateAggregatedAvailability(auth, now)
+					} else {
+						clearAggregatedAvailability(auth)
+					}
 				}
 			} else {
 				applyAuthFailureState(auth, result.Error, result.RetryAfter, now)
@@ -2282,6 +2397,17 @@ func clearAggregatedAvailability(auth *Auth) {
 	auth.Quota = QuotaState{}
 }
 
+// shouldAggregateAvailability reports whether a per-model failure should
+// propagate to auth-level availability. A 404 from an upstream that does not
+// expose the requested model is a model-scope failure, not a credential
+// failure, so the auth must stay available for other models.
+func shouldAggregateAvailability(resultErr *Error) bool {
+	if resultErr == nil {
+		return true
+	}
+	return statusCodeFromResult(resultErr) != http.StatusNotFound
+}
+
 func hasModelError(auth *Auth, now time.Time) bool {
 	if auth == nil || len(auth.ModelStates) == 0 {
 		return false
@@ -2382,17 +2508,33 @@ func isModelSupportErrorMessage(message string) bool {
 	if lower == "" {
 		return false
 	}
+	// Exclusions take precedence: account-type or endpoint-shape messages mention
+	// "not supported" but should NOT trigger 12h client suspension as a model
+	// failure. Routing should still fall through to other auths/upstreams, so we
+	// keep them out of the model-support set.
+	for _, exclusion := range [...]string{
+		"when using codex with a chatgpt account",
+		"chatgpt account",
+	} {
+		if strings.Contains(lower, exclusion) {
+			return false
+		}
+	}
 	patterns := [...]string{
+		// API-style error codes from upstream providers.
 		"model_not_supported",
+		// Clear, request-scoped rejections where the model itself is unavailable.
 		"requested model is not supported",
 		"requested model is unsupported",
 		"requested model is unavailable",
-		"model is not supported",
-		"model not supported",
+		// Provider plans that don't include the requested model.
 		"unsupported model",
 		"model unavailable",
 		"not available for your plan",
 		"not available for your account",
+		// Endpoint-shape restrictions for specific model families.
+		"claude code is not supported on this endpoint",
+		"dedicated anthropic-format endpoint",
 	}
 	for _, pattern := range patterns {
 		if strings.Contains(lower, pattern) {

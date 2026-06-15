@@ -560,5 +560,10 @@ func TestNewProxyAwareWebsocketDialerDirectDisablesProxy(t *testing.T) {
 // headerValueCaseInsensitive looks up a header value in http.Header
 // using case-insensitive key matching.
 func headerValueCaseInsensitive(headers http.Header, key string) string {
-	return headers.Get(key)
+	for existingKey, values := range headers {
+		if strings.EqualFold(existingKey, key) && len(values) > 0 {
+			return values[0]
+		}
+	}
+	return ""
 }

@@ -678,6 +678,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.AmpCode.RestrictManagementToLocalhost = false // Default to false: API key auth is sufficient
 	cfg.RemoteManagement.DisableAutoUpdatePanel = DefaultDisableAutoUpdatePanel
 	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
+	cfg.SessionAffinityMaxRequests = 20
 	if err = yaml.Unmarshal(data, &cfg); err != nil {
 		if optional {
 			// In cloud deploy mode, if YAML parsing fails, return empty config instead of error.
@@ -736,6 +737,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	if cfg.MaxRetryCredentials < 0 {
 		cfg.MaxRetryCredentials = 0
+	}
+	if cfg.SessionAffinityMaxRequests < 0 {
+		cfg.SessionAffinityMaxRequests = 0
 	}
 
 	// Sanitize client API key policy entries and derive the legacy flat key list.

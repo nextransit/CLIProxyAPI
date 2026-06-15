@@ -52,6 +52,7 @@ func ValidateConfig(config ThinkingConfig, modelInfo *registry.ModelInfo, fromFo
 		}
 		return &config, nil
 	}
+	isMiniMaxM3 := IsMiniMaxM3ModelInfo(modelInfo)
 
 	// allowClampUnsupported determines whether to clamp unsupported levels instead of returning an error.
 	// This applies when crossing provider families (e.g., openai→gemini, claude→gemini) and the target
@@ -112,6 +113,9 @@ func ValidateConfig(config ThinkingConfig, modelInfo *registry.ModelInfo, fromFo
 		config.Mode = ModeNone
 		config.Level = ""
 	}
+	if isMiniMaxM3 {
+		config = normalizeMiniMaxM3Config(config)
+	}
 
 	if len(support.Levels) > 0 && config.Mode == ModeLevel {
 		if !isLevelSupported(string(config.Level), support.Levels) {
@@ -139,7 +143,7 @@ func ValidateConfig(config ThinkingConfig, modelInfo *registry.ModelInfo, fromFo
 	}
 
 	// Convert ModeAuto to mid-range if dynamic not allowed
-	if config.Mode == ModeAuto && !support.DynamicAllowed {
+	if config.Mode == ModeAuto && !support.DynamicAllowed && !isMiniMaxM3 {
 		config = convertAutoToMidRange(config, support, toFormat, model)
 	}
 
@@ -207,6 +211,33 @@ func convertAutoToMidRange(config ThinkingConfig, support *registry.ThinkingSupp
 		"original_mode": "auto",
 		"clamped_to":    config.Budget,
 	}).Debug("thinking: mode converted, dynamic not allowed |")
+	return config
+}
+
+func normalizeMiniMaxM3Config(config ThinkingConfig) ThinkingConfig {
+	switch config.Mode {
+	case ModeLevel:
+		value := strings.ToLower(strings.TrimSpace(string(config.Level)))
+		switch value {
+		case "", "none", "disabled", "0":
+			config.Mode = ModeNone
+			config.Budget = 0
+			config.Level = ""
+		default:
+			config.Mode = ModeAuto
+			config.Budget = -1
+			config.Level = ""
+		}
+	case ModeBudget:
+		if config.Budget == 0 {
+			config.Mode = ModeNone
+			config.Level = ""
+			return config
+		}
+		config.Mode = ModeAuto
+		config.Budget = -1
+		config.Level = ""
+	}
 	return config
 }
 
@@ -374,6 +405,19 @@ func isSameProviderFamily(from, to string) bool {
 
 func isUserDefinedWithThinking(modelInfo *registry.ModelInfo) bool {
 	return modelInfo != nil && modelInfo.UserDefined && modelInfo.Thinking != nil
+}
+
+func IsMiniMaxM3ModelInfo(modelInfo *registry.ModelInfo) bool {
+	if modelInfo == nil {
+		return false
+	}
+	modelID := strings.ToLower(strings.TrimSpace(modelInfo.ID))
+	if strings.Contains(modelID, "minimax-m3") {
+		return true
+	}
+	ownedBy := strings.ToLower(strings.TrimSpace(modelInfo.OwnedBy))
+	modelType := strings.ToLower(strings.TrimSpace(modelInfo.Type))
+	return strings.Contains(modelID, "m3") && (ownedBy == "minimax" || modelType == "minimax")
 }
 
 func abs(x int) int {

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	cliproxyusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
@@ -142,14 +143,60 @@ func TestOpenAICompatExecutorMiniMaxM3UsageThinkingFromClaudeRequest(t *testing.
 	if record.Detail.Thinking == nil {
 		t.Fatal("thinking should not be nil")
 	}
-	if got := record.Detail.Thinking.Intensity; got != "high" {
-		t.Fatalf("thinking intensity = %q, want high", got)
+	if got := record.Detail.Thinking.Intensity; got != "auto" {
+		t.Fatalf("thinking intensity = %q, want auto", got)
 	}
-	if got := record.Detail.Thinking.Mode; got != "level" {
-		t.Fatalf("thinking mode = %q, want level", got)
+	if got := record.Detail.Thinking.Mode; got != "auto" {
+		t.Fatalf("thinking mode = %q, want auto", got)
 	}
-	if got := record.Detail.Thinking.Level; got != "high" {
-		t.Fatalf("thinking level = %q, want high", got)
+	if got := record.Detail.Thinking.Level; got != "auto" {
+		t.Fatalf("thinking level = %q, want auto", got)
+	}
+}
+
+func TestOpenAICompatExecutorMiniMaxM3AcceptsXHighReasoningEffort(t *testing.T) {
+	reg := registry.GetGlobalRegistry()
+	clientID := "test-minimax-m3-stale-levels-" + t.Name()
+	reg.RegisterClient(clientID, "minimax", []*registry.ModelInfo{{
+		ID:       "MiniMax-M3",
+		OwnedBy:  "minimax",
+		Type:     "minimax",
+		Thinking: &registry.ThinkingSupport{Levels: []string{"low", "medium", "high"}},
+	}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(clientID)
+	})
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if gjson.GetBytes(body, "reasoning_effort").Exists() {
+			t.Fatalf("reasoning_effort should be normalized away for MiniMax-M3, body=%s", string(body))
+		}
+		if got := gjson.GetBytes(body, "thinking.type").String(); got != "adaptive" {
+			t.Fatalf("thinking.type = %q, want adaptive, body=%s", got, string(body))
+		}
+		if got := gjson.GetBytes(body, "reasoning_split").Bool(); !got {
+			t.Fatalf("reasoning_split = %v, want true, body=%s", got, string(body))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-x","object":"chat.completion","usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3},"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("openai-compatibility", &config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL + "/v1",
+		"api_key":  "test",
+	}}
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "MiniMax-M3",
+		Payload: []byte(`{"model":"MiniMax-M3","messages":[{"role":"user","content":"hello"}],"reasoning_effort":"xhigh"}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai"),
+		Stream:       false,
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
 	}
 }
 

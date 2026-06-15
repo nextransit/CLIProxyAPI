@@ -790,6 +790,11 @@ func buildCodexResponsesWebsocketURL(httpURL string) (string, error) {
 		parsed.Scheme = "ws"
 	case "https":
 		parsed.Scheme = "wss"
+	default:
+		return "", fmt.Errorf("unsupported websocket base URL scheme %q", parsed.Scheme)
+	}
+	if strings.TrimSpace(parsed.Host) == "" {
+		return "", fmt.Errorf("websocket base URL host is empty")
 	}
 	return parsed.String(), nil
 }
@@ -823,6 +828,7 @@ func applyCodexPromptCacheHeaders(from sdktranslator.Format, req cliproxyexecuto
 
 	if cache.ID != "" {
 		rawJSON, _ = sjson.SetBytes(rawJSON, "prompt_cache_key", cache.ID)
+		ensureExactHeader(headers, "session_id", cache.ID)
 		headers.Set("Conversation_id", cache.ID)
 	}
 
@@ -842,13 +848,26 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 		ginHeaders = ginCtx.Request.Header.Clone()
 	}
 
-	_, cfgBetaFeatures := codexHeaderDefaults(cfg, auth)
+	cfgUserAgent, cfgBetaFeatures := codexHeaderDefaults(cfg, auth)
+	isAPIKey := false
+	if auth != nil && auth.Attributes != nil {
+		if v := strings.TrimSpace(auth.Attributes["api_key"]); v != "" {
+			isAPIKey = true
+		}
+	}
+
+	if isAPIKey {
+		ensureHeaderWithPriority(headers, ginHeaders, "User-Agent", "", "")
+	} else {
+		ensureHeaderWithConfigPrecedence(headers, ginHeaders, "User-Agent", cfgUserAgent, codexUserAgent)
+	}
 	ensureHeaderWithPriority(headers, ginHeaders, "x-codex-beta-features", cfgBetaFeatures, "")
 	misc.EnsureHeader(headers, ginHeaders, "x-codex-turn-state", "")
 	misc.EnsureHeader(headers, ginHeaders, "x-codex-turn-metadata", "")
 	misc.EnsureHeader(headers, ginHeaders, "x-client-request-id", "")
 	misc.EnsureHeader(headers, ginHeaders, "x-responsesapi-include-timing-metrics", "")
 	misc.EnsureHeader(headers, ginHeaders, "Version", "")
+	copyHeaderExact(headers, ginHeaders, "session_id")
 
 	betaHeader := strings.TrimSpace(headers.Get("OpenAI-Beta"))
 	if betaHeader == "" && ginHeaders != nil {
@@ -859,16 +878,9 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 	}
 	headers.Set("OpenAI-Beta", betaHeader)
 	if strings.Contains(headers.Get("User-Agent"), "Mac OS") {
-		misc.EnsureHeader(headers, ginHeaders, "Session_id", uuid.NewString())
+		ensureExactHeader(headers, "session_id", uuid.NewString())
 	}
-	headers.Del("User-Agent")
 
-	isAPIKey := false
-	if auth != nil && auth.Attributes != nil {
-		if v := strings.TrimSpace(auth.Attributes["api_key"]); v != "" {
-			isAPIKey = true
-		}
-	}
 	if originator := strings.TrimSpace(ginHeaders.Get("Originator")); originator != "" {
 		headers.Set("Originator", originator)
 	} else if !isAPIKey {
@@ -878,7 +890,7 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 		if auth != nil && auth.Metadata != nil {
 			if accountID, ok := auth.Metadata["account_id"].(string); ok {
 				if trimmed := strings.TrimSpace(accountID); trimmed != "" {
-					headers.Set("Chatgpt-Account-Id", trimmed)
+					ensureExactHeader(headers, "ChatGPT-Account-ID", trimmed)
 				}
 			}
 		}
@@ -891,6 +903,40 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 	util.ApplyCustomHeadersFromAttrs(&http.Request{Header: headers}, attrs)
 
 	return headers
+}
+
+func copyHeaderExact(target http.Header, source http.Header, key string) {
+	if target == nil || source == nil {
+		return
+	}
+	if strings.TrimSpace(headerValueExactOrCanonical(target, key)) != "" {
+		return
+	}
+	if val := strings.TrimSpace(headerValueExactOrCanonical(source, key)); val != "" {
+		ensureExactHeader(target, key, val)
+	}
+}
+
+func ensureExactHeader(headers http.Header, key, value string) {
+	if headers == nil || strings.TrimSpace(value) == "" {
+		return
+	}
+	for existing := range headers {
+		if strings.EqualFold(existing, key) && existing != key {
+			delete(headers, existing)
+		}
+	}
+	headers[key] = []string{value}
+}
+
+func headerValueExactOrCanonical(headers http.Header, key string) string {
+	if headers == nil {
+		return ""
+	}
+	if values, ok := headers[key]; ok && len(values) > 0 {
+		return values[0]
+	}
+	return headers.Get(key)
 }
 
 func codexHeaderDefaults(cfg *config.Config, auth *cliproxyauth.Auth) (string, string) {
@@ -977,22 +1023,65 @@ func parseCodexWebsocketError(payload []byte) (error, bool) {
 	}
 
 	out := []byte(`{}`)
-	if errNode := gjson.GetBytes(payload, "error"); errNode.Exists() {
-		raw := errNode.Raw
-		if errNode.Type == gjson.String {
-			raw = errNode.Raw
+	if bodyNode := gjson.GetBytes(payload, "body"); bodyNode.Exists() {
+		if bodyNode.IsObject() {
+			out, _ = sjson.SetRawBytes(out, "body", []byte(bodyNode.Raw))
+		} else if bodyNode.Type == gjson.String {
+			out, _ = sjson.SetBytes(out, "body", bodyNode.String())
 		}
-		out, _ = sjson.SetRawBytes(out, "error", []byte(raw))
+	}
+	errorNode := gjson.GetBytes(payload, "error")
+	if !errorNode.Exists() {
+		errorNode = gjson.GetBytes(payload, "body.error")
+	}
+	if errorNode.Exists() {
+		if errorNode.IsObject() {
+			out, _ = sjson.SetRawBytes(out, "error", []byte(errorNode.Raw))
+		} else if errorNode.Type == gjson.String {
+			out, _ = sjson.SetBytes(out, "error.message", errorNode.String())
+			out, _ = sjson.SetBytes(out, "error.type", "server_error")
+		}
 	} else {
 		out, _ = sjson.SetBytes(out, "error.type", "server_error")
 		out, _ = sjson.SetBytes(out, "error.message", http.StatusText(status))
 	}
+	out, _ = sjson.SetBytes(out, "status", status)
 
 	headers := parseCodexWebsocketErrorHeaders(payload)
+	retryAfter := parseCodexWebsocketRetryAfter(status, out, headers)
 	return statusErrWithHeaders{
-		statusErr: statusErr{code: status, msg: string(out)},
+		statusErr: statusErr{code: status, msg: string(out), retryAfter: retryAfter},
 		headers:   headers,
 	}, true
+}
+
+func parseCodexWebsocketRetryAfter(status int, body []byte, headers http.Header) *time.Duration {
+	if status != http.StatusTooManyRequests {
+		return nil
+	}
+	for _, path := range []string{"error.code", "body.error.code"} {
+		if strings.TrimSpace(gjson.GetBytes(body, path).String()) == "websocket_connection_limit_reached" {
+			d := time.Duration(0)
+			return &d
+		}
+	}
+	if seconds := gjson.GetBytes(body, "body.error.resets_in_seconds"); seconds.Exists() {
+		d := time.Duration(seconds.Int()) * time.Second
+		return &d
+	}
+	if seconds := gjson.GetBytes(body, "error.resets_in_seconds"); seconds.Exists() {
+		d := time.Duration(seconds.Int()) * time.Second
+		return &d
+	}
+	if headers != nil {
+		if raw := strings.TrimSpace(headers.Get("retry-after")); raw != "" {
+			if seconds, err := strconv.Atoi(raw); err == nil {
+				d := time.Duration(seconds) * time.Second
+				return &d
+			}
+		}
+	}
+	return nil
 }
 
 func parseCodexWebsocketErrorHeaders(payload []byte) http.Header {

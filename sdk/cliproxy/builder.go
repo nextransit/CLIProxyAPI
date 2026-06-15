@@ -64,6 +64,16 @@ type Hooks struct {
 	OnAfterStart func(*Service)
 }
 
+func sessionAffinityMaxRequests(cfg *config.Config) int {
+	if cfg == nil {
+		return 20
+	}
+	if cfg.SessionAffinityMaxRequests < 0 {
+		return 0
+	}
+	return cfg.SessionAffinityMaxRequests
+}
+
 // NewBuilder creates a Builder with default dependencies left unset.
 // Use the fluent interface methods to configure the service before calling Build().
 //
@@ -231,8 +241,9 @@ func (b *Builder) Build() (*Service, error) {
 		// Wrap with session affinity if enabled (failover is always on)
 		if sessionAffinity {
 			selector = coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
-				Fallback: selector,
-				TTL:      sessionAffinityTTL,
+				Fallback:    selector,
+				TTL:         sessionAffinityTTL,
+				MaxRequests: sessionAffinityMaxRequests(b.cfg),
 			})
 		}
 

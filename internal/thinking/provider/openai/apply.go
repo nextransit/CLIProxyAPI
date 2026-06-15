@@ -46,8 +46,8 @@ func (a *Applier) Apply(body []byte, config thinking.ThinkingConfig, modelInfo *
 		return body, nil
 	}
 
-	// Only handle ModeLevel and ModeNone; other modes pass through unchanged.
-	if config.Mode != thinking.ModeLevel && config.Mode != thinking.ModeNone {
+	// Only handle ModeLevel, ModeNone, and dynamic auto models; other modes pass through unchanged.
+	if config.Mode != thinking.ModeLevel && config.Mode != thinking.ModeNone && config.Mode != thinking.ModeAuto {
 		return body, nil
 	}
 
@@ -58,6 +58,23 @@ func (a *Applier) Apply(body []byte, config thinking.ThinkingConfig, modelInfo *
 	if config.Mode == thinking.ModeLevel {
 		result, _ := sjson.SetBytes(body, "reasoning_effort", string(config.Level))
 		return result, nil
+	}
+	if thinking.IsMiniMaxM3ModelInfo(modelInfo) {
+		switch config.Mode {
+		case thinking.ModeAuto:
+			result, _ := sjson.SetBytes(body, "reasoning_effort", string(thinking.LevelAuto))
+			return result, nil
+		case thinking.ModeNone:
+			result, _ := sjson.SetBytes(body, "reasoning_effort", string(thinking.LevelNone))
+			return result, nil
+		}
+	}
+	if config.Mode == thinking.ModeAuto {
+		if modelInfo.Thinking.DynamicAllowed {
+			result, _ := sjson.SetBytes(body, "reasoning_effort", string(thinking.LevelAuto))
+			return result, nil
+		}
+		return body, nil
 	}
 
 	effort := ""

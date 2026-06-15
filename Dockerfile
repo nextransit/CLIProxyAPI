@@ -54,6 +54,6 @@ ENV TZ=Asia/Shanghai
 # A lightweight healthcheck that the orchestrator can use to detect a wedged
 # process without spawning extra binaries inside the container.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD wget -q -O- http://127.0.0.1:8317/v0/management/api-keys >/dev/null 2>&1 || exit 1
+    CMD wget -q -O- http://127.0.0.1:8317/ >/dev/null 2>&1 || exit 1
 
 CMD ["./CLIProxyAPI"]

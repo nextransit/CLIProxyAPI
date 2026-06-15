@@ -47,6 +47,80 @@ func TestParseOpenAIUsageResponses(t *testing.T) {
 	}
 }
 
+func TestParseClaudeUsageIncludesCacheTokensInTotal(t *testing.T) {
+	data := []byte(`{"usage":{"input_tokens":13,"output_tokens":4,"cache_read_input_tokens":22000,"cache_creation_input_tokens":31}}`)
+	detail := ParseClaudeUsage(data)
+	if detail.InputTokens != 13 {
+		t.Fatalf("input tokens = %d, want 13", detail.InputTokens)
+	}
+	if detail.OutputTokens != 4 {
+		t.Fatalf("output tokens = %d, want 4", detail.OutputTokens)
+	}
+	if detail.CachedTokens != 22000 {
+		t.Fatalf("cached tokens = %d, want 22000", detail.CachedTokens)
+	}
+	if detail.TotalTokens != 22048 {
+		t.Fatalf("total tokens = %d, want 22048", detail.TotalTokens)
+	}
+}
+
+func TestParseClaudeStreamUsageIncludesCacheTokensInTotal(t *testing.T) {
+	line := []byte(`data: {"type":"message_delta","usage":{"input_tokens":13,"output_tokens":4,"cache_read_input_tokens":22000,"cache_creation_input_tokens":31}}`)
+	detail, ok := ParseClaudeStreamUsage(line)
+	if !ok {
+		t.Fatal("expected usage detail")
+	}
+	if detail.InputTokens != 13 {
+		t.Fatalf("input tokens = %d, want 13", detail.InputTokens)
+	}
+	if detail.OutputTokens != 4 {
+		t.Fatalf("output tokens = %d, want 4", detail.OutputTokens)
+	}
+	if detail.CachedTokens != 22000 {
+		t.Fatalf("cached tokens = %d, want 22000", detail.CachedTokens)
+	}
+	if detail.TotalTokens != 22048 {
+		t.Fatalf("total tokens = %d, want 22048", detail.TotalTokens)
+	}
+}
+
+func TestParseClaudeStreamUsageReadsMessageStartUsage(t *testing.T) {
+	line := []byte(`data: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":1366,"cache_creation_input_tokens":0}}}`)
+	detail, ok := ParseClaudeStreamUsage(line)
+	if !ok {
+		t.Fatal("expected usage detail")
+	}
+	if detail.CachedTokens != 1366 {
+		t.Fatalf("cached tokens = %d, want 1366", detail.CachedTokens)
+	}
+	if detail.TotalTokens != 1366 {
+		t.Fatalf("total tokens = %d, want 1366", detail.TotalTokens)
+	}
+}
+
+func TestClaudeStreamUsageAccumulatorCombinesStartAndDeltaUsage(t *testing.T) {
+	var accumulator ClaudeStreamUsageAccumulator
+	accumulator.AddLine([]byte(`data: {"type":"message_start","message":{"usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":1366,"cache_creation_input_tokens":0}}}`))
+	accumulator.AddLine([]byte(`data: {"type":"message_delta","usage":{"input_tokens":1252,"output_tokens":213,"cache_read_input_tokens":114,"cache_creation_input_tokens":31}}`))
+
+	detail, ok := accumulator.Detail()
+	if !ok {
+		t.Fatal("expected usage detail")
+	}
+	if detail.InputTokens != 1252 {
+		t.Fatalf("input tokens = %d, want 1252", detail.InputTokens)
+	}
+	if detail.OutputTokens != 213 {
+		t.Fatalf("output tokens = %d, want 213", detail.OutputTokens)
+	}
+	if detail.CachedTokens != 1480 {
+		t.Fatalf("cached tokens = %d, want 1480", detail.CachedTokens)
+	}
+	if detail.TotalTokens != 2976 {
+		t.Fatalf("total tokens = %d, want 2976", detail.TotalTokens)
+	}
+}
+
 func TestParseOpenAIUsageWithPresenceReturnsFalseForMissingUsage(t *testing.T) {
 	data := []byte(`{"id":"resp_1","choices":[{"message":{"content":"hi"}}]}`)
 	detail, ok := ParseOpenAIUsageWithPresence(data)

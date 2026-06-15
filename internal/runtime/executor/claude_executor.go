@@ -167,10 +167,10 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
 	body = ensureModelMaxTokens(body, baseModel)
 
+	body = normalizeMiniMaxM3Request(body, baseModel)
 	// Disable thinking if tool_choice forces tool use (Anthropic API constraint)
 	body = disableThinkingIfToolChoiceForced(body)
 	body = normalizeClaudeTemperatureForThinking(body)
-	body = normalizeMiniMaxM3Request(body, baseModel)
 
 	// Auto-inject cache_control if missing (optimization for ClawdBot/clients without caching support)
 	if countCacheControls(body) == 0 {
@@ -260,11 +260,21 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		err = statusErr{code: httpResp.StatusCode, msg: string(b), retryAfter: helps.ParseRetryAfter(httpResp, b)}
+		recovered := false
+		if shouldAttemptClaudeMiniMax2013Recovery(b, httpResp.StatusCode, baseModel, bodyForUpstream) {
+			if retryResp, retryPayload, ok := e.retryClaudeMiniMax2013Recovery(ctx, auth, url, apiKey, extraBetas, baseModel, bodyForUpstream, false); ok {
+				httpResp = retryResp
+				bodyForTranslation = retryPayload
+				recovered = true
+			}
+		}
 		if errClose := errBody.Close(); errClose != nil {
 			log.Errorf("response body close error: %v", errClose)
 		}
-		return resp, err
+		if !recovered {
+			err = statusErr{code: httpResp.StatusCode, msg: string(b), retryAfter: helps.ParseRetryAfter(httpResp, b)}
+			return resp, err
+		}
 	}
 	decodedBody, err := decodeResponseBody(httpResp.Body, httpResp.Header.Get("Content-Encoding"))
 	if err != nil {
@@ -290,11 +300,13 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 			helps.RecordAPIResponseError(ctx, e.cfg, errValidate)
 			return resp, errValidate
 		}
+		var usageAccumulator helps.ClaudeStreamUsageAccumulator
 		lines := bytes.Split(data, []byte("\n"))
 		for _, line := range lines {
-			if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
-				reporter.Publish(ctx, detail)
-			}
+			usageAccumulator.AddLine(line)
+		}
+		if detail, ok := usageAccumulator.Detail(); ok {
+			reporter.Publish(ctx, detail)
 		}
 	} else {
 		reporter.Publish(ctx, helps.ParseClaudeUsage(data))
@@ -358,10 +370,10 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
 	body = ensureModelMaxTokens(body, baseModel)
 
+	body = normalizeMiniMaxM3Request(body, baseModel)
 	// Disable thinking if tool_choice forces tool use (Anthropic API constraint)
 	body = disableThinkingIfToolChoiceForced(body)
 	body = normalizeClaudeTemperatureForThinking(body)
-	body = normalizeMiniMaxM3Request(body, baseModel)
 
 	// Auto-inject cache_control if missing (optimization for ClawdBot/clients without caching support)
 	if countCacheControls(body) == 0 {
@@ -447,11 +459,21 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
+		recovered := false
+		if shouldAttemptClaudeMiniMax2013Recovery(b, httpResp.StatusCode, baseModel, bodyForUpstream) {
+			if retryResp, retryPayload, ok := e.retryClaudeMiniMax2013Recovery(ctx, auth, url, apiKey, extraBetas, baseModel, bodyForUpstream, true); ok {
+				httpResp = retryResp
+				bodyForTranslation = retryPayload
+				recovered = true
+			}
+		}
 		if errClose := errBody.Close(); errClose != nil {
 			log.Errorf("response body close error: %v", errClose)
 		}
-		err = statusErr{code: httpResp.StatusCode, msg: string(b), retryAfter: helps.ParseRetryAfter(httpResp, b)}
-		return nil, err
+		if !recovered {
+			err = statusErr{code: httpResp.StatusCode, msg: string(b), retryAfter: helps.ParseRetryAfter(httpResp, b)}
+			return nil, err
+		}
 	}
 	decodedBody, err := decodeResponseBody(httpResp.Body, httpResp.Header.Get("Content-Encoding"))
 	if err != nil {
@@ -474,12 +496,16 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		if from == to {
 			scanner := bufio.NewScanner(decodedBody)
 			scanner.Buffer(nil, 52_428_800) // 50MB
+			var usageAccumulator helps.ClaudeStreamUsageAccumulator
+			defer func() {
+				if detail, ok := usageAccumulator.Detail(); ok {
+					reporter.Publish(ctx, detail)
+				}
+			}()
 			for scanner.Scan() {
 				line := scanner.Bytes()
 				helps.AppendAPIResponseChunk(ctx, e.cfg, line)
-				if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
-					reporter.Publish(ctx, detail)
-				}
+				usageAccumulator.AddLine(line)
 				if isClaudeOAuthToken(apiKey) && !auth.ToolPrefixDisabled() {
 					line = stripClaudeToolPrefixFromStreamLine(line, claudeToolPrefix)
 				}
@@ -511,12 +537,16 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		scanner := bufio.NewScanner(decodedBody)
 		scanner.Buffer(nil, 52_428_800) // 50MB
 		var param any
+		var usageAccumulator helps.ClaudeStreamUsageAccumulator
+		defer func() {
+			if detail, ok := usageAccumulator.Detail(); ok {
+				reporter.Publish(ctx, detail)
+			}
+		}()
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
-			if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
-				reporter.Publish(ctx, detail)
-			}
+			usageAccumulator.AddLine(line)
 			if isClaudeOAuthToken(apiKey) && !auth.ToolPrefixDisabled() {
 				line = stripClaudeToolPrefixFromStreamLine(line, claudeToolPrefix)
 			}
@@ -944,6 +974,147 @@ func decodeResponseBody(body io.ReadCloser, contentEncoding string) (io.ReadClos
 		}
 	}
 	return body, nil
+}
+
+func shouldAttemptClaudeMiniMax2013Recovery(body []byte, httpStatusCode int, model string, payload []byte) bool {
+	if !isMiniMaxCompatModel(model) {
+		return false
+	}
+	if isMiniMaxContextWindowError(body) {
+		return true
+	}
+	if !isMiniMaxAmbiguous2013Error(body, httpStatusCode) {
+		return false
+	}
+	return true
+}
+
+func stripClaudeRecoveryTools(payload []byte) []byte {
+	out := stripToolsFromAnthropicPayload(payload)
+	out, err := sjson.DeleteBytes(out, "tool_choice")
+	if err != nil {
+		return payload
+	}
+	return out
+}
+
+func (e *ClaudeExecutor) retryClaudeMiniMax2013Recovery(ctx context.Context, auth *cliproxyauth.Auth, url, apiKey string, extraBetas []string, model string, payload []byte, stream bool) (*http.Response, []byte, bool) {
+	compactLevels := []int{5, 3, 1}
+	currentPayload := stripClaudeRecoveryTools(payload)
+	if !bytes.Equal(currentPayload, payload) {
+		helps.LogWithRequestID(ctx).Debugf("claude executor: MiniMax 2013 retry with tools stripped")
+		if resp, body, ok := e.tryClaudeRecoveryRequest(ctx, auth, url, apiKey, extraBetas, currentPayload, stream); ok {
+			return resp, currentPayload, true
+		} else if shouldAttemptClaudeMiniMax2013Recovery(body, responseStatusCode(resp), model, currentPayload) {
+			if resp != nil {
+				_ = resp.Body.Close()
+			}
+		} else {
+			if resp != nil {
+				_ = resp.Body.Close()
+			}
+			return nil, nil, false
+		}
+	}
+
+	for retryIdx, maxItems := range compactLevels {
+		compacted := compactMessagesForRetry(currentPayload, maxItems)
+		if bytes.Equal(compacted, currentPayload) {
+			break
+		}
+		helps.LogWithRequestID(ctx).Debugf("claude executor: MiniMax 2013 compact retry %d/%d to %d messages", retryIdx+1, len(compactLevels), maxItems)
+		if resp, body, ok := e.tryClaudeRecoveryRequest(ctx, auth, url, apiKey, extraBetas, compacted, stream); ok {
+			return resp, compacted, true
+		} else if shouldAttemptClaudeMiniMax2013Recovery(body, responseStatusCode(resp), model, compacted) {
+			if resp != nil {
+				_ = resp.Body.Close()
+			}
+			currentPayload = compacted
+			continue
+		} else {
+			if resp != nil {
+				_ = resp.Body.Close()
+			}
+			return nil, nil, false
+		}
+	}
+
+	truncated := truncateMessageContent(currentPayload, 128000)
+	if bytes.Equal(truncated, currentPayload) {
+		return nil, nil, false
+	}
+	helps.LogWithRequestID(ctx).Debugf("claude executor: MiniMax 2013 content truncation retry")
+	if resp, _, ok := e.tryClaudeRecoveryRequest(ctx, auth, url, apiKey, extraBetas, truncated, stream); ok {
+		return resp, truncated, true
+	} else if resp != nil {
+		_ = resp.Body.Close()
+	}
+	return nil, nil, false
+}
+
+func (e *ClaudeExecutor) tryClaudeRecoveryRequest(ctx context.Context, auth *cliproxyauth.Auth, url, apiKey string, extraBetas []string, payload []byte, stream bool) (*http.Response, []byte, bool) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		helps.RecordAPIResponseError(ctx, e.cfg, err)
+		return nil, nil, false
+	}
+	applyClaudeHeaders(req, auth, apiKey, stream, extraBetas, e.cfg)
+	var authID, authLabel, authType, authValue string
+	if auth != nil {
+		authID = auth.ID
+		authLabel = auth.Label
+		authType, authValue = auth.AccountInfo()
+	}
+	helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
+		URL:       url,
+		Method:    http.MethodPost,
+		Headers:   req.Header.Clone(),
+		Body:      payload,
+		Provider:  "claude",
+		AuthID:    authID,
+		AuthLabel: authLabel,
+		AuthType:  authType,
+		AuthValue: authValue,
+	})
+
+	httpClient := helps.NewUtlsHTTPClient(e.cfg, auth, 0)
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		helps.RecordAPIResponseError(ctx, e.cfg, err)
+		return nil, nil, false
+	}
+	helps.RecordAPIResponseMetadata(ctx, e.cfg, resp.StatusCode, resp.Header.Clone())
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return resp, nil, true
+	}
+
+	errBody, decErr := decodeResponseBody(resp.Body, resp.Header.Get("Content-Encoding"))
+	if decErr != nil {
+		helps.RecordAPIResponseError(ctx, e.cfg, decErr)
+		if resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		resp.Body = io.NopCloser(bytes.NewReader([]byte(decErr.Error())))
+		return resp, []byte(decErr.Error()), false
+	}
+	body, readErr := helps.LimitedReadAll(errBody)
+	if readErr != nil {
+		helps.RecordAPIResponseError(ctx, e.cfg, readErr)
+		body = []byte(readErr.Error())
+	}
+	helps.AppendAPIResponseChunk(ctx, e.cfg, body)
+	if errClose := errBody.Close(); errClose != nil {
+		log.Errorf("response body close error: %v", errClose)
+	}
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	return resp, body, false
+}
+
+func responseStatusCode(resp *http.Response) int {
+	if resp == nil {
+		return 0
+	}
+	return resp.StatusCode
 }
 
 func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string, stream bool, extraBetas []string, cfg *config.Config) {

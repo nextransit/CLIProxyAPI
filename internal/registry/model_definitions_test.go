@@ -68,6 +68,15 @@ func assertMiniMaxM3ModelInfo(t *testing.T, source string, model *ModelInfo) {
 	if model.Thinking == nil {
 		t.Fatalf("%s missing thinking support", source)
 	}
+	if !model.Thinking.ZeroAllowed {
+		t.Fatalf("%s thinking zero should be allowed", source)
+	}
+	if !model.Thinking.DynamicAllowed {
+		t.Fatalf("%s thinking dynamic should be allowed", source)
+	}
+	if len(model.Thinking.Levels) != 0 {
+		t.Fatalf("%s thinking levels should be empty for MiniMax-M3, got %v", source, model.Thinking.Levels)
+	}
 }
 
 func assertGPT55ModelInfo(t *testing.T, source string, model *ModelInfo) {

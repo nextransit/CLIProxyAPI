@@ -619,11 +619,13 @@ func (s *Service) Run(ctx context.Context) error {
 		previousStrategy := ""
 		var previousSessionAffinity bool
 		var previousSessionAffinityTTL string
+		previousSessionAffinityMaxRequests := 20
 		s.cfgMu.RLock()
 		if s.cfg != nil {
 			previousStrategy = strings.ToLower(strings.TrimSpace(s.cfg.Routing.Strategy))
 			previousSessionAffinity = s.cfg.Routing.SessionAffinity
 			previousSessionAffinityTTL = s.cfg.Routing.SessionAffinityTTL
+			previousSessionAffinityMaxRequests = sessionAffinityMaxRequests(s.cfg)
 		}
 		s.cfgMu.RUnlock()
 
@@ -651,10 +653,12 @@ func (s *Service) Run(ctx context.Context) error {
 
 		nextSessionAffinity := newCfg.Routing.SessionAffinity
 		nextSessionAffinityTTL := newCfg.Routing.SessionAffinityTTL
+		nextSessionAffinityMaxRequests := sessionAffinityMaxRequests(newCfg)
 
 		selectorChanged := previousStrategy != nextStrategy ||
 			previousSessionAffinity != nextSessionAffinity ||
-			previousSessionAffinityTTL != nextSessionAffinityTTL
+			previousSessionAffinityTTL != nextSessionAffinityTTL ||
+			previousSessionAffinityMaxRequests != nextSessionAffinityMaxRequests
 
 		if s.coreManager != nil && selectorChanged {
 			var selector coreauth.Selector
@@ -672,16 +676,10 @@ func (s *Service) Run(ctx context.Context) error {
 						ttl = parsed
 					}
 				}
-				maxRequests := 20
-				if s.cfg != nil {
-					if v := s.cfg.SessionAffinityMaxRequests; v > 0 {
-						maxRequests = v
-					}
-				}
 				selector = coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
 					Fallback:    selector,
 					TTL:         ttl,
-					MaxRequests: maxRequests,
+					MaxRequests: nextSessionAffinityMaxRequests,
 				})
 			}
 

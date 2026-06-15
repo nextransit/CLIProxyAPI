@@ -90,6 +90,10 @@ func fetchURLContent(rawURL string) (string, error) {
 		return "", fmt.Errorf("refusing to fetch URL from local or private network: %s", rawURL)
 	}
 
+	return fetchURLContentWithoutSSRFCheck(rawURL)
+}
+
+func fetchURLContentWithoutSSRFCheck(rawURL string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 

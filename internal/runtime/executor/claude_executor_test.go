@@ -22,6 +22,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+	cliproxyusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -1077,6 +1078,138 @@ func TestClaudeExecutorMiniMax429CarriesRetryAfter(t *testing.T) {
 	}
 }
 
+func TestClaudeExecutorMiniMaxM3Ambiguous2013RetriesWithoutTools(t *testing.T) {
+	var calls int
+	var retryBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		calls++
+		switch calls {
+		case 1:
+			if !gjson.GetBytes(body, "tools").Exists() {
+				t.Fatalf("first request should include tools, body=%s", string(body))
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"type":"bad_request_error","message":"invalid params, 400 (2013)","http_code":"400"}}`))
+		case 2:
+			retryBody = bytes.Clone(body)
+			if gjson.GetBytes(body, "tools").Exists() {
+				t.Fatalf("retry request should strip tools, body=%s", string(body))
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"MiniMax-M3","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+		default:
+			t.Fatalf("unexpected call %d", calls)
+		}
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "key-123",
+		"base_url": server.URL,
+	}}
+	payload := []byte(`{
+		"model":"MiniMax-M3",
+		"messages":[{"role":"user","content":"hi"}],
+		"tools":[{"name":"Bash","description":"run shell command","input_schema":{"type":"object","properties":{"command":{"type":"string"}}}}],
+		"tool_choice":{"type":"auto"}
+	}`)
+
+	resp, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "minimax-claude/MiniMax-M3",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if got := calls; got != 2 {
+		t.Fatalf("calls = %d, want 2", got)
+	}
+	if len(retryBody) == 0 {
+		t.Fatal("expected retry request body")
+	}
+	if !bytes.Contains(resp.Payload, []byte(`"text":"ok"`)) {
+		t.Fatalf("response payload = %s, want MiniMax response", string(resp.Payload))
+	}
+}
+
+func TestClaudeExecutorMiniMaxM3Ambiguous2013StreamRetriesWithoutTools(t *testing.T) {
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		calls++
+		switch calls {
+		case 1:
+			if !gjson.GetBytes(body, "tools").Exists() {
+				t.Fatalf("first request should include tools, body=%s", string(body))
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"type":"bad_request_error","message":"invalid params, 400 (2013)","http_code":"400"}}`))
+		case 2:
+			if gjson.GetBytes(body, "tools").Exists() {
+				t.Fatalf("retry request should strip tools, body=%s", string(body))
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, strings.Join([]string{
+				`event: message_start`,
+				`data: {"type":"message_start","message":{"id":"msg_1","model":"MiniMax-M3"}}`,
+				`event: content_block_delta`,
+				`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}`,
+				`event: message_delta`,
+				`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":1,"output_tokens":1}}`,
+				`event: message_stop`,
+				`data: {"type":"message_stop"}`,
+				``,
+			}, "\n"))
+		default:
+			t.Fatalf("unexpected call %d", calls)
+		}
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "key-123",
+		"base_url": server.URL,
+	}}
+	payload := []byte(`{
+		"model":"MiniMax-M3",
+		"messages":[{"role":"user","content":"hi"}],
+		"tools":[{"name":"Bash","description":"run shell command","input_schema":{"type":"object","properties":{"command":{"type":"string"}}}}],
+		"tool_choice":{"type":"auto"},
+		"stream":true
+	}`)
+
+	stream, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "minimax-claude/MiniMax-M3",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+		Stream:       true,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+	var got bytes.Buffer
+	for chunk := range stream.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error: %v", chunk.Err)
+		}
+		got.Write(chunk.Payload)
+	}
+	if calls != 2 {
+		t.Fatalf("calls = %d, want 2", calls)
+	}
+	if !strings.Contains(got.String(), `"text":"ok"`) {
+		t.Fatalf("stream payload = %s, want text delta", got.String())
+	}
+}
+
 func TestClaudeExecutorMiniMaxM3AddsReasoningSplitForThinking(t *testing.T) {
 	var seenBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1108,6 +1241,237 @@ func TestClaudeExecutorMiniMaxM3AddsReasoningSplitForThinking(t *testing.T) {
 	}
 	if got := gjson.GetBytes(seenBody, "reasoning_split").Bool(); !got {
 		t.Fatalf("reasoning_split = %v, want true; body=%s", got, string(seenBody))
+	}
+}
+
+func TestClaudeExecutorMiniMaxM3RemovesOutputConfigEffort(t *testing.T) {
+	var seenBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		seenBody = bytes.Clone(body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(strings.Join([]string{
+			`event: message_start`,
+			`data: {"type":"message_start","message":{"id":"msg_1","model":"MiniMax-M3"}}`,
+			`event: content_block_delta`,
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}`,
+			`event: message_delta`,
+			`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":1,"output_tokens":1}}`,
+			`event: message_stop`,
+			`data: {"type":"message_stop"}`,
+			``,
+		}, "\n")))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "key-123",
+		"base_url": server.URL,
+	}}
+	payload := []byte(`{"model":"MiniMax-M3","thinking":{"type":"adaptive"},"output_config":{"effort":"high"},"messages":[{"role":"user","content":"hi"}]}`)
+
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "MiniMax-M3",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if len(seenBody) == 0 {
+		t.Fatal("expected request body to be captured")
+	}
+	if gjson.GetBytes(seenBody, "output_config").Exists() {
+		t.Fatalf("output_config should be absent for MiniMax-M3 upstream body; body=%s", string(seenBody))
+	}
+	if got := gjson.GetBytes(seenBody, "reasoning_split").Bool(); !got {
+		t.Fatalf("reasoning_split = %v, want true; body=%s", got, string(seenBody))
+	}
+}
+
+func TestClaudeExecutorMiniMaxM3OpenAIReasoningEffortDoesNotLeakOutputConfig(t *testing.T) {
+	var seenBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		seenBody = bytes.Clone(body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(strings.Join([]string{
+			`event: message_start`,
+			`data: {"type":"message_start","message":{"id":"msg_1","model":"MiniMax-M3"}}`,
+			`event: content_block_delta`,
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}`,
+			`event: message_delta`,
+			`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":1,"output_tokens":1}}`,
+			`event: message_stop`,
+			`data: {"type":"message_stop"}`,
+			``,
+		}, "\n")))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "key-123",
+		"base_url": server.URL,
+	}}
+	payload := []byte(`{"model":"MiniMax-M3","reasoning_effort":"high","messages":[{"role":"user","content":"hi"}]}`)
+
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "MiniMax-M3",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai"),
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if len(seenBody) == 0 {
+		t.Fatal("expected request body to be captured")
+	}
+	if gjson.GetBytes(seenBody, "output_config.effort").Exists() {
+		t.Fatalf("output_config.effort should be absent for MiniMax-M3 upstream body; body=%s", string(seenBody))
+	}
+	if gjson.GetBytes(seenBody, "reasoning_effort").Exists() {
+		t.Fatalf("reasoning_effort should be absent for MiniMax-M3 upstream body; body=%s", string(seenBody))
+	}
+	if got := gjson.GetBytes(seenBody, "thinking.type").String(); got != "adaptive" {
+		t.Fatalf("thinking.type = %q, want adaptive; body=%s", got, string(seenBody))
+	}
+	if got := gjson.GetBytes(seenBody, "reasoning_split").Bool(); !got {
+		t.Fatalf("reasoning_split = %v, want true; body=%s", got, string(seenBody))
+	}
+}
+
+func TestClaudeExecutorMiniMaxM3NormalizesAnthropicThinkingShape(t *testing.T) {
+	var seenBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		seenBody = bytes.Clone(body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"MiniMax-M3","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "key-123",
+		"base_url": server.URL,
+	}}
+	payload := []byte(`{"model":"MiniMax-M3","thinking":{"type":"enabled","budget_tokens":32768},"messages":[{"role":"user","content":"hi"}]}`)
+
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "MiniMax-M3",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if len(seenBody) == 0 {
+		t.Fatal("expected request body to be captured")
+	}
+	if got := gjson.GetBytes(seenBody, "thinking.type").String(); got != "adaptive" {
+		t.Fatalf("thinking.type = %q, want adaptive; body=%s", got, string(seenBody))
+	}
+	if gjson.GetBytes(seenBody, "thinking.budget_tokens").Exists() {
+		t.Fatalf("thinking.budget_tokens should be absent for MiniMax-M3 upstream body; body=%s", string(seenBody))
+	}
+	if gjson.GetBytes(seenBody, "output_config").Exists() {
+		t.Fatalf("output_config should be absent for MiniMax-M3 upstream body; body=%s", string(seenBody))
+	}
+	if got := gjson.GetBytes(seenBody, "reasoning_split").Bool(); !got {
+		t.Fatalf("reasoning_split = %v, want true; body=%s", got, string(seenBody))
+	}
+}
+
+func TestClaudeExecutorMiniMaxM3UsageIncludesCacheTokens(t *testing.T) {
+	probe := &usageProbe{records: make(chan cliproxyusage.Record, 16)}
+	cliproxyusage.RegisterPlugin(probe)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"MiniMax-M3","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":13,"output_tokens":4,"cache_read_input_tokens":22000,"cache_creation_input_tokens":31}}`))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "key-123",
+		"base_url": server.URL,
+	}}
+	model := "minimax-claude/MiniMax-M3"
+	started := time.Now()
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   model,
+		Payload: []byte(`{"model":"MiniMax-M3","messages":[{"role":"user","content":"hi"}]}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	record := waitUsageRecord(t, probe.records, "claude", model, started)
+	if record.Detail.TotalTokens != 22048 {
+		t.Fatalf("total tokens = %d, want 22048", record.Detail.TotalTokens)
+	}
+	if record.Detail.CachedTokens != 22000 {
+		t.Fatalf("cached tokens = %d, want 22000", record.Detail.CachedTokens)
+	}
+}
+
+func TestClaudeExecutorMiniMaxM3StreamUsageIncludesCacheTokens(t *testing.T) {
+	probe := &usageProbe{records: make(chan cliproxyusage.Record, 16)}
+	cliproxyusage.RegisterPlugin(probe)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, strings.Join([]string{
+			`event: message_start`,
+			`data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"MiniMax-M3","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":1366}}}`,
+			`event: content_block_delta`,
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}`,
+			`event: message_delta`,
+			`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":1252,"output_tokens":213,"cache_read_input_tokens":114,"cache_creation_input_tokens":31}}`,
+			`event: message_stop`,
+			`data: {"type":"message_stop"}`,
+			``,
+		}, "\n"))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":  "key-123",
+		"base_url": server.URL,
+	}}
+	model := "minimax-claude/MiniMax-M3"
+	started := time.Now()
+	stream, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   model,
+		Payload: []byte(`{"model":"MiniMax-M3","messages":[{"role":"user","content":"hi"}]}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+		Stream:       true,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+	for chunk := range stream.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error: %v", chunk.Err)
+		}
+	}
+
+	record := waitUsageRecord(t, probe.records, "claude", model, started)
+	if record.Detail.TotalTokens != 2976 {
+		t.Fatalf("total tokens = %d, want 2976", record.Detail.TotalTokens)
+	}
+	if record.Detail.CachedTokens != 1480 {
+		t.Fatalf("cached tokens = %d, want 1480", record.Detail.CachedTokens)
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/thinking/provider/claude"
+	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/thinking/provider/openai"
 	"github.com/tidwall/gjson"
 )
 
@@ -77,5 +78,28 @@ func TestApplyThinking_UserDefinedClaudeWithThinkingClampsUnsupportedLevel(t *te
 	}
 	if got := gjson.GetBytes(out, "output_config.effort").String(); got != "high" {
 		t.Fatalf("output_config.effort = %q, want %q, body=%s", got, "high", string(out))
+	}
+}
+
+func TestApplyThinking_MiniMaxM3IgnoresStaleLevelRegistry(t *testing.T) {
+	reg := registry.GetGlobalRegistry()
+	clientID := "test-minimax-m3-stale-levels-" + t.Name()
+	reg.RegisterClient(clientID, "minimax", []*registry.ModelInfo{{
+		ID:       "MiniMax-M3",
+		OwnedBy:  "minimax",
+		Type:     "minimax",
+		Thinking: &registry.ThinkingSupport{Levels: []string{"low", "medium", "high"}},
+	}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(clientID)
+	})
+
+	body := []byte(`{"model":"MiniMax-M3","messages":[],"reasoning_effort":"xhigh"}`)
+	out, err := thinking.ApplyThinking(body, "MiniMax-M3", "openai", "openai", "minimax")
+	if err != nil {
+		t.Fatalf("ApplyThinking() error = %v", err)
+	}
+	if got := gjson.GetBytes(out, "reasoning_effort").String(); got != "auto" {
+		t.Fatalf("reasoning_effort = %q, want auto, body=%s", got, string(out))
 	}
 }

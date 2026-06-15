@@ -776,6 +776,31 @@ func TestExtractSessionID_Headers(t *testing.T) {
 	}
 }
 
+func TestExtractSessionID_ClientSpecificHeaders(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		header string
+		value  string
+		want   string
+	}{
+		{name: "codex_session_id_hyphen", header: "Session-Id", value: "codex-123", want: "codex:codex-123"},
+		{name: "codex_session_id_underscore", header: "Session_id", value: "codex-456", want: "codex:codex-456"},
+		{name: "amp_thread", header: "X-Amp-Thread-Id", value: "thread-789", want: "amp:thread-789"},
+		{name: "pi_client_request", header: "X-Client-Request-Id", value: "pi-abc", want: "clientreq:pi-abc"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			headers := make(http.Header)
+			headers.Set(tt.header, tt.value)
+			if got := ExtractSessionID(headers, nil, nil); got != tt.want {
+				t.Fatalf("ExtractSessionID() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 // TestExtractSessionID_IdempotencyKey verifies that idempotency_key is intentionally
 // ignored for session affinity (it's auto-generated per-request, causing cache misses).
 func TestExtractSessionID_IdempotencyKey(t *testing.T) {

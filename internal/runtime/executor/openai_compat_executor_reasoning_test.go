@@ -146,6 +146,80 @@ func TestNormalizeMiniMaxM3RequestMapsReasoningEffort(t *testing.T) {
 	}
 }
 
+func TestNormalizeMiniMaxM3RequestMapsXHighReasoningEffort(t *testing.T) {
+	input := []byte(`{"model":"MiniMax-M3","messages":[],"reasoning_effort":"xhigh"}`)
+
+	out := normalizeMiniMaxM3Request(input, "MiniMax-M3")
+
+	if gjson.GetBytes(out, "reasoning_effort").Exists() {
+		t.Fatalf("reasoning_effort should be removed, body=%s", string(out))
+	}
+	if got := gjson.GetBytes(out, "thinking.type").String(); got != "adaptive" {
+		t.Fatalf("thinking.type = %q, want adaptive, body=%s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "reasoning_split").Bool(); !got {
+		t.Fatalf("reasoning_split = %v, want true, body=%s", got, string(out))
+	}
+}
+
+func TestNormalizeMiniMaxM3RequestMapsClaudeEnabledThinking(t *testing.T) {
+	input := []byte(`{"model":"MiniMax-M3","messages":[],"thinking":{"type":"enabled","budget_tokens":32768}}`)
+
+	out := normalizeMiniMaxM3Request(input, "MiniMax-M3")
+
+	if got := gjson.GetBytes(out, "thinking.type").String(); got != "adaptive" {
+		t.Fatalf("thinking.type = %q, want adaptive, body=%s", got, string(out))
+	}
+	if gjson.GetBytes(out, "thinking.budget_tokens").Exists() {
+		t.Fatalf("thinking.budget_tokens should be removed, body=%s", string(out))
+	}
+	if got := gjson.GetBytes(out, "reasoning_split").Bool(); !got {
+		t.Fatalf("reasoning_split = %v, want true, body=%s", got, string(out))
+	}
+}
+
+func TestNormalizeMiniMaxM3RequestNormalizesForcedToolChoice(t *testing.T) {
+	input := []byte(`{"model":"MiniMax-M3","messages":[],"thinking":{"type":"disabled"},"tool_choice":{"type":"any"}}`)
+
+	out := normalizeMiniMaxM3Request(input, "MiniMax-M3")
+
+	if got := gjson.GetBytes(out, "tool_choice.type").String(); got != "auto" {
+		t.Fatalf("tool_choice.type = %q, want auto, body=%s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "thinking.type").String(); got != "disabled" {
+		t.Fatalf("thinking.type = %q, want disabled, body=%s", got, string(out))
+	}
+	if gjson.GetBytes(out, "reasoning_split").Exists() {
+		t.Fatalf("reasoning_split should not be set when thinking is disabled, body=%s", string(out))
+	}
+}
+
+func TestNormalizeMiniMaxM3RequestRemovesOutputConfigEffort(t *testing.T) {
+	input := []byte(`{"model":"MiniMax-M3","messages":[],"thinking":{"type":"adaptive"},"output_config":{"effort":"high"}}`)
+
+	out := normalizeMiniMaxM3Request(input, "MiniMax-M3")
+
+	if gjson.GetBytes(out, "output_config").Exists() {
+		t.Fatalf("output_config should be removed when only effort was present, body=%s", string(out))
+	}
+	if got := gjson.GetBytes(out, "reasoning_split").Bool(); !got {
+		t.Fatalf("reasoning_split = %v, want true, body=%s", got, string(out))
+	}
+}
+
+func TestNormalizeMiniMaxM3RequestRemovesOutputConfigEffortOnly(t *testing.T) {
+	input := []byte(`{"model":"MiniMax-M3","messages":[],"thinking":{"type":"adaptive"},"output_config":{"effort":"high","verbosity":"low"}}`)
+
+	out := normalizeMiniMaxM3Request(input, "MiniMax-M3")
+
+	if gjson.GetBytes(out, "output_config.effort").Exists() {
+		t.Fatalf("output_config.effort should be removed, body=%s", string(out))
+	}
+	if got := gjson.GetBytes(out, "output_config.verbosity").String(); got != "low" {
+		t.Fatalf("output_config.verbosity = %q, want low, body=%s", got, string(out))
+	}
+}
+
 func TestNormalizeMiniMaxM3RequestDisablesThinking(t *testing.T) {
 	input := []byte(`{"model":"MiniMax-M3","messages":[],"reasoning_effort":"none"}`)
 

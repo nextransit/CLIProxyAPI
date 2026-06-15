@@ -110,7 +110,7 @@ func (c *SessionCache) Invalidate(sessionID string) {
 // InvalidateAuth removes all sessions bound to a specific auth ID.
 // Used when an auth becomes unavailable.
 func (c *SessionCache) InvalidateAuth(authID string) {
-	if authID == "" {
+	if c == nil || authID == "" {
 		return
 	}
 	c.mu.Lock()
@@ -120,6 +120,40 @@ func (c *SessionCache) InvalidateAuth(authID string) {
 		}
 	}
 	c.mu.Unlock()
+}
+
+// CountByAuth returns a map of authID to the number of currently active
+// sessions bound to it. Expired entries are excluded. Used by the weighted
+// session-affinity selector to spread new sessions across auths in proportion
+// to each auth's configured weight.
+func (c *SessionCache) CountByAuth() map[string]int {
+	out := map[string]int{}
+	if c == nil {
+		return out
+	}
+	now := time.Now()
+	c.mu.RLock()
+	entries := make([]sessionEntry, 0, len(c.entries))
+	expired := make([]string, 0)
+	for sid, entry := range c.entries {
+		if now.After(entry.expiresAt) {
+			expired = append(expired, sid)
+			continue
+		}
+		entries = append(entries, entry)
+	}
+	c.mu.RUnlock()
+	if len(expired) > 0 {
+		c.mu.Lock()
+		for _, sid := range expired {
+			delete(c.entries, sid)
+		}
+		c.mu.Unlock()
+	}
+	for _, entry := range entries {
+		out[entry.authID]++
+	}
+	return out
 }
 
 // Stop terminates the background cleanup goroutine.

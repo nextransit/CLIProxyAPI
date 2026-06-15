@@ -6,7 +6,7 @@
 # with version information dynamically injected at build time.
 
 # Hidden feature: Preserve usage statistics across rebuilds
-# Usage: ./docker-build.sh --with-usage
+# Usage: ./docker-build.sh [--source|--prebuilt] [--with-usage]
 # First run prompts for management API key, saved to temp/stats/.api_secret
 
 set -euo pipefail
@@ -15,6 +15,7 @@ STATS_DIR="temp/stats"
 STATS_FILE="${STATS_DIR}/.usage_backup.json"
 SECRET_FILE="${STATS_DIR}/.api_secret"
 WITH_USAGE=false
+RUN_MODE="source"
 
 get_port() {
   if [[ -f "config.yaml" ]]; then
@@ -109,29 +110,49 @@ wait_for_service() {
   sleep 2
 }
 
-case "${1:-}" in
-  "")
-    ;;
-  "--with-usage")
-    WITH_USAGE=true
-    export_stats_api_secret
-    ;;
-  *)
-    echo "Error: unknown option '${1}'. Did you mean '--with-usage'?"
-    echo "Usage: ./docker-build.sh [--with-usage]"
-    exit 1
-    ;;
-esac
+usage() {
+  cat <<'EOF'
+Usage: ./docker-build.sh [--source|--prebuilt] [--with-usage]
 
-# --- Step 1: Choose Environment ---
-echo "Please select an option:"
-echo "1) Run using Pre-built Image (Recommended)"
-echo "2) Build from Source and Run (For Developers)"
-read -r -p "Enter choice [1-2]: " choice
+Options:
+  --source, 2   Build from Source and Run (For Developers). Default.
+  --prebuilt, 1 Run using Pre-built Image (Recommended).
+  --with-usage  Preserve usage statistics across rebuilds.
+  -h, --help    Show this help.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    "--source"|"2")
+      RUN_MODE="source"
+      ;;
+    "--prebuilt"|"1")
+      RUN_MODE="prebuilt"
+      ;;
+    "--with-usage")
+      WITH_USAGE=true
+      ;;
+    "-h"|"--help")
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Error: unknown option '$1'"
+      usage
+      exit 1
+      ;;
+  esac
+  shift
+done
+
+if [[ "${WITH_USAGE}" == "true" ]]; then
+  export_stats_api_secret
+fi
 
 # --- Step 2: Execute based on choice ---
-case "$choice" in
-  1)
+case "$RUN_MODE" in
+  prebuilt)
     echo "--- Running with Pre-built Image ---"
     if [[ "${WITH_USAGE}" == "true" ]]; then
       export_stats
@@ -144,7 +165,7 @@ case "$choice" in
     echo "Services are starting from remote image."
     echo "Run 'docker compose logs -f' to see the logs."
     ;;
-  2)
+  source)
     echo "--- Building from Source and Running ---"
 
     # Backup config.yaml before build
@@ -193,7 +214,7 @@ case "$choice" in
     echo "Run 'docker compose logs -f' to see the logs."
     ;;
   *)
-    echo "Invalid choice. Please enter 1 or 2."
+    echo "Invalid run mode: ${RUN_MODE}"
     exit 1
     ;;
 esac

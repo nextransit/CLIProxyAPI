@@ -520,9 +520,12 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 // Priority for session ID extraction:
 //  1. metadata.user_id (Claude Code format) - highest priority
 //  2. X-Session-ID header
-//  3. metadata.user_id (non-Claude Code format)
-//  4. conversation_id field
-//  5. Hash-based fallback from messages
+//  3. Session_id header (Codex)
+//  4. X-Amp-Thread-Id header (Amp CLI thread ID)
+//  5. X-Client-Request-Id header (PI)
+//  6. metadata.user_id (non-Claude Code format)
+//  7. conversation_id field
+//  8. Hash-based fallback from messages
 //
 // Note: The cache key includes provider, session ID, and model to handle cases where
 // a session uses multiple models (e.g., gemini-2.5-pro and gemini-3-flash-preview)
@@ -540,6 +543,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	if err != nil {
 		return nil, err
 	}
+	available = preferCodexWebsocketAuths(ctx, provider, available)
 
 	cacheKey := provider + "::" + primaryID + "::" + model
 
@@ -554,8 +558,13 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 					return auth, nil
 				}
 			}
-			// Cached auth not available, reselect via fallback selector for even distribution
-			auth, err := s.fallback.Pick(ctx, provider, model, opts, auths)
+			// Cached auth not available, reselect via the weighted-share path
+			// so the new binding respects the same weight/session distribution
+			// as a brand-new session, instead of just falling back to the
+			// legacy round-robin. This also avoids routing every displaced
+			// session onto the same auth, which would happen if a large
+			// session cohort was bound to a key that just failed.
+			auth, err := s.pickByWeightedSessionShare(ctx, provider, model, opts, auths)
 			if err != nil {
 				return nil, err
 			}
@@ -580,13 +589,61 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		}
 	}
 
-	auth, err := s.fallback.Pick(ctx, provider, model, opts, auths)
+	auth, err := s.pickByWeightedSessionShare(ctx, provider, model, opts, auths)
 	if err != nil {
 		return nil, err
 	}
 	s.cache.Set(cacheKey, auth.ID)
 	entry.Infof("session-affinity: cache miss, new binding | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 	return auth, nil
+}
+
+// pickByWeightedSessionShare picks an auth using the configured weight and the
+// number of sessions already bound to each auth. New sessions go to the auth
+// with the largest remaining weight share (weight / (1 + bound_sessions)),
+// so that N concurrent sessions distribute across available keys in
+// proportion to their configured weights. Already-bound sessions are not
+// rebalanced, preserving prompt-cache hits. Falls back to the configured
+// selector when no eligible weighted choice is possible.
+func (s *SessionAffinitySelector) pickByWeightedSessionShare(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
+	if len(auths) == 0 {
+		return s.fallback.Pick(ctx, provider, model, opts, auths)
+	}
+	if _, fillFirst := s.fallback.(*FillFirstSelector); fillFirst {
+		return s.fallback.Pick(ctx, provider, model, opts, auths)
+	}
+	now := time.Now()
+	available, err := getAvailableAuths(auths, provider, model, now)
+	if err != nil {
+		return nil, err
+	}
+	available = preferCodexWebsocketAuths(ctx, provider, available)
+	boundByAuth := s.cache.CountByAuth()
+	// Compute weight share for every available auth. Ties keep the incoming
+	// auth order, matching the configured fallback selector's candidate order.
+	var best *Auth
+	bestShare := -1.0
+	for _, auth := range available {
+		if auth == nil {
+			continue
+		}
+		weight := authWeight(auth)
+		if weight <= 0 {
+			weight = 1
+		}
+		bound := boundByAuth[auth.ID]
+		// (1 + bound) avoids div-by-zero and gives a fresh auth the same
+		// "1 share" baseline regardless of its weight.
+		share := float64(weight) / float64(1+bound)
+		if share > bestShare {
+			bestShare = share
+			best = auth
+		}
+	}
+	if best == nil {
+		return s.fallback.Pick(ctx, provider, model, opts, auths)
+	}
+	return best, nil
 }
 
 func selectorLogEntry(ctx context.Context) *log.Entry {
@@ -626,9 +683,12 @@ func (s *SessionAffinitySelector) InvalidateAuth(authID string) {
 // Priority order:
 //  1. metadata.user_id (Claude Code format with _session_{uuid}) - highest priority for Claude Code clients
 //  2. X-Session-ID header
-//  3. metadata.user_id (non-Claude Code format)
-//  4. conversation_id field in request body
-//  5. Stable hash from first few messages content (fallback)
+//  3. Session_id header (Codex)
+//  4. X-Amp-Thread-Id header (Amp CLI thread ID)
+//  5. X-Client-Request-Id header (PI)
+//  6. metadata.user_id (non-Claude Code format)
+//  7. conversation_id field in request body
+//  8. Stable hash from first few messages content (fallback)
 func ExtractSessionID(headers http.Header, payload []byte, metadata map[string]any) string {
 	primary, _ := extractSessionIDs(headers, payload, metadata)
 	return primary
@@ -664,22 +724,46 @@ func extractSessionIDs(headers http.Header, payload []byte, metadata map[string]
 		}
 	}
 
+	// 3. Session_id header (Codex)
+	if headers != nil {
+		if sid := headers.Get("Session-Id"); sid != "" {
+			return "codex:" + sid, ""
+		}
+		if sid := headers.Get("Session_id"); sid != "" {
+			return "codex:" + sid, ""
+		}
+	}
+
+	// 4. X-Amp-Thread-Id header (Amp CLI thread ID)
+	if headers != nil {
+		if tid := headers.Get("X-Amp-Thread-Id"); tid != "" {
+			return "amp:" + tid, ""
+		}
+	}
+
+	// 5. X-Client-Request-Id header (PI)
+	if headers != nil {
+		if rid := headers.Get("X-Client-Request-Id"); rid != "" {
+			return "clientreq:" + rid, ""
+		}
+	}
+
 	if len(payload) == 0 {
 		return "", ""
 	}
 
-	// 3. metadata.user_id (non-Claude Code format)
+	// 6. metadata.user_id (non-Claude Code format)
 	userID := gjson.GetBytes(payload, "metadata.user_id").String()
 	if userID != "" {
 		return "user:" + userID, ""
 	}
 
-	// 4. conversation_id field
+	// 7. conversation_id field
 	if convID := gjson.GetBytes(payload, "conversation_id").String(); convID != "" {
 		return "conv:" + convID, ""
 	}
 
-	// 5. Hash-based fallback from message content
+	// 8. Hash-based fallback from message content
 	return extractMessageHashIDs(payload)
 }
 

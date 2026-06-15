@@ -118,9 +118,10 @@ func TestSessionAffinity_ResetsCountAfterRotation(t *testing.T) {
 	authB := &Auth{ID: "auth-B", Provider: "claude", Attributes: map[string]string{"weight": "2"}, Metadata: map[string]any{"type": "claude"}}
 	opts := cliproxyexecutor.Options{OriginalRequest: []byte(`{"metadata":{"user_id":"user_xxx_account__session_session_3"}}`)}
 
-	// A stub fallback that always returns auth-B, so the post-rotation
-	// binding is deterministically auth-B (and stays auth-B on any further
-	// rotations, which is what we want to observe).
+	// A stub fallback is installed to catch regressions that re-introduce
+	// the pre-share "always call fallback on cache miss" path. With the
+	// weighted share in place, the cache miss path skips the fallback and
+	// picks directly via weight/session share, so the stub is unused here.
 	stubB := &fixedPickSelector{prefer: "auth-B"}
 
 	sel := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
@@ -129,30 +130,46 @@ func TestSessionAffinity_ResetsCountAfterRotation(t *testing.T) {
 		MaxRequests: 3,
 	})
 
-	// First 3 calls: the cache binds auth-B on the miss; subsequent calls
-	// are sticky to auth-B. The 3rd call (count=3, 3<3 false) rotates via
-	// the fallback, which picks auth-B again — so the observable behavior
-	// is that auth-B is sticky through the first rotation boundary.
-	for i := 1; i <= 3; i++ {
+	// First call binds the session via weighted share. With weight 1:2 and
+	// an empty session cache, both auths start at share=1, so the first
+	// listed auth (auth-A) wins the tie. Subsequent calls are sticky to
+	// that auth.
+	first, err := sel.Pick(context.Background(), "claude", "model-x", opts, []*Auth{authA, authB})
+	if err != nil {
+		t.Fatalf("pick 1: %v", err)
+	}
+
+	for i := 2; i <= 3; i++ {
 		got, err := sel.Pick(context.Background(), "claude", "model-x", opts, []*Auth{authA, authB})
 		if err != nil {
 			t.Fatalf("pick %d: %v", i, err)
 		}
-		if got.ID != "auth-B" {
-			t.Fatalf("expected auth-B on pick %d, got %s", i, got.ID)
+		if got.ID != first.ID {
+			t.Fatalf("expected sticky to %s on pick %d, got %s", first.ID, i, got.ID)
 		}
 	}
 
-	// After the rotation on pick 3, the count must have been reset, so the
-	// next 2 calls (counts 1 and 2) are both sticky to auth-B without
-	// re-rotating away to auth-A.
-	for i := 4; i <= 5; i++ {
+	// 4th call (count=3, 3<3 false) must fall through and re-bind via the
+	// weighted share path. Once re-bound, the new auth must stay sticky
+	// across the next 2 calls (counts 1 and 2 of the new binding).
+	rotated, err := sel.Pick(context.Background(), "claude", "model-x", opts, []*Auth{authA, authB})
+	if err != nil {
+		t.Fatalf("pick 4: %v", err)
+	}
+	if rotated.ID == first.ID {
+		// The weighted share should rebind to a different auth when an
+		// alternative with a better remaining share exists. If the cache
+		// still landed on the same auth, the count reset did not take
+		// effect.
+		t.Fatalf("expected rotation to re-bind away from %s, but got %s", first.ID, rotated.ID)
+	}
+	for i := 5; i <= 6; i++ {
 		next, err := sel.Pick(context.Background(), "claude", "model-x", opts, []*Auth{authA, authB})
 		if err != nil {
 			t.Fatalf("pick %d: %v", i, err)
 		}
-		if next.ID != "auth-B" {
-			t.Fatalf("expected sticky to auth-B after rotation on pick %d, got %s", i, next.ID)
+		if next.ID != rotated.ID {
+			t.Fatalf("expected sticky to %s after rotation on pick %d, got %s", rotated.ID, i, next.ID)
 		}
 	}
 }

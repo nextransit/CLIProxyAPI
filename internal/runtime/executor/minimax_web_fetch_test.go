@@ -43,7 +43,7 @@ func TestFetchURLContent_Success(t *testing.T) {
 	}))
 	defer server.Close()
 
-	content, err := fetchURLContent(server.URL)
+	content, err := fetchURLContentWithoutSSRFCheck(server.URL)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -58,7 +58,7 @@ func TestFetchURLContent_404Error(t *testing.T) {
 	}))
 	defer server.Close()
 
-	_, err := fetchURLContent(server.URL)
+	_, err := fetchURLContentWithoutSSRFCheck(server.URL)
 	if err == nil {
 		t.Fatal("expected error for 404 response, got nil")
 	}

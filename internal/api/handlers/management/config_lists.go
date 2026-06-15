@@ -351,6 +351,7 @@ func (h *Handler) PatchGeminiKey(c *gin.Context) {
 		ProxyURL       *string            `json:"proxy-url"`
 		Headers        *map[string]string `json:"headers"`
 		ExcludedModels *[]string          `json:"excluded-models"`
+		Weight         *int               `json:"weight"`
 	}
 	var body struct {
 		Index *int            `json:"index"`
@@ -409,6 +410,9 @@ func (h *Handler) PatchGeminiKey(c *gin.Context) {
 	}
 	if body.Value.ExcludedModels != nil {
 		entry.ExcludedModels = config.NormalizeExcludedModels(*body.Value.ExcludedModels)
+	}
+	if body.Value.Weight != nil {
+		entry.Weight = *body.Value.Weight
 	}
 	h.cfg.GeminiKey[targetIndex] = entry
 	h.cfg.SanitizeGeminiKeys()
@@ -512,6 +516,7 @@ func (h *Handler) PatchClaudeKey(c *gin.Context) {
 		Models         *[]config.ClaudeModel `json:"models"`
 		Headers        *map[string]string    `json:"headers"`
 		ExcludedModels *[]string             `json:"excluded-models"`
+		Weight         *int                  `json:"weight"`
 	}
 	var body struct {
 		Index *int            `json:"index"`
@@ -564,6 +569,9 @@ func (h *Handler) PatchClaudeKey(c *gin.Context) {
 	}
 	if body.Value.ExcludedModels != nil {
 		entry.ExcludedModels = config.NormalizeExcludedModels(*body.Value.ExcludedModels)
+	}
+	if body.Value.Weight != nil {
+		entry.Weight = *body.Value.Weight
 	}
 	normalizeClaudeKey(&entry)
 	h.cfg.ClaudeKey[targetIndex] = entry
@@ -1166,6 +1174,7 @@ func (h *Handler) PatchCodexKey(c *gin.Context) {
 		Models         *[]config.CodexModel `json:"models"`
 		Headers        *map[string]string   `json:"headers"`
 		ExcludedModels *[]string            `json:"excluded-models"`
+		Weight         *int                 `json:"weight"`
 	}
 	var body struct {
 		Index *int           `json:"index"`
@@ -1225,6 +1234,9 @@ func (h *Handler) PatchCodexKey(c *gin.Context) {
 	}
 	if body.Value.ExcludedModels != nil {
 		entry.ExcludedModels = config.NormalizeExcludedModels(*body.Value.ExcludedModels)
+	}
+	if body.Value.Weight != nil {
+		entry.Weight = *body.Value.Weight
 	}
 	normalizeCodexKey(&entry)
 	h.cfg.CodexKey[targetIndex] = entry

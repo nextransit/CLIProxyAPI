@@ -667,6 +667,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.DELETE("/auth-files", s.mgmt.DeleteAuthFile)
 		mgmt.PATCH("/auth-files/status", s.mgmt.PatchAuthFileStatus)
 		mgmt.PATCH("/auth-files/fields", s.mgmt.PatchAuthFileFields)
+		mgmt.POST("/auth-files/resume", s.mgmt.ResumeAuthFile)
 		mgmt.POST("/vertex/import", s.mgmt.ImportVertexCredential)
 
 		mgmt.GET("/anthropic-auth-url", s.mgmt.RequestAnthropicToken)
@@ -712,8 +713,14 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 		return
 	}
 
-	// Serve the best available management.html asset.
-	// Priority: local assets/ (dev/deploy) > static/ (GitHub sync) > builtin shell.
+	externalRequested := isTruthyQueryFlag(c.Query("external"))
+	if !externalRequested {
+		s.serveBuiltinAuthManagementPage(c)
+		return
+	}
+
+	// Serve the best available external management.html asset.
+	// Priority: local assets/ (dev/deploy) > static/ (GitHub sync) > builtin auth page.
 	serveFile := func(path string) bool {
 		path = strings.TrimSpace(path)
 		if path == "" {

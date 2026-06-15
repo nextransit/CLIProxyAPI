@@ -637,6 +637,34 @@ func (e *MiniMaxExecutor) StreamExecute(ctx context.Context, auth *cliproxyauth.
 
 	if httpResp.StatusCode != http.StatusOK {
 		b, _ := helps.LimitedReadAll(httpResp.Body)
+		_ = httpResp.Body.Close()
+		// Recovery: MiniMax returns 2013 (context window exceeded) when the
+		// accumulated conversation history + thinking blocks blow past the
+		// model's 1M-token budget. Reuse the non-streaming compact pipeline
+		// here so a long chat does not immediately fail for streaming clients
+		// (e.g. codex cli).
+		if isMiniMaxContextWindowError(b) {
+			helps.LogWithRequestID(ctx).Debugf("minimax executor streaming: 2013 detected, attempting compact retry")
+			current := stripToolsFromAnthropicPayload(anthropicPayload)
+			compactLevels := []int{5, 3, 1}
+			for _, maxItems := range compactLevels {
+				compacted := e.compactAnthropicPayload(current, maxItems)
+				if bytes.Equal(compacted, current) {
+					break
+				}
+				current = compacted
+				retryBody, retryOK := e.retryAnthropicForRecovery(ctx, auth, current, apiKey, baseURL, true)
+				if retryOK && retryBody != nil && !isMiniMaxContextWindowError(retryBody) {
+					// We have a non-2013 response; surface it as a single
+					// non-streaming payload so the user still gets a useful
+					// answer instead of an opaque 400.
+					chunks := make(chan cliproxyexecutor.StreamChunk, 1)
+					chunks <- cliproxyexecutor.StreamChunk{Payload: retryBody}
+					close(chunks)
+					return cliproxyexecutor.StreamResult{Chunks: chunks}
+				}
+			}
+		}
 		errCh := make(chan cliproxyexecutor.StreamChunk, 1)
 		errCh <- cliproxyexecutor.StreamChunk{Err: statusErr{code: httpResp.StatusCode, msg: string(b), retryAfter: helps.ParseRetryAfter(httpResp, b)}}
 		close(errCh)
@@ -680,6 +708,39 @@ func (e *MiniMaxExecutor) StreamExecute(ctx context.Context, auth *cliproxyauth.
 		Headers: httpResp.Header,
 		Chunks:  chunks,
 	}
+}
+
+// retryAnthropicForRecovery sends a single Anthropic-format request to
+// MiniMax and returns the response body when the call succeeded (HTTP 200
+// and not a context-window error). The streaming 2013 recovery path uses
+// it to fall back to a one-shot reply rather than failing the user's chat.
+func (e *MiniMaxExecutor) retryAnthropicForRecovery(ctx context.Context, auth *cliproxyauth.Auth, payload []byte, apiKey, baseURL string, stream bool) ([]byte, bool) {
+	anthropicURL := e.buildAnthropicURL(baseURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, anthropicURL, bytes.NewReader(payload))
+	if err != nil {
+		return nil, false
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("anthropic-version", "2023-06-01")
+	if apiKey != "" {
+		req.Header.Set("x-api-key", apiKey)
+	}
+	if stream {
+		req.Header.Set("Accept", "text/event-stream")
+	}
+	resp, err := e.HttpRequest(ctx, auth, req)
+	if err != nil {
+		return nil, false
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, _ := helps.LimitedReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return body, false
+	}
+	if isMiniMaxContextWindowError(body) {
+		return body, false
+	}
+	return body, true
 }
 
 func (e *MiniMaxExecutor) resolveCredentials(auth *cliproxyauth.Auth) (string, string) {

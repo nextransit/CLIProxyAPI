@@ -7,6 +7,7 @@ import (
 )
 
 const codexBuiltinImageModelID = "gpt-image-2"
+const codexBuiltinGPT55ModelID = "gpt-5.5"
 const minimaxM3ModelID = "MiniMax-M3"
 
 // staticModelsJSON mirrors the top-level structure of models.json.
@@ -83,7 +84,7 @@ func GetAntigravityModels() []*ModelInfo {
 // not depend on remote models.json updates. Built-ins replace any matching IDs
 // already present in the provided slice.
 func WithCodexBuiltins(models []*ModelInfo) []*ModelInfo {
-	return upsertModelInfos(models, codexBuiltinImageModelInfo())
+	return upsertModelInfos(models, codexBuiltinImageModelInfo(), codexBuiltinGPT55ModelInfo())
 }
 
 func codexBuiltinImageModelInfo() *ModelInfo {
@@ -95,6 +96,25 @@ func codexBuiltinImageModelInfo() *ModelInfo {
 		Type:        "openai",
 		DisplayName: "GPT Image 2",
 		Version:     codexBuiltinImageModelID,
+	}
+}
+
+func codexBuiltinGPT55ModelInfo() *ModelInfo {
+	return &ModelInfo{
+		ID:                  codexBuiltinGPT55ModelID,
+		Object:              "model",
+		Created:             1776902400,
+		OwnedBy:             "openai",
+		Type:                "openai",
+		DisplayName:         "GPT 5.5",
+		Version:             codexBuiltinGPT55ModelID,
+		Description:         "Frontier model for complex coding, research, and real-world work.",
+		ContextLength:       272000,
+		MaxCompletionTokens: 128000,
+		SupportedParameters: []string{"tools"},
+		Thinking: &ThinkingSupport{
+			Levels: []string{"low", "medium", "high", "xhigh"},
+		},
 	}
 }
 
@@ -110,7 +130,8 @@ func minimaxM3ModelInfo() *ModelInfo {
 		ContextLength:       1000000,
 		MaxCompletionTokens: 32768,
 		Thinking: &ThinkingSupport{
-			Levels: []string{"low", "medium", "high"},
+			ZeroAllowed:    true,
+			DynamicAllowed: true,
 		},
 	}
 }
@@ -118,6 +139,8 @@ func minimaxM3ModelInfo() *ModelInfo {
 func lookupBuiltinStaticModelInfo(modelID string) *ModelInfo {
 	normalized := strings.ToLower(strings.TrimSpace(modelID))
 	switch normalized {
+	case "gpt-5.5":
+		return codexBuiltinGPT55ModelInfo()
 	case "minimax-m3", "minimax-claude/minimax-m3", "minimax/minimax-m3":
 		return minimaxM3ModelInfo()
 	default:
