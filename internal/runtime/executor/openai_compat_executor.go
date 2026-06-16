@@ -117,6 +117,10 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	}
 
 	if isDeepSeekModel(baseModel) {
+		translated, err = ensureDeepSeekToolMessageNames(translated)
+		if err != nil {
+			return resp, err
+		}
 		translated, err = ensureDeepSeekReasoningContent(translated)
 		if err != nil {
 			return resp, err
@@ -334,6 +338,10 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	}
 
 	if isDeepSeekModel(baseModel) {
+		translated, err = ensureDeepSeekToolMessageNames(translated)
+		if err != nil {
+			return nil, err
+		}
 		translated, err = ensureDeepSeekReasoningContent(translated)
 		if err != nil {
 			return nil, err
@@ -968,6 +976,80 @@ func hasOpenAICompatTools(payload []byte) bool {
 	return gjson.GetBytes(payload, "tool_choice").Exists() || gjson.GetBytes(payload, "tool_functions").Exists()
 }
 
+// ensureDeepSeekToolMessageNames fills the legacy tool message name field.
+// DeepSeek v4 currently rejects some OpenAI-compatible tool result messages
+// without name even when tool_call_id is present.
+func ensureDeepSeekToolMessageNames(payload []byte) ([]byte, error) {
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return payload, nil
+	}
+
+	messages := gjson.GetBytes(payload, "messages")
+	if !messages.Exists() || !messages.IsArray() {
+		return payload, nil
+	}
+
+	toolNames := make(map[string]string)
+	for _, msg := range messages.Array() {
+		if strings.TrimSpace(msg.Get("role").String()) != "assistant" {
+			continue
+		}
+		toolCalls := msg.Get("tool_calls")
+		if !toolCalls.IsArray() {
+			continue
+		}
+		for _, toolCall := range toolCalls.Array() {
+			toolCallID := strings.TrimSpace(toolCall.Get("id").String())
+			if toolCallID == "" {
+				toolCallID = strings.TrimSpace(toolCall.Get("call_id").String())
+			}
+			if toolCallID == "" {
+				continue
+			}
+			name := strings.TrimSpace(toolCall.Get("function.name").String())
+			if name == "" {
+				name = openAICompatFallbackToolName(toolCallID)
+			}
+			toolNames[toolCallID] = name
+		}
+	}
+
+	out := payload
+	patched := 0
+	for msgIdx, msg := range messages.Array() {
+		if strings.TrimSpace(msg.Get("role").String()) != "tool" {
+			continue
+		}
+		if strings.TrimSpace(msg.Get("name").String()) != "" {
+			continue
+		}
+		toolCallID := strings.TrimSpace(msg.Get("tool_call_id").String())
+		if toolCallID == "" {
+			toolCallID = strings.TrimSpace(msg.Get("call_id").String())
+		}
+		if toolCallID == "" {
+			continue
+		}
+		name := toolNames[toolCallID]
+		if name == "" {
+			name = openAICompatFallbackToolName(toolCallID)
+		}
+		next, err := sjson.SetBytes(out, fmt.Sprintf("messages.%d.name", msgIdx), name)
+		if err != nil {
+			return payload, fmt.Errorf("openai compat executor: failed to set deepseek tool message name: %w", err)
+		}
+		out = next
+		patched++
+	}
+
+	if patched > 0 {
+		log.WithField("patched_tool_message_names", patched).
+			Debug("openai compat executor: ensured tool message names for deepseek model")
+	}
+
+	return out, nil
+}
+
 // ensureDeepSeekReasoningContent ensures assistant messages have reasoning_content present.
 // DeepSeek's API requires reasoning_content to be passed back in multi-turn
 // thinking-mode conversations; missing it causes 400 errors.
@@ -1093,16 +1175,17 @@ func (e statusErr) StatusCode() int            { return e.code }
 func (e statusErr) RetryAfter() *time.Duration { return e.retryAfter }
 
 type openAICompatToolRepairStats struct {
-	MovedToolMessages           int
-	SynthesizedToolMessages     int
-	DroppedOrphanToolMessages   int
-	PreservedOrphanToolMessages int
-	NormalizedToolContents      int
-	NormalizedToolArguments     int
-	PatchedToolMessageIDs       int
-	MergedAssistantMessages     int
-	PatchedAssistantToolCallIDs int
-	NormalizedAssistantContent  int
+	MovedToolMessages             int
+	SynthesizedToolMessages       int
+	DroppedOrphanToolMessages     int
+	PreservedOrphanToolMessages   int
+	NormalizedToolContents        int
+	NormalizedToolArguments       int
+	PatchedToolMessageIDs         int
+	MergedAssistantMessages       int
+	PatchedAssistantToolCallIDs   int
+	PatchedAssistantToolCallNames int
+	NormalizedAssistantContent    int
 }
 
 func (s openAICompatToolRepairStats) changed() bool {
@@ -1115,6 +1198,7 @@ func (s openAICompatToolRepairStats) changed() bool {
 		s.PatchedToolMessageIDs > 0 ||
 		s.MergedAssistantMessages > 0 ||
 		s.PatchedAssistantToolCallIDs > 0 ||
+		s.PatchedAssistantToolCallNames > 0 ||
 		s.NormalizedAssistantContent > 0
 }
 
@@ -1156,16 +1240,17 @@ func normalizeOpenAICompatToolMessages(payload []byte) ([]byte, error) {
 	}
 
 	log.WithFields(log.Fields{
-		"moved_tool_messages":             stats.MovedToolMessages,
-		"synthesized_tool_messages":       stats.SynthesizedToolMessages,
-		"dropped_orphan_tool_messages":    stats.DroppedOrphanToolMessages,
-		"preserved_orphan_tool_messages":  stats.PreservedOrphanToolMessages,
-		"normalized_tool_contents":        stats.NormalizedToolContents,
-		"normalized_tool_arguments":       stats.NormalizedToolArguments,
-		"patched_tool_message_ids":        stats.PatchedToolMessageIDs,
-		"merged_assistant_messages":       stats.MergedAssistantMessages,
-		"patched_assistant_tool_call_ids": stats.PatchedAssistantToolCallIDs,
-		"normalized_assistant_content":    stats.NormalizedAssistantContent,
+		"moved_tool_messages":               stats.MovedToolMessages,
+		"synthesized_tool_messages":         stats.SynthesizedToolMessages,
+		"dropped_orphan_tool_messages":      stats.DroppedOrphanToolMessages,
+		"preserved_orphan_tool_messages":    stats.PreservedOrphanToolMessages,
+		"normalized_tool_contents":          stats.NormalizedToolContents,
+		"normalized_tool_arguments":         stats.NormalizedToolArguments,
+		"patched_tool_message_ids":          stats.PatchedToolMessageIDs,
+		"merged_assistant_messages":         stats.MergedAssistantMessages,
+		"patched_assistant_tool_call_ids":   stats.PatchedAssistantToolCallIDs,
+		"patched_assistant_tool_call_names": stats.PatchedAssistantToolCallNames,
+		"normalized_assistant_content":      stats.NormalizedAssistantContent,
 	}).Debug("openai compat executor: normalized tool-call message sequence")
 
 	return out, nil
@@ -1213,6 +1298,7 @@ func normalizeOpenAICompatMessageSequence(rawMessages []json.RawMessage) ([]json
 			return rawMessages, stats, errNormalize
 		}
 		stats.PatchedAssistantToolCallIDs += assistantStats.PatchedAssistantToolCallIDs
+		stats.PatchedAssistantToolCallNames += assistantStats.PatchedAssistantToolCallNames
 		stats.NormalizedAssistantContent += assistantStats.NormalizedAssistantContent
 		stats.NormalizedToolArguments += assistantStats.NormalizedToolArguments
 
@@ -1383,6 +1469,22 @@ func normalizeOpenAICompatAssistantToolCalls(raw json.RawMessage, msgIdx int) (j
 				return nil, nil, stats, fmt.Errorf("openai compat executor: failed to normalize tool_call arguments: %w", errSet)
 			}
 			stats.NormalizedToolArguments++
+		}
+
+		functionName := strings.TrimSpace(toolCall.Get("function.name").String())
+		if functionName == "" {
+			// Some clients (notably those sending Claude- or Gemini-style
+			// tool calls through the OpenAI-compat executor) emit assistant
+			// tool_calls with an empty function.name. Upstream providers
+			// (e.g. DeepSeek v4) reject such requests with 400 "invalid
+			// tool_call function, function/name cannot be empty". Backfill
+			// with a placeholder so the request is accepted; the upstream
+			// still pairs the call with the matching tool result by id.
+			placeholder := openAICompatFallbackToolName(toolCallID)
+			if next, errSetName := sjson.SetBytes(toolCallRaw, "function.name", placeholder); errSetName == nil {
+				toolCallRaw = next
+				stats.PatchedAssistantToolCallNames++
+			}
 		}
 		toolCallIDs = append(toolCallIDs, toolCallID)
 		wrapper, errSet = sjson.SetRawBytes(wrapper, "tool_calls.-1", toolCallRaw)
@@ -1616,6 +1718,31 @@ func normalizeOpenAICompatFunctionArguments(arguments gjson.Result) string {
 		return "{}"
 	}
 	return string(wrapped)
+}
+
+func openAICompatFallbackToolName(toolCallID string) string {
+	const prefix = "tool_call_"
+	trimmed := strings.TrimSpace(toolCallID)
+	if trimmed == "" {
+		return "tool_call"
+	}
+
+	var b strings.Builder
+	b.Grow(len(prefix) + len(trimmed))
+	b.WriteString(prefix)
+	for i := 0; i < len(trimmed); i++ {
+		c := trimmed[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-' {
+			b.WriteByte(c)
+			continue
+		}
+		b.WriteByte('_')
+	}
+	name := b.String()
+	if len(name) > 64 {
+		return name[:64]
+	}
+	return name
 }
 
 // debugLogMessageStructure logs detailed message structure for diagnosing tool call issues.
