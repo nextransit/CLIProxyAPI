@@ -100,6 +100,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, opts.Stream)
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	translated = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", translated, originalTranslated, requestedModel)
+	translated = removeUnsupportedClaudeBuiltinToolsForOpenAICompat(translated, originalPayload)
 	if opts.Alt == "responses/compact" {
 		if updated, errDelete := sjson.DeleteBytes(translated, "stream"); errDelete == nil {
 			translated = updated
@@ -326,6 +327,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, true)
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	translated = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", translated, originalTranslated, requestedModel)
+	translated = removeUnsupportedClaudeBuiltinToolsForOpenAICompat(translated, originalPayload)
 
 	translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -974,6 +976,109 @@ func hasOpenAICompatTools(payload []byte) bool {
 		return true
 	}
 	return gjson.GetBytes(payload, "tool_choice").Exists() || gjson.GetBytes(payload, "tool_functions").Exists()
+}
+
+func removeUnsupportedClaudeBuiltinToolsForOpenAICompat(payload []byte, original []byte) []byte {
+	builtinNames := claudeBuiltinToolNamesFromOriginalRequest(original)
+	if len(builtinNames) == 0 || len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return payload
+	}
+	tools := gjson.GetBytes(payload, "tools")
+	if !tools.IsArray() || len(tools.Array()) == 0 {
+		return payload
+	}
+
+	out := payload
+	keptTools := make([]any, 0, len(tools.Array()))
+	removed := 0
+	for _, tool := range tools.Array() {
+		name := strings.TrimSpace(tool.Get("function.name").String())
+		if name == "" {
+			name = strings.TrimSpace(tool.Get("name").String())
+		}
+		if _, ok := builtinNames[name]; ok {
+			removed++
+			continue
+		}
+		keptTools = append(keptTools, tool.Value())
+	}
+	if removed == 0 {
+		return payload
+	}
+
+	var errSet error
+	if len(keptTools) == 0 {
+		if next, errDelete := sjson.DeleteBytes(out, "tools"); errDelete == nil {
+			out = next
+		}
+		if next, errDelete := sjson.DeleteBytes(out, "tool_choice"); errDelete == nil {
+			out = next
+		}
+	} else {
+		out, errSet = sjson.SetBytes(out, "tools", keptTools)
+		if errSet != nil {
+			return payload
+		}
+		if choiceName := strings.TrimSpace(gjson.GetBytes(out, "tool_choice.function.name").String()); choiceName != "" {
+			if _, ok := builtinNames[choiceName]; ok {
+				if next, errDelete := sjson.DeleteBytes(out, "tool_choice"); errDelete == nil {
+					out = next
+				}
+			}
+		}
+	}
+
+	log.WithField("removed_builtin_tools", removed).
+		Debug("openai compat executor: removed unsupported Claude built-in tools")
+	return out
+}
+
+func claudeBuiltinToolNamesFromOriginalRequest(original []byte) map[string]struct{} {
+	if len(original) == 0 || !gjson.ValidBytes(original) {
+		return nil
+	}
+	tools := gjson.GetBytes(original, "tools")
+	if !tools.IsArray() {
+		return nil
+	}
+	out := make(map[string]struct{})
+	for _, tool := range tools.Array() {
+		if tool.Get("input_schema").Exists() {
+			continue
+		}
+		if name := claudeBuiltinToolName(tool); name != "" {
+			out[name] = struct{}{}
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func claudeBuiltinToolName(tool gjson.Result) string {
+	toolType := strings.ToLower(strings.TrimSpace(tool.Get("type").String()))
+	if toolType == "" {
+		return ""
+	}
+	prefixName := claudeBuiltinToolNameFromType(toolType)
+	if prefixName == "" {
+		return ""
+	}
+	name := strings.TrimSpace(tool.Get("name").String())
+	if name != "" {
+		return name
+	}
+	return prefixName
+}
+
+func claudeBuiltinToolNameFromType(toolType string) string {
+	for _, prefix := range []string{"web_search", "code_execution", "text_editor", "computer"} {
+		if strings.HasPrefix(toolType, prefix) {
+			return prefix
+		}
+	}
+	return ""
 }
 
 // ensureDeepSeekToolMessageNames fills the legacy tool message name field.

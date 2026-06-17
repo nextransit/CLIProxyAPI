@@ -599,7 +599,8 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 }
 
 // pickByWeightedSessionShare picks an auth using the configured weight and the
-// number of sessions already bound to each auth. New sessions go to the auth
+// number of sessions already bound to each auth for the same provider/model
+// routing scope. New sessions go to the auth
 // with the largest remaining weight share (weight / (1 + bound_sessions)),
 // so that N concurrent sessions distribute across available keys in
 // proportion to their configured weights. Already-bound sessions are not
@@ -618,7 +619,7 @@ func (s *SessionAffinitySelector) pickByWeightedSessionShare(ctx context.Context
 		return nil, err
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
-	boundByAuth := s.cache.CountByAuth()
+	boundByAuth := s.cache.CountByAuthFor(provider, model)
 	// Compute weight share for every available auth. Ties keep the incoming
 	// auth order, matching the configured fallback selector's candidate order.
 	var best *Auth

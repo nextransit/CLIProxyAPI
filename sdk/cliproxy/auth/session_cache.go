@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"strings"
 	"sync"
 	"time"
 )
@@ -122,15 +123,16 @@ func (c *SessionCache) InvalidateAuth(authID string) {
 	c.mu.Unlock()
 }
 
-// CountByAuth returns a map of authID to the number of currently active
-// sessions bound to it. Expired entries are excluded. Used by the weighted
-// session-affinity selector to spread new sessions across auths in proportion
-// to each auth's configured weight.
-func (c *SessionCache) CountByAuth() map[string]int {
+// CountByAuthFor returns a map of authID to the number of currently active
+// sessions bound to it for the same provider/model routing scope. Expired
+// entries are excluded.
+func (c *SessionCache) CountByAuthFor(provider, model string) map[string]int {
 	out := map[string]int{}
 	if c == nil {
 		return out
 	}
+	providerPrefix := provider + "::"
+	modelSuffix := "::" + model
 	now := time.Now()
 	c.mu.RLock()
 	entries := make([]sessionEntry, 0, len(c.entries))
@@ -138,6 +140,12 @@ func (c *SessionCache) CountByAuth() map[string]int {
 	for sid, entry := range c.entries {
 		if now.After(entry.expiresAt) {
 			expired = append(expired, sid)
+			continue
+		}
+		if provider != "" && !strings.HasPrefix(sid, providerPrefix) {
+			continue
+		}
+		if model != "" && !strings.HasSuffix(sid, modelSuffix) {
 			continue
 		}
 		entries = append(entries, entry)

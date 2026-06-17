@@ -45,7 +45,7 @@ func TestManager_UpdateDisabledAuthClearsSessionBindings(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pick 2: %v", err)
 	}
-	bindings := sel.cache.CountByAuth()
+	bindings := sel.cache.CountByAuthFor("claude", "model-x")
 	if bindings[first.ID] == 0 || bindings[second.ID] == 0 {
 		t.Fatalf("expected each auth to have at least one binding, got %+v", bindings)
 	}
@@ -60,7 +60,7 @@ func TestManager_UpdateDisabledAuthClearsSessionBindings(t *testing.T) {
 		t.Fatalf("disable: %v", err)
 	}
 
-	after := sel.cache.CountByAuth()
+	after := sel.cache.CountByAuthFor("claude", "model-x")
 	if after[first.ID] != 0 {
 		t.Fatalf("disabled auth %s still has %d session bindings; expected 0", first.ID, after[first.ID])
 	}

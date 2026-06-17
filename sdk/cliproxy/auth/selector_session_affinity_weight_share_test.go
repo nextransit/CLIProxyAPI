@@ -105,6 +105,51 @@ func TestSessionAffinity_StickyWithinSessionAfterWeightedPick(t *testing.T) {
 	}
 }
 
+func TestSessionAffinity_WeightedShareScopedByProviderAndModel(t *testing.T) {
+	authA := &Auth{
+		ID:         "auth-A",
+		Provider:   "claude",
+		Attributes: map[string]string{"weight": "1"},
+		Metadata:   map[string]any{"type": "claude"},
+	}
+	authB := &Auth{
+		ID:         "auth-B",
+		Provider:   "claude",
+		Attributes: map[string]string{"weight": "1"},
+		Metadata:   map[string]any{"type": "claude"},
+	}
+	auths := []*Auth{authA, authB}
+	sel := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback:    &RoundRobinSelector{},
+		TTL:         time.Hour,
+		MaxRequests: 1000,
+	})
+
+	// Bind auth-A heavily under a different model. The next session for
+	// model-y should still start from auth-A because share accounting is scoped
+	// to provider/model, not the auth globally.
+	for i := 0; i < 4; i++ {
+		opts := cliproxyexecutor.Options{OriginalRequest: []byte(buildSessionPayload(100 + i))}
+		picked, err := sel.Pick(context.Background(), "claude", "model-x", opts, []*Auth{authA})
+		if err != nil {
+			t.Fatalf("seed model-x %d: %v", i, err)
+		}
+		if picked.ID != "auth-A" {
+			t.Fatalf("seed model-x picked %s, want auth-A", picked.ID)
+		}
+	}
+
+	got, err := sel.Pick(context.Background(), "claude", "model-y", cliproxyexecutor.Options{
+		OriginalRequest: []byte(buildSessionPayload(200)),
+	}, auths)
+	if err != nil {
+		t.Fatalf("pick model-y: %v", err)
+	}
+	if got.ID != "auth-A" {
+		t.Fatalf("model-y pick = %s, want auth-A unaffected by model-x bindings", got.ID)
+	}
+}
+
 // buildSessionPayload builds a Claude-Code-style metadata.user_id string with
 // a unique session UUID, matching the format extractSessionIDs parses.
 func buildSessionPayload(idx int) string {

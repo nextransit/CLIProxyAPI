@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -72,6 +73,81 @@ func TestNormalizeOpenAICompatToolMessagesRepairsToolSequence(t *testing.T) {
 	}
 	if got := messages[6].Get("content").String(); got != "after tools" {
 		t.Fatalf("messages[6].content = %q, want after tools", got)
+	}
+}
+
+func TestRemoveUnsupportedClaudeBuiltinToolsForOpenAICompatDropsForcedWebSearch(t *testing.T) {
+	original := []byte(`{
+		"tools":[{"type":"web_search_20250305","name":"web_search","max_uses":8}],
+		"tool_choice":{"type":"tool","name":"web_search"}
+	}`)
+	payload := []byte(`{
+		"model":"deepseek-v4-flash",
+		"messages":[{"role":"user","content":"search"}],
+		"tools":[{"type":"function","function":{"name":"web_search","description":""}}],
+		"tool_choice":{"type":"function","function":{"name":"web_search"}}
+	}`)
+
+	out := removeUnsupportedClaudeBuiltinToolsForOpenAICompat(payload, original)
+	if gjson.GetBytes(out, "tools").Exists() {
+		t.Fatalf("tools should be removed for unsupported Claude built-in web_search: %s", string(out))
+	}
+	if gjson.GetBytes(out, "tool_choice").Exists() {
+		t.Fatalf("tool_choice should be removed with the unsupported forced built-in: %s", string(out))
+	}
+}
+
+func TestRemoveUnsupportedClaudeBuiltinToolsForOpenAICompatKeepsCustomTools(t *testing.T) {
+	original := []byte(`{
+		"tools":[
+			{"type":"web_search_20250305","name":"web_search","max_uses":8},
+			{"name":"Bash","description":"Run command","input_schema":{"type":"object","properties":{"command":{"type":"string"}}}}
+		],
+		"tool_choice":{"type":"tool","name":"web_search"}
+	}`)
+	payload := []byte(`{
+		"model":"deepseek-v4-flash",
+		"messages":[{"role":"user","content":"run"}],
+		"tools":[
+			{"type":"function","function":{"name":"web_search","description":""}},
+			{"type":"function","function":{"name":"Bash","description":"Run command","parameters":{"type":"object","properties":{"command":{"type":"string"}}}}}
+		],
+		"tool_choice":{"type":"function","function":{"name":"web_search"}}
+	}`)
+
+	out := removeUnsupportedClaudeBuiltinToolsForOpenAICompat(payload, original)
+	tools := gjson.GetBytes(out, "tools").Array()
+	if len(tools) != 1 {
+		t.Fatalf("tools len = %d, want 1: %s", len(tools), string(out))
+	}
+	if got := tools[0].Get("function.name").String(); got != "Bash" {
+		t.Fatalf("kept tool name = %q, want Bash: %s", got, string(out))
+	}
+	if gjson.GetBytes(out, "tool_choice").Exists() {
+		t.Fatalf("tool_choice should be removed because it targeted the built-in: %s", string(out))
+	}
+	if !json.Valid(out) {
+		t.Fatalf("output is not valid JSON: %s", string(out))
+	}
+}
+
+func TestRemoveUnsupportedClaudeBuiltinToolsForOpenAICompatIgnoresUnknownTypedTools(t *testing.T) {
+	original := []byte(`{
+		"tools":[{"type":"vendor_tool_20260101","name":"vendor_tool"}]
+	}`)
+	payload := []byte(`{
+		"model":"deepseek-v4-flash",
+		"messages":[{"role":"user","content":"run"}],
+		"tools":[{"type":"function","function":{"name":"vendor_tool","description":"Vendor tool"}}],
+		"tool_choice":{"type":"function","function":{"name":"vendor_tool"}}
+	}`)
+
+	out := removeUnsupportedClaudeBuiltinToolsForOpenAICompat(payload, original)
+	if got := gjson.GetBytes(out, "tools.#").Int(); got != 1 {
+		t.Fatalf("unknown typed tool should be preserved, tools len = %d: %s", got, string(out))
+	}
+	if !gjson.GetBytes(out, "tool_choice").Exists() {
+		t.Fatalf("tool_choice for unknown typed tool should be preserved: %s", string(out))
 	}
 }
 

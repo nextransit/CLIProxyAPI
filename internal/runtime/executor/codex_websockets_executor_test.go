@@ -7,11 +7,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+	log "github.com/sirupsen/logrus"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
@@ -19,6 +21,40 @@ import (
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	"github.com/tidwall/gjson"
 )
+
+// captureLogger redirects logrus output into a thread-safe buffer for the
+// duration of the test. Returns a string reader the caller can assert on.
+func captureLogger(t *testing.T) *syncBuffer {
+	t.Helper()
+	buf := &syncBuffer{buf: &bytes.Buffer{}}
+	logger := log.StandardLogger()
+	previousOutput := logger.Out
+	previousLevel := logger.Level
+	log.SetOutput(buf)
+	log.SetLevel(log.DebugLevel)
+	t.Cleanup(func() {
+		log.SetOutput(previousOutput)
+		log.SetLevel(previousLevel)
+	})
+	return buf
+}
+
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf *bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
 
 func TestBuildCodexWebsocketRequestBodyPreservesPreviousResponseID(t *testing.T) {
 	body := []byte(`{"model":"gpt-5-codex","previous_response_id":"resp-1","input":[{"type":"message","id":"msg-1"}]}`)
@@ -566,4 +602,275 @@ func headerValueCaseInsensitive(headers http.Header, key string) string {
 		}
 	}
 	return ""
+}
+
+// TestCodexWebsocketsExecuteReadErrorLogsAtErrorLevel verifies that when the
+// upstream websocket is severed mid-stream (the situation behind Codex's
+// "stream disconnected before completion: max_output_tokens" error) the
+// executor surfaces the failure via an Errorf/Warnf log line — previously it
+// was silent because the read loop only wrote metrics.
+func TestCodexWebsocketsExecuteReadErrorLogsAtErrorLevel(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade websocket: %v", err)
+			return
+		}
+		// Read the request, then immediately close without sending any
+		// event — this mimics OpenAI abruptly closing the connection
+		// after a max_output_tokens or context-window termination.
+		if _, _, errRead := conn.ReadMessage(); errRead != nil {
+			return
+		}
+		_ = conn.Close()
+	}))
+	defer server.Close()
+
+	buf := captureLogger(t)
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5-codex",
+		Payload: []byte(`{"model":"gpt-5-codex","input":[]}`),
+	}
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("codex")}
+
+	_, _ = exec.Execute(context.Background(), auth, req, opts)
+
+	// Give the read goroutine time to surface the failure.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(buf.String(), "read message failed") ||
+			strings.Contains(buf.String(), "upstream disconnected") {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "read message failed") {
+		t.Fatalf("expected Errorf/Warnf log line about read message failure, got: %q", out)
+	}
+	if !strings.Contains(out, "upstream disconnected") {
+		t.Fatalf("expected disconnect log line, got: %q", out)
+	}
+}
+
+// TestCodexWebsocketsExecuteUpstreamErrorLogsAtErrorLevel verifies that an
+// inbound {"type":"error"} event surfaces through an Errorf/Warnf line so
+// operators see it without grepping the raw stream dump.
+func TestCodexWebsocketsExecuteUpstreamErrorLogsAtErrorLevel(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade websocket: %v", err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		if _, _, errRead := conn.ReadMessage(); errRead != nil {
+			return
+		}
+		errPayload := []byte(`{"type":"error","status":429,"error":{"type":"rate_limit_error","message":"slow down"}}`)
+		_ = conn.WriteMessage(websocket.TextMessage, errPayload)
+	}))
+	defer server.Close()
+
+	buf := captureLogger(t)
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5-codex",
+		Payload: []byte(`{"model":"gpt-5-codex","input":[]}`),
+	}
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("codex")}
+
+	_, _ = exec.Execute(context.Background(), auth, req, opts)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(buf.String(), "upstream error event") {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "upstream error event") {
+		t.Fatalf("expected Errorf/Warnf log line for upstream error event, got: %q", out)
+	}
+}
+
+// TestCodexWebsocketsExecuteMaxOutputTokensLogsWarning verifies that a
+// response.completed event with status_details.reason=max_output_tokens is
+// surfaced as a Warnf so the user can see why CPA produced an empty stream.
+func TestCodexWebsocketsExecuteMaxOutputTokensLogsWarning(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade websocket: %v", err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		if _, _, errRead := conn.ReadMessage(); errRead != nil {
+			return
+		}
+		completed := []byte(`{"type":"response.completed","response":{"id":"resp-1","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[],"usage":{"input_tokens":1,"output_tokens":0,"total_tokens":1}}}`)
+		_ = conn.WriteMessage(websocket.TextMessage, completed)
+	}))
+	defer server.Close()
+
+	buf := captureLogger(t)
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5-codex",
+		Payload: []byte(`{"model":"gpt-5-codex","input":[]}`),
+	}
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("codex")}
+
+	_, _ = exec.Execute(context.Background(), auth, req, opts)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(buf.String(), "max_output_tokens") {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "max_output_tokens") {
+		t.Fatalf("expected Warnf log line mentioning max_output_tokens, got: %q", out)
+	}
+}
+
+// TestParseCodexWebsocketErrorAcceptsResponseFailed verifies the parser
+// recognises type=response.failed payloads (which embed an error object under
+// response.error) and surfaces them as a typed upstream error.
+func TestParseCodexWebsocketErrorAcceptsResponseFailed(t *testing.T) {
+	payload := []byte(`{"type":"response.failed","response":{"id":"resp-1","error":{"code":"server_error","message":"upstream is overloaded"}}}`)
+
+	err, ok := parseCodexWebsocketError(payload)
+	if !ok {
+		t.Fatalf("expected parseCodexWebsocketError to recognise response.failed, got ok=false")
+	}
+	if err == nil {
+		t.Fatal("expected non-nil error")
+	}
+	if !strings.Contains(err.Error(), "server_error") && !strings.Contains(err.Error(), "upstream is overloaded") {
+		t.Fatalf("error message lost server_error / message: %v", err)
+	}
+}
+
+// TestWebsocketErrorStageAnnotatesCloseCode verifies that metrics events for
+// websocket failures carry a stage label with the close code, so operators
+// can distinguish abnormal closures (1006) from upstream-initiated
+// terminations (e.g. 1008, 1011, 1013) without grepping raw stream dumps.
+func TestWebsocketErrorStageAnnotatesCloseCode(t *testing.T) {
+	t.Parallel()
+
+	closeErr := &websocket.CloseError{Code: websocket.CloseAbnormalClosure, Text: "abnormal"}
+	plainErr := errors.New("transport broken")
+
+	cases := []struct {
+		name  string
+		stage string
+		err   error
+		want  string
+	}{
+		{"close code attached", "read", closeErr, "read:1006"},
+		{"nil error keeps plain stage", "read", nil, "read"},
+		{"non-close error keeps plain stage", "upstream_error", plainErr, "upstream_error"},
+		{"blank stage falls back to unknown", "", closeErr, "unknown:1006"},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := websocketErrorStage(tc.stage, tc.err); got != tc.want {
+				t.Fatalf("websocketErrorStage(%q, %v) = %q, want %q", tc.stage, tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestIsAbnormalDisconnectReason verifies that the helper used by
+// logCodexWebsocketDisconnected to escalate to Warnf recognises every
+// failure-mode reason emitted by the executor.
+func TestIsAbnormalDisconnectReason(t *testing.T) {
+	t.Parallel()
+
+	abnormal := []string{"read_error", "upstream_error", "unexpected_binary", "send_error", "dial_error"}
+	for _, reason := range abnormal {
+		if !isAbnormalDisconnectReason(reason) {
+			t.Errorf("expected %q to be classified as abnormal", reason)
+		}
+	}
+	for _, reason := range []string{"context_done", "completed", "session_closed"} {
+		if isAbnormalDisconnectReason(reason) {
+			t.Errorf("expected %q to be classified as normal", reason)
+		}
+	}
+}
+
+// TestDescribeCodexResponseTermination walks every shape of upstream
+// termination reason the Codex Responses API has shipped, so future
+// regressions in describeCodexResponseTermination are caught by the test
+// suite rather than by 3am pager alerts.
+func TestDescribeCodexResponseTermination(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name    string
+		payload string
+		want    string
+	}{
+		{
+			name:    "incomplete_details reason",
+			payload: `{"type":"response.completed","response":{"incomplete_details":{"reason":"max_output_tokens"}}}`,
+			want:    "max_output_tokens",
+		},
+		{
+			name:    "status_details reason",
+			payload: `{"type":"response.completed","response":{"status_details":{"reason":"max_output_tokens"}}}`,
+			want:    "max_output_tokens",
+		},
+		{
+			name:    "context length exceeded",
+			payload: `{"type":"response.completed","response":{"incomplete_details":{"reason":"context_length_exceeded"}}}`,
+			want:    "context_length_exceeded",
+		},
+		{
+			name:    "incomplete status",
+			payload: `{"type":"response.completed","response":{"status":"incomplete"}}`,
+			want:    "incomplete",
+		},
+		{
+			name:    "completed status returns empty",
+			payload: `{"type":"response.completed","response":{"status":"completed"}}`,
+			want:    "",
+		},
+		{
+			name:    "empty payload",
+			payload: ``,
+			want:    ``,
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := describeCodexResponseTermination([]byte(tc.payload)); got != tc.want {
+				t.Fatalf("describeCodexResponseTermination() = %q, want %q", got, tc.want)
+			}
+		})
+	}
 }

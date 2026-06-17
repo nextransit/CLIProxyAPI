@@ -5,6 +5,7 @@ package executor
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -335,12 +336,16 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		}
 		msgType, payload, errRead := readCodexWebsocketMessage(ctx, sess, conn, readCh)
 		if errRead != nil {
-			helps.RecordAPIWebsocketError(ctx, e.cfg, "read", errRead)
+			// Operators rely on logs (not metrics) to spot upstream
+			// disconnects, so surface the failure at error level.
+			log.Errorf("codex websockets executor: read message failed: %v", errRead)
+			helps.RecordAPIWebsocketError(ctx, e.cfg, websocketErrorStage("read", errRead), errRead)
 			return resp, errRead
 		}
 		if msgType != websocket.TextMessage {
 			if msgType == websocket.BinaryMessage {
 				err = fmt.Errorf("codex websockets executor: unexpected binary message")
+				log.Errorf("codex websockets executor: %v", err)
 				if sess != nil {
 					e.invalidateUpstreamConn(sess, conn, "unexpected_binary", err)
 				}
@@ -357,6 +362,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		helps.AppendAPIWebsocketResponse(ctx, e.cfg, payload)
 
 		if wsErr, ok := parseCodexWebsocketError(payload); ok {
+			log.Errorf("codex websockets executor: upstream error event: %v", wsErr)
 			if sess != nil {
 				e.invalidateUpstreamConn(sess, conn, "upstream_error", wsErr)
 			}
@@ -370,6 +376,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			if detail, ok := helps.ParseCodexUsage(payload); ok {
 				reporter.Publish(ctx, detail)
 			}
+			logCodexResponseTermination(req.Model, executionSessionID, describeCodexResponseTermination(payload))
 			var param any
 			out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalPayload, body, payload, &param)
 			resp = cliproxyexecutor.Response{Payload: out}
@@ -575,7 +582,11 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				}
 				terminateReason = "read_error"
 				terminateErr = errRead
-				helps.RecordAPIWebsocketError(ctx, e.cfg, "read", errRead)
+				// Operators rely on logs (not metrics) to spot upstream
+				// disconnects like OpenAI's "max_output_tokens" stream
+				// truncation, so surface the failure at error level.
+				log.Errorf("codex websockets executor: read message failed: %v", errRead)
+				helps.RecordAPIWebsocketError(ctx, e.cfg, websocketErrorStage("read", errRead), errRead)
 				reporter.PublishFailure(ctx)
 				_ = send(cliproxyexecutor.StreamChunk{Err: errRead})
 				return
@@ -585,6 +596,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 					err = fmt.Errorf("codex websockets executor: unexpected binary message")
 					terminateReason = "unexpected_binary"
 					terminateErr = err
+					log.Errorf("codex websockets executor: %v", err)
 					helps.RecordAPIWebsocketError(ctx, e.cfg, "unexpected_binary", err)
 					reporter.PublishFailure(ctx)
 					if sess != nil {
@@ -605,6 +617,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			if wsErr, ok := parseCodexWebsocketError(payload); ok {
 				terminateReason = "upstream_error"
 				terminateErr = wsErr
+				log.Errorf("codex websockets executor: upstream error event: %v", wsErr)
 				helps.RecordAPIWebsocketError(ctx, e.cfg, "upstream_error", wsErr)
 				reporter.PublishFailure(ctx)
 				if sess != nil {
@@ -620,6 +633,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 				if detail, ok := helps.ParseCodexUsage(payload); ok {
 					reporter.Publish(ctx, detail)
 				}
+				logCodexResponseTermination(req.Model, executionSessionID, describeCodexResponseTermination(payload))
 			}
 
 			line := encodeCodexWebsocketAsSSE(payload)
@@ -1011,9 +1025,23 @@ func parseCodexWebsocketError(payload []byte) (error, bool) {
 	if len(payload) == 0 {
 		return nil, false
 	}
-	if strings.TrimSpace(gjson.GetBytes(payload, "type").String()) != "error" {
+	eventType := strings.TrimSpace(gjson.GetBytes(payload, "type").String())
+	switch eventType {
+	case "error":
+		return parseCodexWebsocketErrorEnvelope(payload)
+	case "response.failed":
+		// OpenAI sometimes wraps the failure inside a response envelope
+		// (e.g. {"type":"response.failed","response":{"error":{...}}})
+		// instead of the top-level error shape. Normalise it through the
+		// same statusErr pipeline so the rest of the executor can treat
+		// both formats uniformly.
+		return parseCodexWebsocketResponseFailed(payload)
+	default:
 		return nil, false
 	}
+}
+
+func parseCodexWebsocketErrorEnvelope(payload []byte) (error, bool) {
 	status := int(gjson.GetBytes(payload, "status").Int())
 	if status == 0 {
 		status = int(gjson.GetBytes(payload, "status_code").Int())
@@ -1046,6 +1074,58 @@ func parseCodexWebsocketError(payload []byte) (error, bool) {
 		out, _ = sjson.SetBytes(out, "error.message", http.StatusText(status))
 	}
 	out, _ = sjson.SetBytes(out, "status", status)
+
+	headers := parseCodexWebsocketErrorHeaders(payload)
+	retryAfter := parseCodexWebsocketRetryAfter(status, out, headers)
+	return statusErrWithHeaders{
+		statusErr: statusErr{code: status, msg: string(out), retryAfter: retryAfter},
+		headers:   headers,
+	}, true
+}
+
+// parseCodexWebsocketResponseFailed handles the response.failed envelope,
+// synthesising a status code from the embedded error when the upstream
+// omitted one (the common case for streaming responses).
+func parseCodexWebsocketResponseFailed(payload []byte) (error, bool) {
+	errorNode := gjson.GetBytes(payload, "response.error")
+	if !errorNode.Exists() {
+		errorNode = gjson.GetBytes(payload, "error")
+	}
+	if !errorNode.Exists() {
+		return nil, false
+	}
+
+	status := int(gjson.GetBytes(payload, "status").Int())
+	if status == 0 {
+		status = int(gjson.GetBytes(payload, "response.status_code").Int())
+	}
+	if status == 0 {
+		switch strings.TrimSpace(gjson.GetBytes([]byte(errorNode.Raw), "code").String()) {
+		case "context_length_exceeded":
+			status = http.StatusRequestEntityTooLarge
+		case "rate_limit_exceeded", "rate_limit_error":
+			status = http.StatusTooManyRequests
+		case "invalid_request_error":
+			status = http.StatusBadRequest
+		case "authentication_error":
+			status = http.StatusUnauthorized
+		default:
+			status = http.StatusBadGateway
+		}
+	}
+
+	out := []byte(`{}`)
+	if errorNode.IsObject() {
+		out, _ = sjson.SetRawBytes(out, "error", []byte(errorNode.Raw))
+	} else if errorNode.Type == gjson.String {
+		out, _ = sjson.SetBytes(out, "error.message", errorNode.String())
+		out, _ = sjson.SetBytes(out, "error.type", "server_error")
+	}
+	if statusField := strings.TrimSpace(gjson.GetBytes(payload, "response.status").String()); statusField != "" {
+		out, _ = sjson.SetBytes(out, "status", statusField)
+	} else {
+		out, _ = sjson.SetBytes(out, "status", status)
+	}
 
 	headers := parseCodexWebsocketErrorHeaders(payload)
 	retryAfter := parseCodexWebsocketRetryAfter(status, out, headers)
@@ -1122,6 +1202,50 @@ func normalizeCodexWebsocketCompletion(payload []byte) []byte {
 		}
 	}
 	return payload
+}
+
+// describeCodexResponseTermination inspects a response.completed /
+// response.done payload for the upstream termination reason (e.g.
+// "max_output_tokens", "context_length_exceeded") and returns a short
+// human-readable label. The empty string means "no abnormal termination
+// signalled" — i.e. the response finished naturally.
+//
+// OpenAI has used three locations for this signal over time; the helper
+// walks them in order of preference so callers always get the freshest
+// shape:
+//
+//  1. response.incomplete_details.reason   (current Responses API)
+//  2. response.status_details.reason       (some streaming variants)
+//  3. response.status                      (older "incomplete" /
+//     "failed" status strings)
+func describeCodexResponseTermination(payload []byte) string {
+	if len(payload) == 0 {
+		return ""
+	}
+	for _, path := range []string{
+		"response.incomplete_details.reason",
+		"response.status_details.reason",
+		"response.incomplete_details",
+	} {
+		if value := strings.TrimSpace(gjson.GetBytes(payload, path).String()); value != "" {
+			return value
+		}
+	}
+	if status := strings.TrimSpace(gjson.GetBytes(payload, "response.status").String()); status != "" && status != "completed" {
+		return status
+	}
+	return ""
+}
+
+// logCodexResponseTermination emits a single Warnf when a response completes
+// in a degraded state (most commonly max_output_tokens). Without this line,
+// the client only sees an empty stream with no clue why the model went
+// silent — a frequent support complaint.
+func logCodexResponseTermination(model, sessionID, reason string) {
+	if reason == "" {
+		return
+	}
+	log.Warnf("codex websockets executor: upstream terminated response reason=%s model=%s session=%s", strings.TrimSpace(reason), strings.TrimSpace(model), strings.TrimSpace(sessionID))
 }
 
 func encodeCodexWebsocketAsSSE(payload []byte) []byte {
@@ -1458,11 +1582,52 @@ func logCodexWebsocketConnected(sessionID string, authID string, wsURL string) {
 }
 
 func logCodexWebsocketDisconnected(sessionID string, authID string, wsURL string, reason string, err error) {
-	if err != nil {
-		log.Infof("codex websockets: upstream disconnected session=%s auth=%s url=%s reason=%s err=%v", strings.TrimSpace(sessionID), strings.TrimSpace(authID), strings.TrimSpace(wsURL), strings.TrimSpace(reason), err)
-		return
+	switch {
+	case err != nil:
+		// An upstream error accompanied the disconnect — this is a real
+		// failure (rate limit, max tokens, network drop) and must not be
+		// hidden behind the default Info level.
+		log.Errorf("codex websockets: upstream disconnected session=%s auth=%s url=%s reason=%s err=%v", strings.TrimSpace(sessionID), strings.TrimSpace(authID), strings.TrimSpace(wsURL), strings.TrimSpace(reason), err)
+	case isAbnormalDisconnectReason(reason):
+		// Caller classified the disconnect as abnormal (e.g. read_error,
+		// upstream_error, unexpected_binary) but the underlying read
+		// already logged the detail — surface a warn-level summary so
+		// operators can correlate it without having to read debug logs.
+		log.Warnf("codex websockets: upstream disconnected session=%s auth=%s url=%s reason=%s", strings.TrimSpace(sessionID), strings.TrimSpace(authID), strings.TrimSpace(wsURL), strings.TrimSpace(reason))
+	default:
+		log.Infof("codex websockets: upstream disconnected session=%s auth=%s url=%s reason=%s", strings.TrimSpace(sessionID), strings.TrimSpace(authID), strings.TrimSpace(wsURL), strings.TrimSpace(reason))
 	}
-	log.Infof("codex websockets: upstream disconnected session=%s auth=%s url=%s reason=%s", strings.TrimSpace(sessionID), strings.TrimSpace(authID), strings.TrimSpace(wsURL), strings.TrimSpace(reason))
+}
+
+// isAbnormalDisconnectReason reports whether a Codex websocket disconnect
+// reason indicates an upstream failure rather than a clean shutdown.
+func isAbnormalDisconnectReason(reason string) bool {
+	switch strings.TrimSpace(reason) {
+	case "read_error", "upstream_error", "unexpected_binary", "send_error", "dial_error":
+		return true
+	default:
+		return false
+	}
+}
+
+// websocketErrorStage returns a stage label for RecordAPIWebsocketError that
+// includes the WebSocket close code when the underlying error carries one.
+// This lets operators slice metrics by root cause (e.g. "read:1006" for
+// abnormal closures, "read:1011" for server errors) without changing the
+// helper's signature.
+func websocketErrorStage(stage string, err error) string {
+	trimmed := strings.TrimSpace(stage)
+	if trimmed == "" {
+		trimmed = "unknown"
+	}
+	if err == nil {
+		return trimmed
+	}
+	var closeErr *websocket.CloseError
+	if errors.As(err, &closeErr) {
+		return fmt.Sprintf("%s:%d", trimmed, closeErr.Code)
+	}
+	return trimmed
 }
 
 // CloseCodexWebsocketSessionsForAuthID closes all active Codex upstream websocket sessions
