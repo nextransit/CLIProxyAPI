@@ -154,11 +154,110 @@ func TestFinalizeStreamingWritesAPIWebsocketTimeline(t *testing.T) {
 	}
 }
 
+func TestDetectClaudeCodeToolFailure(t *testing.T) {
+	tests := []struct {
+		name string
+		body []byte
+		want string
+	}{
+		{
+			name: "no such tool",
+			body: []byte(`{"content":"No such tool available: bash"}`),
+			want: "no_such_tool_available",
+		},
+		{
+			name: "tool selection syntax",
+			body: []byte(`Those tool calls failed — the tool selection syntax is wrong.`),
+			want: "tool_selection_syntax_is_wrong",
+		},
+		{
+			name: "unrelated",
+			body: []byte(`{"content":"done"}`),
+			want: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := detectClaudeCodeToolFailure(tt.body); got != tt.want {
+				t.Fatalf("detectClaudeCodeToolFailure() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestExtractModelFromRequestBody(t *testing.T) {
+	body := []byte(`{"messages":[],"model":"deepseek-v4-flash","tools":[{"name":"Bash"}]}`)
+	if got := extractModelFromRequestBody(body); got != "deepseek-v4-flash" {
+		t.Fatalf("extractModelFromRequestBody() = %q, want %q", got, "deepseek-v4-flash")
+	}
+
+	if got := extractModelFromRequestBody([]byte(`{"messages":[]}`)); got != "" {
+		t.Fatalf("extractModelFromRequestBody() = %q, want empty", got)
+	}
+}
+
+func TestFinalizeForcesRequestLogForResponsesProtocolAnomaly(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	logger := &testRequestLogger{enabled: false}
+	wrapper := NewResponseWriterWrapper(c.Writer, logger, &RequestInfo{
+		URL:       "/v1/responses",
+		Method:    "POST",
+		Headers:   map[string][]string{"Content-Type": {"application/json"}},
+		Body:      []byte(`{"model":"gpt-5","input":"hello"}`),
+		RequestID: "deadbeef",
+		Timestamp: time.Date(2026, time.June, 20, 11, 26, 2, 0, time.UTC),
+	})
+	wrapper.logOnErrorOnly = true
+	c.Writer = wrapper
+
+	c.Set(responsesProtocolAnomalyContextKey, "max_output_tokens")
+	c.Writer.Header().Set("Content-Type", "text/event-stream")
+	c.Status(200)
+	_, _ = c.Writer.Write([]byte(`data: {"type":"response.completed","response":{"status":"completed","output":[{"type":"message","id":"msg-1"}],"incomplete_details":null}}`))
+
+	if err := wrapper.Finalize(c); err != nil {
+		t.Fatalf("Finalize error: %v", err)
+	}
+	if logger.logRequestCalls != 1 {
+		t.Fatalf("log request calls = %d, want 1", logger.logRequestCalls)
+	}
+	if !logger.force {
+		t.Fatal("expected forced request log")
+	}
+	if logger.statusCode != 200 {
+		t.Fatalf("status code = %d, want 200", logger.statusCode)
+	}
+	if !bytes.Contains(logger.requestBody, []byte(`"model":"gpt-5"`)) {
+		t.Fatalf("request body not captured: %s", logger.requestBody)
+	}
+	if !bytes.Contains(logger.responseBody, []byte(`response.completed`)) {
+		t.Fatalf("response body not captured: %s", logger.responseBody)
+	}
+}
+
 type testRequestLogger struct {
-	enabled bool
+	enabled         bool
+	force           bool
+	requestBody     []byte
+	responseBody    []byte
+	statusCode      int
+	logRequestCalls int
 }
 
 func (l *testRequestLogger) LogRequest(string, string, map[string][]string, []byte, int, map[string][]string, []byte, []byte, []byte, []byte, []byte, []*interfaces.ErrorMessage, string, time.Time, time.Time) error {
+	l.logRequestCalls++
+	return nil
+}
+
+func (l *testRequestLogger) LogRequestWithOptions(_ string, _ string, _ map[string][]string, requestBody []byte, statusCode int, _ map[string][]string, response []byte, _ []byte, _ []byte, _ []byte, _ []byte, _ []*interfaces.ErrorMessage, force bool, _ string, _ time.Time, _ time.Time) error {
+	l.logRequestCalls++
+	l.force = force
+	l.requestBody = bytes.Clone(requestBody)
+	l.responseBody = bytes.Clone(response)
+	l.statusCode = statusCode
 	return nil
 }
 

@@ -31,6 +31,16 @@ var logSearchAliases = map[string][]string{
 		"invalidated",
 		"invalid_request_error",
 	},
+	"claude_code_tool_call_failure": {
+		"claude_code_tool_call_failure",
+		"no such tool available",
+		"tool selection syntax",
+		"those tool calls failed",
+	},
+	"tool_selection": {
+		"tool selection syntax",
+		"no such tool available",
+	},
 }
 
 type logFileDescriptor struct {
@@ -90,6 +100,18 @@ func (h *Handler) GetLogs(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to read log file %s: %v", files[i], errProcess)})
 			return
 		}
+	}
+	errorFiles, errErrorFiles := h.collectRequestErrorLogFiles(logDir)
+	if errErrorFiles != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to list request error logs: %v", errErrorFiles)})
+		return
+	}
+	for i := range errorFiles {
+		line, errSummary := summarizeRequestErrorLog(errorFiles[i])
+		if errSummary != nil || line == "" {
+			continue
+		}
+		acc.addLine(line)
 	}
 
 	lines, total, latest := acc.result()
@@ -549,6 +571,181 @@ func (h *Handler) collectManagedLogFiles(dir string, search string) ([]logFileDe
 		return files[i].Modified > files[j].Modified
 	})
 	return files, nil
+}
+
+func (h *Handler) collectRequestErrorLogFiles(dir string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []string{}, nil
+		}
+		return nil, err
+	}
+
+	type candidate struct {
+		path    string
+		modTime time.Time
+	}
+	cands := make([]candidate, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !strings.HasPrefix(name, "error-") || !strings.HasSuffix(name, ".log") {
+			continue
+		}
+		info, errInfo := entry.Info()
+		if errInfo != nil {
+			return nil, errInfo
+		}
+		cands = append(cands, candidate{
+			path:    filepath.Join(dir, name),
+			modTime: info.ModTime(),
+		})
+	}
+	sort.Slice(cands, func(i, j int) bool {
+		if cands[i].modTime.Equal(cands[j].modTime) {
+			return cands[i].path < cands[j].path
+		}
+		return cands[i].modTime.Before(cands[j].modTime)
+	})
+	paths := make([]string, 0, len(cands))
+	for _, cand := range cands {
+		paths = append(paths, cand.path)
+	}
+	return paths, nil
+}
+
+type requestErrorLogSummary struct {
+	name      string
+	requestID string
+	timestamp time.Time
+	method    string
+	url       string
+	status    int
+}
+
+func summarizeRequestErrorLog(path string) (string, error) {
+	info, errStat := os.Stat(path)
+	if errStat != nil {
+		return "", errStat
+	}
+	if info.IsDir() {
+		return "", nil
+	}
+
+	summary := requestErrorLogSummary{
+		name:      filepath.Base(path),
+		requestID: requestIDFromLogFilename(filepath.Base(path)),
+		timestamp: info.ModTime(),
+		method:    "UNKNOWN",
+		url:       "/",
+		status:    http.StatusInternalServerError,
+	}
+
+	file, errOpen := os.Open(path)
+	if errOpen != nil {
+		return "", errOpen
+	}
+	defer func() {
+		_ = file.Close()
+	}()
+
+	scanner := bufio.NewScanner(file)
+	buf := make([]byte, 0, logScannerInitialBuffer)
+	scanner.Buffer(buf, logScannerMaxBuffer)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		switch {
+		case strings.HasPrefix(line, "URL:"):
+			if value := strings.TrimSpace(strings.TrimPrefix(line, "URL:")); value != "" {
+				summary.url = strings.SplitN(value, "?", 2)[0]
+			}
+		case strings.HasPrefix(line, "Method:"):
+			if value := strings.TrimSpace(strings.TrimPrefix(line, "Method:")); value != "" {
+				summary.method = strings.ToUpper(value)
+			}
+		case strings.HasPrefix(line, "Timestamp:"):
+			if parsed, ok := parseRequestLogTimestamp(strings.TrimSpace(strings.TrimPrefix(line, "Timestamp:"))); ok {
+				summary.timestamp = parsed
+			}
+		case strings.HasPrefix(line, "HTTP Status:"):
+			if status := parseStatusCode(strings.TrimSpace(strings.TrimPrefix(line, "HTTP Status:"))); status > 0 {
+				summary.status = status
+			}
+		case strings.HasPrefix(line, "Status:"):
+			if status := parseStatusCode(strings.TrimSpace(strings.TrimPrefix(line, "Status:"))); status > 0 {
+				summary.status = status
+			}
+		}
+	}
+	if errScan := scanner.Err(); errScan != nil {
+		return "", errScan
+	}
+
+	if summary.requestID == "" {
+		summary.requestID = "--------"
+	}
+	return fmt.Sprintf("[%s] [%s] [error] request_failed | %s %s %d | request_log=%s",
+		summary.timestamp.Local().Format("2006-01-02 15:04:05"),
+		summary.requestID,
+		summary.method,
+		summary.url,
+		summary.status,
+		summary.name,
+	), nil
+}
+
+func requestIDFromLogFilename(name string) string {
+	name = strings.TrimSuffix(strings.TrimSpace(name), ".log")
+	if name == "" {
+		return ""
+	}
+	idx := strings.LastIndexByte(name, '-')
+	if idx < 0 || idx == len(name)-1 {
+		return ""
+	}
+	candidate := name[idx+1:]
+	if len(candidate) == 8 && isLowerHex(candidate) {
+		return candidate
+	}
+	return ""
+}
+
+func isLowerHex(value string) bool {
+	for _, r := range value {
+		if (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') {
+			continue
+		}
+		return false
+	}
+	return value != ""
+}
+
+func parseRequestLogTimestamp(raw string) (time.Time, bool) {
+	if raw == "" {
+		return time.Time{}, false
+	}
+	if parsed, err := time.Parse(time.RFC3339Nano, raw); err == nil {
+		return parsed, true
+	}
+	if parsed, err := time.ParseInLocation("2006-01-02 15:04:05", raw, time.Local); err == nil {
+		return parsed, true
+	}
+	return time.Time{}, false
+}
+
+func parseStatusCode(raw string) int {
+	fields := strings.Fields(raw)
+	if len(fields) == 0 {
+		return 0
+	}
+	status, err := strconv.Atoi(fields[0])
+	if err != nil || status < 100 || status > 599 {
+		return 0
+	}
+	return status
 }
 
 type logAccumulator struct {

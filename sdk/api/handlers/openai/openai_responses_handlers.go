@@ -14,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	. "github.com/router-for-me/CLIProxyAPI/v6/internal/constant"
@@ -53,7 +54,10 @@ type responsesSSEFramer struct {
 	responseID           string
 	completedOutput      []byte
 	completed            bool
+	ginContext           *gin.Context
 }
+
+const responsesProtocolAnomalyContextKey = "RESPONSES_PROTOCOL_ANOMALY"
 
 func (f *responsesSSEFramer) WriteChunk(w io.Writer, chunk []byte) {
 	if len(chunk) == 0 {
@@ -109,17 +113,27 @@ func (f *responsesSSEFramer) repairFrame(frame []byte) []byte {
 		return frame
 	}
 
+	repaired := f.repairPayload(payload)
+	if !bytes.Equal(repaired, payload) {
+		return responsesSSEFrameWithData(frame, repaired)
+	}
+	return frame
+}
+
+func (f *responsesSSEFramer) repairPayload(payload []byte) []byte {
 	switch gjson.GetBytes(payload, "type").String() {
 	case "response.output_item.done":
 		f.recordOutputItem(payload)
 	case "response.completed":
 		repaired := f.repairCompletedPayload(payload)
-		f.recordCompletedPayload(repaired)
-		if !bytes.Equal(repaired, payload) {
-			return responsesSSEFrameWithData(frame, repaired)
+		if responseCompletedReasonIsMaxOutputTokens(repaired) {
+			markResponsesProtocolAnomaly(f.ginContext, "max_output_tokens")
 		}
+		repaired = normalizeMaxOutputTokensCompletedPayload(repaired)
+		f.recordCompletedPayload(repaired)
+		return repaired
 	}
-	return frame
+	return payload
 }
 
 func responsesSSEDataPayload(frame []byte) ([]byte, bool) {
@@ -227,6 +241,59 @@ func (f *responsesSSEFramer) recordCompletedPayload(payload []byte) {
 	f.responseID = responsesResponseIDFromPayload(payload)
 	f.completedOutput = responsesResponseOutputFromPayload(payload)
 	f.completed = true
+}
+
+func normalizeMaxOutputTokensCompletedPayload(payload []byte) []byte {
+	if gjson.GetBytes(payload, "type").String() != "response.completed" {
+		return payload
+	}
+	if !responseCompletedHasOutput(payload) || !responseCompletedReasonIsMaxOutputTokens(payload) {
+		return payload
+	}
+	if errResult := gjson.GetBytes(payload, "response.error"); errResult.Exists() && errResult.Type != gjson.Null {
+		return payload
+	}
+
+	updated, errSet := sjson.SetBytes(payload, "response.status", "completed")
+	if errSet != nil {
+		return payload
+	}
+	updated, errSet = sjson.SetRawBytes(updated, "response.incomplete_details", []byte("null"))
+	if errSet != nil {
+		return payload
+	}
+	if gjson.GetBytes(updated, "response.status_details").Exists() {
+		if withoutStatusDetails, errDelete := sjson.DeleteBytes(updated, "response.status_details"); errDelete == nil {
+			updated = withoutStatusDetails
+		}
+	}
+	return updated
+}
+
+func responseCompletedHasOutput(payload []byte) bool {
+	output := gjson.GetBytes(payload, "response.output")
+	return output.Exists() && output.IsArray() && len(output.Array()) > 0
+}
+
+func responseCompletedReasonIsMaxOutputTokens(payload []byte) bool {
+	for _, path := range []string{
+		"response.incomplete_details.reason",
+		"response.status_details.reason",
+		"response.incomplete_details",
+		"response.status_details",
+	} {
+		if gjson.GetBytes(payload, path).String() == "max_output_tokens" {
+			return true
+		}
+	}
+	return false
+}
+
+func markResponsesProtocolAnomaly(c *gin.Context, reason string) {
+	if c == nil || strings.TrimSpace(reason) == "" {
+		return
+	}
+	c.Set(responsesProtocolAnomalyContextKey, reason)
 }
 
 func responsesSSEFrameLen(chunk []byte) int {
@@ -523,7 +590,7 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 		c.Header("Connection", "keep-alive")
 		c.Header("Access-Control-Allow-Origin", "*")
 	}
-	framer := &responsesSSEFramer{}
+	framer := &responsesSSEFramer{ginContext: c}
 
 	// Peek at the first chunk
 	for {
@@ -576,7 +643,9 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 
 func (h *OpenAIResponsesAPIHandler) forwardResponsesStream(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage, framer *responsesSSEFramer) {
 	if framer == nil {
-		framer = &responsesSSEFramer{}
+		framer = &responsesSSEFramer{ginContext: c}
+	} else if framer.ginContext == nil {
+		framer.ginContext = c
 	}
 	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
 		WriteChunk: func(chunk []byte) {

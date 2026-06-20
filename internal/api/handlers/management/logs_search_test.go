@@ -120,6 +120,67 @@ func TestGetLogs_SearchSupportsUsageLimitReachedAlias(t *testing.T) {
 	}
 }
 
+func TestGetLogs_IncludesRequestErrorLogSummaries(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	logDir := t.TempDir()
+	name := "error-v1-messages-2026-06-18T120000-abcd1234.log"
+	content := "" +
+		"Timestamp: 2026-06-18T12:00:00Z\n" +
+		"Method: POST\n" +
+		"URL: /v1/messages?secret=masked\n" +
+		"HTTP Status: 400 Bad Request\n"
+	if err := os.WriteFile(filepath.Join(logDir, name), []byte(content), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	handler := NewHandlerWithoutConfigFilePath(&config.Config{
+		LoggingToFile: true,
+	}, nil)
+	handler.SetLogDirectory(logDir)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/logs", nil)
+
+	handler.GetLogs(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+
+	lines, ok := payload["lines"].([]any)
+	if !ok {
+		t.Fatalf("payload.lines type = %T, want []any", payload["lines"])
+	}
+	if len(lines) != 1 {
+		t.Fatalf("len(lines) = %d, want 1", len(lines))
+	}
+
+	line, ok := lines[0].(string)
+	if !ok {
+		t.Fatalf("lines[0] type = %T, want string", lines[0])
+	}
+	for _, want := range []string{
+		"[abcd1234] [error] request_failed",
+		"POST /v1/messages 400",
+		"request_log=" + name,
+	} {
+		if !contains(line, want) {
+			t.Fatalf("line = %q, want substring %q", line, want)
+		}
+	}
+	if got := int(payload["line-count"].(float64)); got != 1 {
+		t.Fatalf("line-count = %d, want 1", got)
+	}
+}
+
 func contains(s, substr string) bool {
 	return len(substr) == 0 || (len(s) >= len(substr) && (func() bool {
 		for i := 0; i+len(substr) <= len(s); i++ {

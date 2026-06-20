@@ -6,17 +6,20 @@ package middleware
 import (
 	"bytes"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
+	log "github.com/sirupsen/logrus"
 )
 
 const requestBodyOverrideContextKey = "REQUEST_BODY_OVERRIDE"
 const responseBodyOverrideContextKey = "RESPONSE_BODY_OVERRIDE"
 const websocketTimelineOverrideContextKey = "WEBSOCKET_TIMELINE_OVERRIDE"
+const responsesProtocolAnomalyContextKey = "RESPONSES_PROTOCOL_ANOMALY"
 
 // maxResponseBodyBytes caps the in-memory response body buffer to 1 MiB
 // to prevent unbounded allocation when logging is active (commercial-mode: false).
@@ -24,6 +27,16 @@ const maxResponseBodyBytes = 1 << 20
 
 // maxRequestBodyBytes caps the request body captured for logging at 1 MiB.
 const maxRequestBodyBytes = 1 << 20
+
+// maxAnomalyResponseBodyBytes caps response text retained only for lightweight anomaly detection.
+const maxAnomalyResponseBodyBytes = 64 * 1024
+
+var claudeCodeToolFailureMarkers = []string{
+	"no such tool available",
+	"tool selection syntax is wrong",
+	"those tool calls failed",
+	"tool names got corrupted",
+}
 
 // RequestInfo holds essential details of an incoming HTTP request for logging purposes.
 type RequestInfo struct {
@@ -50,6 +63,7 @@ type ResponseWriterWrapper struct {
 	headers             map[string][]string        // headers stores the response headers.
 	logOnErrorOnly      bool                       // logOnErrorOnly enables logging only when an error response is detected.
 	firstChunkTimestamp time.Time                  // firstChunkTimestamp captures TTFB for streaming responses.
+	anomalyBody         *bytes.Buffer              // anomalyBody stores a small response prefix for protocol-failure detection.
 }
 
 // NewResponseWriterWrapper creates and initializes a new ResponseWriterWrapper.
@@ -86,6 +100,7 @@ func (w *ResponseWriterWrapper) Write(data []byte) (int, error) {
 	n, err := w.ResponseWriter.Write(data)
 
 	// THEN: Handle logging based on response type
+	w.captureAnomalyResponse(data)
 	if w.isStreaming && w.chunkChannel != nil {
 		// Capture TTFB on first chunk (synchronous, before async channel send)
 		if w.firstChunkTimestamp.IsZero() {
@@ -141,6 +156,7 @@ func (w *ResponseWriterWrapper) WriteString(data string) (int, error) {
 	n, err := w.ResponseWriter.WriteString(data)
 
 	// THEN: Capture for logging
+	w.captureAnomalyResponse([]byte(data))
 	if w.isStreaming && w.chunkChannel != nil {
 		// Capture TTFB on first chunk (synchronous, before async channel send)
 		if w.firstChunkTimestamp.IsZero() {
@@ -299,7 +315,11 @@ func (w *ResponseWriterWrapper) Finalize(c *gin.Context) error {
 		}
 	}
 
-	hasAPIError := len(slicesAPIResponseError) > 0 || finalStatusCode >= http.StatusBadRequest
+	responsesProtocolAnomalyReason := extractResponsesProtocolAnomaly(c)
+	hasAPIError := len(slicesAPIResponseError) > 0 || finalStatusCode >= http.StatusBadRequest || responsesProtocolAnomalyReason != ""
+	w.logAPIErrorSummary(finalStatusCode, slicesAPIResponseError)
+	w.logResponsesProtocolAnomalySummary(finalStatusCode, responsesProtocolAnomalyReason)
+	w.logClaudeCodeToolFailureSummary(finalStatusCode)
 	forceLog := w.logOnErrorOnly && hasAPIError && !w.logger.IsEnabled()
 	if !w.logger.IsEnabled() && !forceLog {
 		return nil
@@ -340,6 +360,212 @@ func (w *ResponseWriterWrapper) Finalize(c *gin.Context) error {
 	}
 
 	return w.logRequest(w.extractRequestBody(c), finalStatusCode, w.cloneHeaders(), w.extractResponseBody(c), w.extractWebsocketTimeline(c), w.extractAPIRequest(c), w.extractAPIResponse(c), w.extractAPIWebsocketTimeline(c), w.extractAPIResponseTimestamp(c), slicesAPIResponseError, forceLog)
+}
+
+func (w *ResponseWriterWrapper) captureAnomalyResponse(data []byte) {
+	if len(data) == 0 || !w.shouldInspectResponseAnomalies() {
+		return
+	}
+	if w.anomalyBody == nil {
+		w.anomalyBody = &bytes.Buffer{}
+	}
+	if w.anomalyBody.Len() >= maxAnomalyResponseBodyBytes {
+		return
+	}
+	remaining := maxAnomalyResponseBodyBytes - w.anomalyBody.Len()
+	if len(data) > remaining {
+		data = data[:remaining]
+	}
+	_, _ = w.anomalyBody.Write(data)
+}
+
+func (w *ResponseWriterWrapper) shouldInspectResponseAnomalies() bool {
+	if w == nil || w.requestInfo == nil {
+		return false
+	}
+	path := requestInfoPath(w.requestInfo.URL)
+	if strings.HasPrefix(path, "/v1/responses") && w.logOnErrorOnly {
+		return true
+	}
+	if !isAnomalyInspectablePath(path) {
+		return false
+	}
+	body := w.requestInfo.Body
+	if len(body) == 0 {
+		return false
+	}
+	return bytes.Contains(body, []byte(`"tools"`)) || bytes.Contains(body, []byte(`"tool_choice"`))
+}
+
+func isAnomalyInspectablePath(path string) bool {
+	path = strings.SplitN(path, "?", 2)[0]
+	for _, prefix := range []string{"/v1/messages", "/v1/chat/completions", "/v1/responses"} {
+		if strings.HasPrefix(path, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func (w *ResponseWriterWrapper) logAPIErrorSummary(statusCode int, apiResponseErrors []*interfaces.ErrorMessage) {
+	if w == nil || w.requestInfo == nil {
+		return
+	}
+	if statusCode < http.StatusBadRequest && len(apiResponseErrors) == 0 {
+		return
+	}
+	method := strings.TrimSpace(w.requestInfo.Method)
+	path := requestInfoPath(w.requestInfo.URL)
+	if method == "" {
+		method = "UNKNOWN"
+	}
+	if path == "" {
+		path = "/"
+	}
+	log.WithField("request_id", w.requestInfo.RequestID).
+		Errorf("request_failed | %s %s %d | request_log_id=%s%s",
+			method,
+			path,
+			statusCode,
+			w.requestInfo.RequestID,
+			apiErrorSummarySuffix(apiResponseErrors),
+		)
+}
+
+func (w *ResponseWriterWrapper) logResponsesProtocolAnomalySummary(statusCode int, reason string) {
+	if w == nil || w.requestInfo == nil || strings.TrimSpace(reason) == "" {
+		return
+	}
+	method := strings.TrimSpace(w.requestInfo.Method)
+	path := requestInfoPath(w.requestInfo.URL)
+	if method == "" {
+		method = "UNKNOWN"
+	}
+	if path == "" {
+		path = "/"
+	}
+	if statusCode == 0 {
+		statusCode = http.StatusOK
+	}
+	log.WithField("request_id", w.requestInfo.RequestID).
+		Errorf("response_incomplete | %s %s %d | reason=%s | request_log_id=%s",
+			method,
+			path,
+			statusCode,
+			reason,
+			w.requestInfo.RequestID,
+		)
+}
+
+func (w *ResponseWriterWrapper) logClaudeCodeToolFailureSummary(statusCode int) {
+	if w == nil || w.requestInfo == nil || w.anomalyBody == nil || w.anomalyBody.Len() == 0 {
+		return
+	}
+	reason := detectClaudeCodeToolFailure(w.anomalyBody.Bytes())
+	if reason == "" {
+		return
+	}
+	method := strings.TrimSpace(w.requestInfo.Method)
+	path := requestInfoPath(w.requestInfo.URL)
+	if method == "" {
+		method = "UNKNOWN"
+	}
+	if path == "" {
+		path = "/"
+	}
+	if statusCode == 0 {
+		statusCode = http.StatusOK
+	}
+	model := extractModelFromRequestBody(w.requestInfo.Body)
+	modelPart := ""
+	if model != "" {
+		modelPart = " | model=" + sanitizeLogSummaryToken(model, 96)
+	}
+	log.WithField("request_id", w.requestInfo.RequestID).
+		Errorf("claude_code_tool_call_failure | %s %s %d%s | reason=%s | request_log_id=%s",
+			method,
+			path,
+			statusCode,
+			modelPart,
+			reason,
+			w.requestInfo.RequestID,
+		)
+}
+
+func detectClaudeCodeToolFailure(response []byte) string {
+	if len(response) == 0 {
+		return ""
+	}
+	lowered := strings.ToLower(string(response))
+	for _, marker := range claudeCodeToolFailureMarkers {
+		if strings.Contains(lowered, marker) {
+			return strings.ReplaceAll(marker, " ", "_")
+		}
+	}
+	return ""
+}
+
+func apiErrorSummarySuffix(apiResponseErrors []*interfaces.ErrorMessage) string {
+	for _, errMsg := range apiResponseErrors {
+		if errMsg == nil {
+			continue
+		}
+		if errMsg.StatusCode > 0 {
+			return " | upstream_status=" + strconv.Itoa(errMsg.StatusCode)
+		}
+	}
+	return ""
+}
+
+func requestInfoPath(raw string) string {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return ""
+	}
+	return strings.SplitN(value, "?", 2)[0]
+}
+
+func extractModelFromRequestBody(body []byte) string {
+	const key = `"model"`
+	idx := bytes.Index(body, []byte(key))
+	if idx < 0 {
+		return ""
+	}
+	rest := body[idx+len(key):]
+	colon := bytes.IndexByte(rest, ':')
+	if colon < 0 {
+		return ""
+	}
+	rest = bytes.TrimSpace(rest[colon+1:])
+	if len(rest) == 0 || rest[0] != '"' {
+		return ""
+	}
+	rest = rest[1:]
+	end := bytes.IndexByte(rest, '"')
+	if end < 0 {
+		return ""
+	}
+	return string(rest[:end])
+}
+
+func sanitizeLogSummaryToken(value string, maxLen int) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	value = strings.Map(func(r rune) rune {
+		switch r {
+		case '\r', '\n', '\t', '|':
+			return ' '
+		default:
+			return r
+		}
+	}, value)
+	value = strings.Join(strings.Fields(value), "_")
+	if maxLen > 0 && len(value) > maxLen {
+		return value[:maxLen]
+	}
+	return value
 }
 
 func (w *ResponseWriterWrapper) cloneHeaders() map[string][]string {
@@ -417,6 +643,9 @@ func (w *ResponseWriterWrapper) extractResponseBody(c *gin.Context) []byte {
 		return body
 	}
 	if w.body == nil || w.body.Len() == 0 {
+		if w.anomalyBody != nil && w.anomalyBody.Len() > 0 {
+			return bytes.Clone(w.anomalyBody.Bytes())
+		}
 		return nil
 	}
 	return bytes.Clone(w.body.Bytes())
@@ -445,6 +674,21 @@ func extractBodyOverride(c *gin.Context, key string) []byte {
 		}
 	}
 	return nil
+}
+
+func extractResponsesProtocolAnomaly(c *gin.Context) string {
+	if c == nil {
+		return ""
+	}
+	value, exists := c.Get(responsesProtocolAnomalyContextKey)
+	if !exists {
+		return ""
+	}
+	reason, ok := value.(string)
+	if !ok {
+		return ""
+	}
+	return sanitizeLogSummaryToken(reason, 96)
 }
 
 func (w *ResponseWriterWrapper) logRequest(requestBody []byte, statusCode int, headers map[string][]string, body, websocketTimeline, apiRequestBody, apiResponseBody, apiWebsocketTimeline []byte, apiResponseTimestamp time.Time, apiResponseErrors []*interfaces.ErrorMessage, forceLog bool) error {

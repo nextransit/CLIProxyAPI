@@ -865,12 +865,16 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 
 			payloads := websocketJSONPayloadsFromChunk(chunk)
 			for i := range payloads {
-				recordResponsesWebsocketToolCallsFromPayload(downstreamSessionKey, payloads[i])
 				eventType := gjson.GetBytes(payloads[i], "type").String()
 				if eventType == wsEventTypeCompleted {
+					if responseCompletedReasonIsMaxOutputTokens(payloads[i]) {
+						markResponsesProtocolAnomaly(c, "max_output_tokens")
+					}
+					payloads[i] = normalizeMaxOutputTokensCompletedPayload(payloads[i])
 					completed = true
 					completedOutput = responseCompletedOutputFromPayload(payloads[i])
 				}
+				recordResponsesWebsocketToolCallsFromPayload(downstreamSessionKey, payloads[i])
 				markAPIResponseTimestamp(c)
 				// log.Infof(
 				// 	"responses websocket: downstream_out id=%s type=%d event=%s payload=%s",

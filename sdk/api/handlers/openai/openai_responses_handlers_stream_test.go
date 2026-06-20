@@ -203,3 +203,55 @@ func TestForwardResponsesStreamDropsIncompleteTrailingDataChunkOnFlush(t *testin
 		t.Fatalf("expected incomplete trailing data to be dropped on flush.\nGot: %q", got)
 	}
 }
+
+func TestForwardResponsesStreamNormalizesMaxOutputTokensCompletedWithOutput(t *testing.T) {
+	h, recorder, c, flusher := newResponsesStreamTestHandler(t)
+
+	data := make(chan []byte, 1)
+	errs := make(chan *interfaces.ErrorMessage)
+	data <- []byte(`data: {"type":"response.completed","response":{"id":"resp-1","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"message","id":"msg-1","content":[{"type":"output_text","text":"partial"}]}],"error":null}}`)
+	close(data)
+	close(errs)
+
+	h.forwardResponsesStream(c, flusher, func(error) {}, data, errs, nil)
+
+	payload := strings.TrimPrefix(strings.TrimSpace(recorder.Body.String()), "data: ")
+	if got := gjson.Get(payload, "response.status").String(); got != "completed" {
+		t.Fatalf("status = %q, want completed in %s", got, payload)
+	}
+	if got := gjson.Get(payload, "response.incomplete_details"); got.Type != gjson.Null {
+		t.Fatalf("incomplete_details type = %v, want Null in %s", got.Type, payload)
+	}
+	if got := gjson.Get(payload, "response.output.0.id").String(); got != "msg-1" {
+		t.Fatalf("output item id = %q, want msg-1 in %s", got, payload)
+	}
+	if got, exists := c.Get(responsesProtocolAnomalyContextKey); !exists || got != "max_output_tokens" {
+		t.Fatalf("protocol anomaly = %v exists=%v, want max_output_tokens", got, exists)
+	}
+}
+
+func TestNormalizeMaxOutputTokensCompletedPayloadLeavesEmptyOutputIncomplete(t *testing.T) {
+	payload := []byte(`{"type":"response.completed","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[]}}`)
+
+	normalized := normalizeMaxOutputTokensCompletedPayload(payload)
+
+	if got := gjson.GetBytes(normalized, "response.status").String(); got != "incomplete" {
+		t.Fatalf("status = %q, want incomplete in %s", got, normalized)
+	}
+	if got := gjson.GetBytes(normalized, "response.incomplete_details.reason").String(); got != "max_output_tokens" {
+		t.Fatalf("reason = %q, want max_output_tokens in %s", got, normalized)
+	}
+}
+
+func TestNormalizeMaxOutputTokensCompletedPayloadLeavesOtherReasonsIncomplete(t *testing.T) {
+	payload := []byte(`{"type":"response.completed","response":{"status":"incomplete","incomplete_details":{"reason":"context_length_exceeded"},"output":[{"type":"message","id":"msg-1"}]}}`)
+
+	normalized := normalizeMaxOutputTokensCompletedPayload(payload)
+
+	if got := gjson.GetBytes(normalized, "response.status").String(); got != "incomplete" {
+		t.Fatalf("status = %q, want incomplete in %s", got, normalized)
+	}
+	if got := gjson.GetBytes(normalized, "response.incomplete_details.reason").String(); got != "context_length_exceeded" {
+		t.Fatalf("reason = %q, want context_length_exceeded in %s", got, normalized)
+	}
+}
