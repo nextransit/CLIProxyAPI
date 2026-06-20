@@ -104,3 +104,55 @@ func TestDownloadLogFile_ReturnsManagedLogFile(t *testing.T) {
 		t.Fatalf("body = %q, want %q", got, content)
 	}
 }
+
+func TestGetRequestLogDetailByID_ReturnsFullContent(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	logDir := t.TempDir()
+	const requestID = "deadbeef"
+	const name = "v1-responses-2026-06-20T112602-deadbeef.log"
+	const content = "=== REQUEST INFO ===\nMethod: POST\n=== API REQUEST 1 ===\nBody:\n{\"model\":\"deepseek-v4-flash\"}\n=== API RESPONSE 1 ===\nStatus: 400\n"
+	if err := os.WriteFile(filepath.Join(logDir, name), []byte(content), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	handler := NewHandlerWithoutConfigFilePath(&config.Config{
+		LoggingToFile: true,
+	}, nil)
+	handler.SetLogDirectory(logDir)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "id", Value: requestID}}
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/request-log-detail-by-id/"+requestID, nil)
+
+	handler.GetRequestLogDetailByID(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var payload struct {
+		ID      string `json:"id"`
+		Name    string `json:"name"`
+		Size    int64  `json:"size"`
+		Content string `json:"content"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+
+	if payload.ID != requestID {
+		t.Fatalf("id = %q, want %q", payload.ID, requestID)
+	}
+	if payload.Name != name {
+		t.Fatalf("name = %q, want %q", payload.Name, name)
+	}
+	if payload.Size != int64(len(content)) {
+		t.Fatalf("size = %d, want %d", payload.Size, len(content))
+	}
+	if payload.Content != content {
+		t.Fatalf("content = %q, want %q", payload.Content, content)
+	}
+}

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
@@ -129,6 +130,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	}
 	reporter.SetThinkingFromPayload(translated)
 	translated = normalizeMiniMaxM3Request(translated, baseModel)
+	translated = clampOpenAICompatMaxTokens(translated, baseModel, e.Identifier())
 	reporter.SetThinkingFromPayloadIfMissing(translated)
 
 	url := strings.TrimSuffix(baseURL, "/") + endpoint
@@ -355,6 +357,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	// Request usage data in the final streaming chunk so that token statistics
 	// are captured even when the upstream is an OpenAI-compatible provider.
 	translated, _ = sjson.SetBytes(translated, "stream_options.include_usage", true)
+	translated = clampOpenAICompatMaxTokens(translated, baseModel, e.Identifier())
 	reporter.SetThinkingFromPayloadIfMissing(translated)
 
 	url := strings.TrimSuffix(baseURL, "/") + "/chat/completions"
@@ -820,6 +823,56 @@ func (e *OpenAICompatExecutor) overrideModel(payload []byte, model string) []byt
 // thinking-mode conversations, otherwise it returns 400.
 func isDeepSeekModel(model string) bool {
 	return strings.Contains(strings.ToLower(model), "deepseek")
+}
+
+func clampOpenAICompatMaxTokens(payload []byte, modelID string, provider string) []byte {
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return payload
+	}
+	maxTokens := gjson.GetBytes(payload, "max_tokens")
+	if !maxTokens.Exists() || maxTokens.Type != gjson.Number {
+		return payload
+	}
+
+	value := maxTokens.Int()
+	if value < 1 {
+		payload, _ = sjson.SetBytes(payload, "max_tokens", 1)
+		value = 1
+	}
+
+	if limit := openAICompatMaxTokensLimit(modelID, provider); limit > 0 && value > int64(limit) {
+		payload, _ = sjson.SetBytes(payload, "max_tokens", limit)
+	}
+	return payload
+}
+
+func openAICompatMaxTokensLimit(modelID string, provider string) int {
+	modelID = strings.TrimSpace(modelID)
+	if modelID == "" {
+		return 0
+	}
+	deepSeekV4Limit := 0
+	if isDeepSeekV4Model(modelID) {
+		deepSeekV4Limit = 65536
+	}
+	if info := registry.LookupModelInfo(modelID, provider); info != nil && info.MaxCompletionTokens > 0 {
+		if deepSeekV4Limit > 0 && info.MaxCompletionTokens > deepSeekV4Limit {
+			return deepSeekV4Limit
+		}
+		return info.MaxCompletionTokens
+	}
+	if info := registry.LookupModelInfo(modelID); info != nil && info.MaxCompletionTokens > 0 {
+		if deepSeekV4Limit > 0 && info.MaxCompletionTokens > deepSeekV4Limit {
+			return deepSeekV4Limit
+		}
+		return info.MaxCompletionTokens
+	}
+	return deepSeekV4Limit
+}
+
+func isDeepSeekV4Model(model string) bool {
+	lowered := strings.ToLower(strings.TrimSpace(model))
+	return strings.Contains(lowered, "deepseek") && strings.Contains(lowered, "v4")
 }
 
 func normalizeMiniMaxM3Request(payload []byte, model string) []byte {

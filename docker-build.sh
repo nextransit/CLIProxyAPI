@@ -110,6 +110,15 @@ wait_for_service() {
   sleep 2
 }
 
+cleanup_build_cache() {
+  echo "Cleaning Docker build cache..."
+  if docker builder prune -af; then
+    echo "Docker build cache cleaned."
+  else
+    echo "Warning: failed to clean Docker build cache; continuing."
+  fi
+}
+
 usage() {
   cat <<'EOF'
 Usage: ./docker-build.sh [--source|--prebuilt] [--with-usage]
@@ -197,6 +206,7 @@ case "$RUN_MODE" in
       --build-arg VERSION="${VERSION}" \
       --build-arg COMMIT="${COMMIT}" \
       --build-arg BUILD_DATE="${BUILD_DATE}"
+    cleanup_build_cache
 
     if [[ "${WITH_USAGE}" == "true" ]]; then
       export_stats

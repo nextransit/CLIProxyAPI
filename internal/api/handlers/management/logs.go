@@ -343,6 +343,37 @@ func (h *Handler) GetRequestErrorLogs(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"files": files})
 }
 
+// GetRequestLogDetailByID finds a request log by request ID and returns its full content.
+func (h *Handler) GetRequestLogDetailByID(c *gin.Context) {
+	if h == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler unavailable"})
+		return
+	}
+	if h.cfg == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration unavailable"})
+		return
+	}
+
+	fullPath, matchedFile, requestID, info, ok := h.resolveRequestLogByID(c)
+	if !ok {
+		return
+	}
+
+	content, errRead := os.ReadFile(fullPath)
+	if errRead != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to read log file: %v", errRead)})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"id":       requestID,
+		"name":     matchedFile,
+		"size":     info.Size(),
+		"modified": info.ModTime().Unix(),
+		"content":  string(content),
+	})
+}
+
 // GetRequestLogByID finds and downloads a request log file by its request ID.
 // The ID is matched against the suffix of log file names (format: *-{requestID}.log).
 func (h *Handler) GetRequestLogByID(c *gin.Context) {
@@ -355,10 +386,19 @@ func (h *Handler) GetRequestLogByID(c *gin.Context) {
 		return
 	}
 
+	fullPath, matchedFile, _, _, ok := h.resolveRequestLogByID(c)
+	if !ok {
+		return
+	}
+
+	c.FileAttachment(fullPath, matchedFile)
+}
+
+func (h *Handler) resolveRequestLogByID(c *gin.Context) (string, string, string, os.FileInfo, bool) {
 	dir := h.logDirectory()
 	if strings.TrimSpace(dir) == "" {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "log directory not configured"})
-		return
+		return "", "", "", nil, false
 	}
 
 	requestID := strings.TrimSpace(c.Param("id"))
@@ -367,21 +407,21 @@ func (h *Handler) GetRequestLogByID(c *gin.Context) {
 	}
 	if requestID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "missing request ID"})
-		return
+		return "", "", "", nil, false
 	}
 	if strings.ContainsAny(requestID, "/\\") {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request ID"})
-		return
+		return "", "", "", nil, false
 	}
 
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "log directory not found"})
-			return
+			return "", "", "", nil, false
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to list log directory: %v", err)})
-		return
+		return "", "", "", nil, false
 	}
 
 	suffix := "-" + requestID + ".log"
@@ -399,36 +439,33 @@ func (h *Handler) GetRequestLogByID(c *gin.Context) {
 
 	if matchedFile == "" {
 		c.JSON(http.StatusNotFound, gin.H{"error": "log file not found for the given request ID"})
-		return
+		return "", "", "", nil, false
 	}
 
-	dirAbs, errAbs := filepath.Abs(dir)
-	if errAbs != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to resolve log directory: %v", errAbs)})
-		return
+	fullPath, errPath := resolveManagedLogFilePath(dir, matchedFile)
+	if errPath != nil {
+		status := http.StatusInternalServerError
+		if strings.Contains(errPath.Error(), "invalid") {
+			status = http.StatusBadRequest
+		}
+		c.JSON(status, gin.H{"error": errPath.Error()})
+		return "", "", "", nil, false
 	}
-	fullPath := filepath.Clean(filepath.Join(dirAbs, matchedFile))
-	prefix := dirAbs + string(os.PathSeparator)
-	if !strings.HasPrefix(fullPath, prefix) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid log file path"})
-		return
-	}
-
 	info, errStat := os.Stat(fullPath)
 	if errStat != nil {
 		if os.IsNotExist(errStat) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "log file not found"})
-			return
+			return "", "", "", nil, false
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to read log file: %v", errStat)})
-		return
+		return "", "", "", nil, false
 	}
 	if info.IsDir() {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid log file"})
-		return
+		return "", "", "", nil, false
 	}
 
-	c.FileAttachment(fullPath, matchedFile)
+	return fullPath, matchedFile, requestID, info, true
 }
 
 // DownloadRequestErrorLog downloads a specific error request log file by name.
