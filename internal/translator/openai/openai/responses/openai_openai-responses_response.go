@@ -197,6 +197,120 @@ func buildResponsesCompletedEvent(st *oaiToResponsesState, requestRawJSON []byte
 	return emitRespEvent("response.completed", completed)
 }
 
+func finalizeOpenResponseOutputItems(st *oaiToResponsesState, nextSeq func() int) [][]byte {
+	var out [][]byte
+
+	if len(st.MsgItemAdded) > 0 {
+		idxs := make([]int, 0, len(st.MsgItemAdded))
+		for i := range st.MsgItemAdded {
+			idxs = append(idxs, i)
+		}
+		sort.Slice(idxs, func(i, j int) bool { return st.MsgOutputIx[idxs[i]] < st.MsgOutputIx[idxs[j]] })
+		for _, i := range idxs {
+			if st.MsgItemAdded[i] && !st.MsgItemDone[i] {
+				msgOutputIndex := st.MsgOutputIx[i]
+				fullText := ""
+				if b := st.MsgTextBuf[i]; b != nil {
+					fullText = b.String()
+				}
+				done := []byte(`{"type":"response.output_text.done","sequence_number":0,"item_id":"","output_index":0,"content_index":0,"text":"","logprobs":[]}`)
+				done, _ = sjson.SetBytes(done, "sequence_number", nextSeq())
+				done, _ = sjson.SetBytes(done, "item_id", fmt.Sprintf("msg_%s_%d", st.ResponseID, i))
+				done, _ = sjson.SetBytes(done, "output_index", msgOutputIndex)
+				done, _ = sjson.SetBytes(done, "content_index", 0)
+				done, _ = sjson.SetBytes(done, "text", fullText)
+				out = append(out, emitRespEvent("response.output_text.done", done))
+
+				partDone := []byte(`{"type":"response.content_part.done","sequence_number":0,"item_id":"","output_index":0,"content_index":0,"part":{"type":"output_text","annotations":[],"logprobs":[],"text":""}}`)
+				partDone, _ = sjson.SetBytes(partDone, "sequence_number", nextSeq())
+				partDone, _ = sjson.SetBytes(partDone, "item_id", fmt.Sprintf("msg_%s_%d", st.ResponseID, i))
+				partDone, _ = sjson.SetBytes(partDone, "output_index", msgOutputIndex)
+				partDone, _ = sjson.SetBytes(partDone, "content_index", 0)
+				partDone, _ = sjson.SetBytes(partDone, "part.text", fullText)
+				out = append(out, emitRespEvent("response.content_part.done", partDone))
+
+				itemDone := []byte(`{"type":"response.output_item.done","sequence_number":0,"output_index":0,"item":{"id":"","type":"message","status":"completed","content":[{"type":"output_text","annotations":[],"logprobs":[],"text":""}],"role":"assistant"}}`)
+				itemDone, _ = sjson.SetBytes(itemDone, "sequence_number", nextSeq())
+				itemDone, _ = sjson.SetBytes(itemDone, "output_index", msgOutputIndex)
+				itemDone, _ = sjson.SetBytes(itemDone, "item.id", fmt.Sprintf("msg_%s_%d", st.ResponseID, i))
+				itemDone, _ = sjson.SetBytes(itemDone, "item.content.0.text", fullText)
+				out = append(out, emitRespEvent("response.output_item.done", itemDone))
+				st.MsgItemDone[i] = true
+			}
+		}
+	}
+
+	if st.ReasoningID != "" {
+		text := st.ReasoningBuf.String()
+		textDone := []byte(`{"type":"response.reasoning_summary_text.done","sequence_number":0,"item_id":"","output_index":0,"summary_index":0,"text":""}`)
+		textDone, _ = sjson.SetBytes(textDone, "sequence_number", nextSeq())
+		textDone, _ = sjson.SetBytes(textDone, "item_id", st.ReasoningID)
+		textDone, _ = sjson.SetBytes(textDone, "output_index", st.ReasoningIndex)
+		textDone, _ = sjson.SetBytes(textDone, "text", text)
+		out = append(out, emitRespEvent("response.reasoning_summary_text.done", textDone))
+
+		partDone := []byte(`{"type":"response.reasoning_summary_part.done","sequence_number":0,"item_id":"","output_index":0,"summary_index":0,"part":{"type":"summary_text","text":""}}`)
+		partDone, _ = sjson.SetBytes(partDone, "sequence_number", nextSeq())
+		partDone, _ = sjson.SetBytes(partDone, "item_id", st.ReasoningID)
+		partDone, _ = sjson.SetBytes(partDone, "output_index", st.ReasoningIndex)
+		partDone, _ = sjson.SetBytes(partDone, "part.text", text)
+		out = append(out, emitRespEvent("response.reasoning_summary_part.done", partDone))
+
+		outputItemDone := []byte(`{"type":"response.output_item.done","item":{"id":"","type":"reasoning","encrypted_content":"","summary":[{"type":"summary_text","text":""}]},"output_index":0,"sequence_number":0}`)
+		outputItemDone, _ = sjson.SetBytes(outputItemDone, "sequence_number", nextSeq())
+		outputItemDone, _ = sjson.SetBytes(outputItemDone, "item.id", st.ReasoningID)
+		outputItemDone, _ = sjson.SetBytes(outputItemDone, "output_index", st.ReasoningIndex)
+		outputItemDone, _ = sjson.SetBytes(outputItemDone, "item.summary.text", text)
+		out = append(out, emitRespEvent("response.output_item.done", outputItemDone))
+
+		st.Reasonings = append(st.Reasonings, oaiToResponsesStateReasoning{ReasoningID: st.ReasoningID, ReasoningData: text, OutputIndex: st.ReasoningIndex})
+		st.ReasoningID = ""
+		st.ReasoningBuf.Reset()
+	}
+
+	if len(st.FuncCallIDs) > 0 {
+		keys := make([]string, 0, len(st.FuncCallIDs))
+		for key := range st.FuncCallIDs {
+			keys = append(keys, key)
+		}
+		sort.Slice(keys, func(i, j int) bool {
+			left := st.FuncOutputIx[keys[i]]
+			right := st.FuncOutputIx[keys[j]]
+			return left < right || (left == right && keys[i] < keys[j])
+		})
+		for _, key := range keys {
+			callID := st.FuncCallIDs[key]
+			if callID == "" || st.FuncItemDone[key] {
+				continue
+			}
+			outputIndex := st.FuncOutputIx[key]
+			args := "{}"
+			if b := st.FuncArgsBuf[key]; b != nil && b.Len() > 0 {
+				args = b.String()
+			}
+			fcDone := []byte(`{"type":"response.function_call_arguments.done","sequence_number":0,"item_id":"","output_index":0,"arguments":""}`)
+			fcDone, _ = sjson.SetBytes(fcDone, "sequence_number", nextSeq())
+			fcDone, _ = sjson.SetBytes(fcDone, "item_id", fmt.Sprintf("fc_%s", callID))
+			fcDone, _ = sjson.SetBytes(fcDone, "output_index", outputIndex)
+			fcDone, _ = sjson.SetBytes(fcDone, "arguments", args)
+			out = append(out, emitRespEvent("response.function_call_arguments.done", fcDone))
+
+			itemDone := []byte(`{"type":"response.output_item.done","sequence_number":0,"output_index":0,"item":{"id":"","type":"function_call","status":"completed","arguments":"","call_id":"","name":""}}`)
+			itemDone, _ = sjson.SetBytes(itemDone, "sequence_number", nextSeq())
+			itemDone, _ = sjson.SetBytes(itemDone, "output_index", outputIndex)
+			itemDone, _ = sjson.SetBytes(itemDone, "item.id", fmt.Sprintf("fc_%s", callID))
+			itemDone, _ = sjson.SetBytes(itemDone, "item.arguments", args)
+			itemDone, _ = sjson.SetBytes(itemDone, "item.call_id", callID)
+			itemDone, _ = sjson.SetBytes(itemDone, "item.name", st.FuncNames[key])
+			out = append(out, emitRespEvent("response.output_item.done", itemDone))
+			st.FuncItemDone[key] = true
+			st.FuncArgsDone[key] = true
+		}
+	}
+
+	return out
+}
+
 // ConvertOpenAIChatCompletionsResponseToOpenAIResponses converts OpenAI Chat Completions streaming chunks
 // to OpenAI Responses SSE events (response.*).
 func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, modelName string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) [][]byte {
@@ -227,9 +341,12 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 		return [][]byte{}
 	}
 	if bytes.Equal(rawJSON, []byte("[DONE]")) {
-		if st.CompletionPending && !st.CompletedEmitted {
+		if st.Started && !st.CompletedEmitted {
+			nextSeq := func() int { st.Seq++; return st.Seq }
+			out := finalizeOpenResponseOutputItems(st, nextSeq)
 			st.CompletedEmitted = true
-			return [][]byte{buildResponsesCompletedEvent(st, requestRawJSON, func() int { st.Seq++; return st.Seq })}
+			out = append(out, buildResponsesCompletedEvent(st, requestRawJSON, nextSeq))
+			return out
 		}
 		return [][]byte{}
 	}

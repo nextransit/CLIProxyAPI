@@ -119,6 +119,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	}
 
 	if isDeepSeekModel(baseModel) {
+		translated = normalizeDeepSeekThinkingRequest(translated, baseModel, e.Identifier())
 		translated, err = ensureDeepSeekToolMessageNames(translated)
 		if err != nil {
 			return resp, err
@@ -132,8 +133,13 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	translated = normalizeMiniMaxM3Request(translated, baseModel)
 	translated = clampOpenAICompatMaxTokens(translated, baseModel, e.Identifier())
 	reporter.SetThinkingFromPayloadIfMissing(translated)
+	if isDeepSeekV4Model(baseModel) {
+		reporter.SetThinkingEffortIfMissing(defaultDeepSeekV4ThinkingEffort(e.Identifier()))
+	}
 
 	url := strings.TrimSuffix(baseURL, "/") + endpoint
+	reporter.SetHTTPRequestMetadata("openai_compat", http.MethodPost, "/v1"+endpoint, "OpenAI Compatible", url)
+	reporter.SetModelMetadata(requestedModel, baseModel, "", "")
 
 	debugLogMessageStructure(translated, baseModel)
 	if log.IsLevelEnabled(log.DebugLevel) {
@@ -184,6 +190,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		}
 	}()
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+	reporter.SetStatusCode(httpResp.StatusCode)
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		b, _ := helps.LimitedReadAll(httpResp.Body)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
@@ -342,6 +349,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	}
 
 	if isDeepSeekModel(baseModel) {
+		translated = normalizeDeepSeekThinkingRequest(translated, baseModel, e.Identifier())
 		translated, err = ensureDeepSeekToolMessageNames(translated)
 		if err != nil {
 			return nil, err
@@ -359,8 +367,14 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	translated, _ = sjson.SetBytes(translated, "stream_options.include_usage", true)
 	translated = clampOpenAICompatMaxTokens(translated, baseModel, e.Identifier())
 	reporter.SetThinkingFromPayloadIfMissing(translated)
+	if isDeepSeekV4Model(baseModel) {
+		reporter.SetThinkingEffortIfMissing(defaultDeepSeekV4ThinkingEffort(e.Identifier()))
+	}
 
 	url := strings.TrimSuffix(baseURL, "/") + "/chat/completions"
+	reporter.SetHTTPRequestMetadata("openai_compat", http.MethodPost, "/v1/chat/completions", "OpenAI Compatible", url)
+	reporter.SetModelMetadata(requestedModel, baseModel, "", "")
+
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
 	if err != nil {
 		return nil, err
@@ -402,6 +416,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		return nil, err
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+	reporter.SetStatusCode(httpResp.StatusCode)
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		b, _ := helps.LimitedReadAll(httpResp.Body)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
@@ -524,6 +539,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 				err = statusErr{code: lastFailureStatus, msg: string(lastFailureBody), retryAfter: lastFailureRetryAfter}
 				return nil, err
 			}
+			reporter.SetStatusCode(httpResp.StatusCode)
 		} else {
 			err = statusErr{code: httpResp.StatusCode, msg: string(b), retryAfter: helps.ParseRetryAfter(httpResp, b)}
 			return nil, err
@@ -875,6 +891,138 @@ func isDeepSeekV4Model(model string) bool {
 	return strings.Contains(lowered, "deepseek") && strings.Contains(lowered, "v4")
 }
 
+func normalizeDeepSeekThinkingRequest(payload []byte, modelID, provider string) []byte {
+	if len(payload) == 0 || !gjson.ValidBytes(payload) || !isDeepSeekV4Model(modelID) {
+		return payload
+	}
+
+	out := payload
+	openRouter := isOpenRouterProvider(provider)
+	sensenova := isSensenovaProvider(provider)
+	reasoningEffortOnly := openRouter || sensenova
+	thinkingType := firstDeepSeekThinkingType(out)
+	if effort := strings.ToLower(strings.TrimSpace(gjson.GetBytes(out, "reasoning_effort").String())); effort != "" {
+		normalizedEffort := normalizeDeepSeekReasoningEffort(effort, provider)
+		if normalizedEffort == "" {
+			if updated, errDelete := sjson.DeleteBytes(out, "reasoning_effort"); errDelete == nil {
+				out = updated
+			}
+			thinkingType = "disabled"
+		} else {
+			if updated, errSet := sjson.SetBytes(out, "reasoning_effort", normalizedEffort); errSet == nil {
+				out = updated
+			}
+			if thinkingType == "" && !reasoningEffortOnly {
+				thinkingType = "enabled"
+			}
+		}
+	} else {
+		switch thinkingType {
+		case "disabled":
+			if updated, errSet := sjson.SetBytes(out, "reasoning_effort", "none"); errSet == nil {
+				out = updated
+			}
+		default:
+			if updated, errSet := sjson.SetBytes(out, "reasoning_effort", defaultDeepSeekV4ThinkingEffort(provider)); errSet == nil {
+				out = updated
+			}
+		}
+	}
+
+	// Delete stale extra_body.thinking before writing our canonical value.
+	if gjson.GetBytes(out, "extra_body.thinking").Exists() {
+		if updated, errDelete := sjson.DeleteBytes(out, "extra_body.thinking"); errDelete == nil {
+			out = updated
+		}
+		if extraBody := gjson.GetBytes(out, "extra_body"); extraBody.Exists() && extraBody.IsObject() && len(extraBody.Map()) == 0 {
+			if updated, errDelete := sjson.DeleteBytes(out, "extra_body"); errDelete == nil {
+				out = updated
+			}
+		}
+	}
+	if thinkingType == "" && !reasoningEffortOnly {
+		thinkingType = "enabled"
+	}
+	if thinkingType != "" && !reasoningEffortOnly {
+		if updated, errSet := sjson.SetBytes(out, "extra_body.thinking.type", thinkingType); errSet == nil {
+			out = updated
+		}
+	}
+	return out
+}
+
+func isOpenRouterProvider(provider string) bool {
+	return strings.Contains(strings.ToLower(strings.TrimSpace(provider)), "openrouter")
+}
+
+func isSensenovaProvider(provider string) bool {
+	return strings.Contains(strings.ToLower(strings.TrimSpace(provider)), "sensenova")
+}
+
+func defaultDeepSeekV4ThinkingEffort(provider string) string {
+	return "high"
+}
+
+func firstDeepSeekThinkingType(payload []byte) string {
+	for _, path := range []string{"thinking.type", "extra_body.thinking.type"} {
+		value := strings.ToLower(strings.TrimSpace(gjson.GetBytes(payload, path).String()))
+		switch value {
+		case "enabled", "adaptive", "auto":
+			return "enabled"
+		case "disabled", "none", "0":
+			return "disabled"
+		}
+	}
+	return ""
+}
+
+func normalizeDeepSeekReasoningEffort(effort, provider string) string {
+	openRouter := isOpenRouterProvider(provider)
+	sensenova := isSensenovaProvider(provider)
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "none", "disabled", "0":
+		if sensenova {
+			return "none"
+		}
+		return ""
+	case "max":
+		if openRouter || sensenova {
+			return "high"
+		}
+		return "max"
+	case "xhigh":
+		if openRouter || sensenova {
+			return "high"
+		}
+		return "max"
+	case "high":
+		return "high"
+	case "medium", "low":
+		if sensenova {
+			return effort
+		}
+		if openRouter {
+			return effort
+		}
+		return "high"
+	case "minimal":
+		if sensenova {
+			return "low"
+		}
+		if openRouter {
+			return effort
+		}
+		return "high"
+	case "auto":
+		if openRouter || sensenova {
+			return "high"
+		}
+		return "high"
+	default:
+		return effort
+	}
+}
+
 func normalizeMiniMaxM3Request(payload []byte, model string) []byte {
 	if !isMiniMaxM3Model(model) || len(payload) == 0 || !gjson.ValidBytes(payload) {
 		return payload
@@ -889,7 +1037,7 @@ func normalizeMiniMaxM3Request(payload []byte, model string) []byte {
 		if value == "none" || value == "disabled" || value == "0" {
 			thinkingType = "disabled"
 		}
-		if updated, errSet := sjson.SetBytes(out, "thinking.type", thinkingType); errSet == nil {
+		if updated, errSet := sjson.SetBytes(out, "extra_body.thinking.type", thinkingType); errSet == nil {
 			out = updated
 		}
 		if updated, errDelete := sjson.DeleteBytes(out, "reasoning_effort"); errDelete == nil {
@@ -904,17 +1052,17 @@ func normalizeMiniMaxM3Request(payload []byte, model string) []byte {
 	thinkingType := strings.ToLower(strings.TrimSpace(thinking.Get("type").String()))
 	if thinkingType == "" {
 		thinkingType = "adaptive"
-		if updated, errSet := sjson.SetBytes(out, "thinking.type", thinkingType); errSet == nil {
+		if updated, errSet := sjson.SetBytes(out, "extra_body.thinking.type", thinkingType); errSet == nil {
 			out = updated
 		}
 	} else if thinkingType == "none" || thinkingType == "0" {
 		thinkingType = "disabled"
-		if updated, errSet := sjson.SetBytes(out, "thinking.type", thinkingType); errSet == nil {
+		if updated, errSet := sjson.SetBytes(out, "extra_body.thinking.type", thinkingType); errSet == nil {
 			out = updated
 		}
 	} else if thinkingType != "disabled" && thinkingType != "adaptive" {
 		thinkingType = "adaptive"
-		if updated, errSet := sjson.SetBytes(out, "thinking.type", thinkingType); errSet == nil {
+		if updated, errSet := sjson.SetBytes(out, "extra_body.thinking.type", thinkingType); errSet == nil {
 			out = updated
 		}
 	}

@@ -32,6 +32,7 @@ go build -o test-output ./cmd/server && rm test-output # Verify compile (REQUIRE
 - `internal/registry/` — Model registry + remote updater (`StartModelsUpdater`); `--local-model` disables remote updates
 - `internal/store/` — Storage implementations and secret resolution
 - `internal/managementasset/` — Config snapshots and management assets
+- `Cli-Proxy-API-Management-Center/` — Management center source lives in this submodule（源码在 `Cli-Proxy-API-Management-Center` 子模块）. Do not treat `assets/management.html` as source; update the submodule UI and deploy the built asset from there.
 - `internal/cache/` — Request signature caching
 - `internal/watcher/` — Config hot-reload and watchers
 - `internal/wsrelay/` — WebSocket relay sessions

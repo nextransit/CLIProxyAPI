@@ -104,7 +104,7 @@ func TestOpenAICompatExecutorMiniMaxM3UsageThinkingFromClaudeRequest(t *testing.
 		if gjson.GetBytes(body, "reasoning_effort").Exists() {
 			t.Fatalf("reasoning_effort should be normalized away for MiniMax-M3, body=%s", string(body))
 		}
-		if got := gjson.GetBytes(body, "thinking.type").String(); got != "adaptive" {
+		if got := gjson.GetBytes(body, "extra_body.thinking.type").String(); got != "adaptive" {
 			t.Fatalf("thinking.type = %q, want adaptive, body=%s", got, string(body))
 		}
 		if got := gjson.GetBytes(body, "reasoning_split").Bool(); !got {
@@ -143,13 +143,13 @@ func TestOpenAICompatExecutorMiniMaxM3UsageThinkingFromClaudeRequest(t *testing.
 	if record.Detail.Thinking == nil {
 		t.Fatal("thinking should not be nil")
 	}
-	if got := record.Detail.Thinking.Intensity; got != "auto" {
-		t.Fatalf("thinking intensity = %q, want auto", got)
+	if got := record.Detail.Thinking.Intensity; got != "high" {
+		t.Fatalf("thinking intensity = %q, want high", got)
 	}
-	if got := record.Detail.Thinking.Mode; got != "auto" {
+	if got := record.Detail.Thinking.Mode; got != "high" {
 		t.Fatalf("thinking mode = %q, want auto", got)
 	}
-	if got := record.Detail.Thinking.Level; got != "auto" {
+	if got := record.Detail.Thinking.Level; got != "high" {
 		t.Fatalf("thinking level = %q, want auto", got)
 	}
 }
@@ -172,7 +172,7 @@ func TestOpenAICompatExecutorMiniMaxM3AcceptsXHighReasoningEffort(t *testing.T) 
 		if gjson.GetBytes(body, "reasoning_effort").Exists() {
 			t.Fatalf("reasoning_effort should be normalized away for MiniMax-M3, body=%s", string(body))
 		}
-		if got := gjson.GetBytes(body, "thinking.type").String(); got != "adaptive" {
+		if got := gjson.GetBytes(body, "extra_body.thinking.type").String(); got != "adaptive" {
 			t.Fatalf("thinking.type = %q, want adaptive, body=%s", got, string(body))
 		}
 		if got := gjson.GetBytes(body, "reasoning_split").Bool(); !got {
@@ -197,6 +197,106 @@ func TestOpenAICompatExecutorMiniMaxM3AcceptsXHighReasoningEffort(t *testing.T) 
 	})
 	if err != nil {
 		t.Fatalf("Execute() error = %v", err)
+	}
+}
+
+func TestOpenAICompatExecutorSensenovaDeepSeekV4DefaultsHighThinking(t *testing.T) {
+	probe := &usageProbe{records: make(chan cliproxyusage.Record, 16)}
+	cliproxyusage.RegisterPlugin(probe)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if got := gjson.GetBytes(body, "reasoning_effort").String(); got != "high" {
+			t.Fatalf("reasoning_effort = %q, want high; body=%s", got, string(body))
+		}
+		if gjson.GetBytes(body, "extra_body.thinking.type").Exists() {
+			t.Fatalf("thinking.type should not be sent to Sensenova; body=%s", string(body))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-x","object":"chat.completion","usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3},"choices":[{"index":0,"message":{"role":"assistant","content":"ok","reasoning_content":"reasoned"},"finish_reason":"stop"}]}`))
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("sensenova", &config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL + "/v1",
+		"api_key":  "test",
+	}}
+	model := "deepseek-v4-flash"
+	started := time.Now()
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   model,
+		Payload: []byte(`{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hello"}]}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai"),
+		Stream:       false,
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	record := waitUsageRecord(t, probe.records, "sensenova", model, started)
+	if record.Detail.Thinking == nil {
+		t.Fatal("thinking should not be nil")
+	}
+	if got := record.Detail.Thinking.Intensity; got != "high" {
+		t.Fatalf("thinking intensity = %q, want high", got)
+	}
+	if got := record.Detail.Thinking.Mode; got != "level" {
+		t.Fatalf("thinking mode = %q, want level", got)
+	}
+	if got := record.Detail.Thinking.Level; got != "high" {
+		t.Fatalf("thinking level = %q, want high", got)
+	}
+}
+
+func TestOpenAICompatExecutorOpenRouterDeepSeekV4DefaultThinkingIsRecorded(t *testing.T) {
+	probe := &usageProbe{records: make(chan cliproxyusage.Record, 16)}
+	cliproxyusage.RegisterPlugin(probe)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if got := gjson.GetBytes(body, "reasoning_effort").String(); got != "high" {
+			t.Fatalf("reasoning_effort = %q, want high; body=%s", got, string(body))
+		}
+		if gjson.GetBytes(body, "extra_body.thinking.type").Exists() {
+			t.Fatalf("thinking.type should not be sent to OpenRouter; body=%s", string(body))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-x","object":"chat.completion","usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3},"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("openrouter", &config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL + "/v1",
+		"api_key":  "test",
+	}}
+	model := "deepseek/deepseek-v4-flash"
+	started := time.Now()
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   model,
+		Payload: []byte(`{"model":"deepseek/deepseek-v4-flash","messages":[{"role":"user","content":"hello"}]}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai"),
+		Stream:       false,
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	record := waitUsageRecord(t, probe.records, "openrouter", model, started)
+	if record.Detail.Thinking == nil {
+		t.Fatal("thinking should not be nil")
+	}
+	if got := record.Detail.Thinking.Intensity; got != "high" {
+		t.Fatalf("thinking intensity = %q, want high", got)
+	}
+	if got := record.Detail.Thinking.Mode; got != "level" {
+		t.Fatalf("thinking mode = %q, want level", got)
+	}
+	if got := record.Detail.Thinking.Level; got != "high" {
+		t.Fatalf("thinking level = %q, want high", got)
 	}
 }
 
@@ -251,6 +351,9 @@ func TestOpenAICompatExecutorFallbackUsageStream(t *testing.T) {
 	record := waitUsageRecord(t, probe.records, "openai-compatibility", model, started)
 	if record.Failed {
 		t.Fatalf("usage record marked failed unexpectedly")
+	}
+	if record.StatusCode != http.StatusOK {
+		t.Fatalf("status code = %d, want %d", record.StatusCode, http.StatusOK)
 	}
 	if record.Detail.InputTokens <= 0 {
 		t.Fatalf("input tokens = %d, want > 0", record.Detail.InputTokens)

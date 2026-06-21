@@ -18,11 +18,15 @@ import (
 type UsageReporter struct {
 	provider    string
 	model       string
+	statusCode  int
 	authID      string
 	authIndex   string
 	authType    string
 	apiKey      string
 	source      string
+	request     usage.RequestInfo
+	modelInfo   usage.ModelInfo
+	estimate    usage.Detail
 	requestedAt time.Time
 	thinking    *usage.Thinking
 	once        sync.Once
@@ -66,7 +70,7 @@ func (r *UsageReporter) publishWithOutcome(ctx context.Context, detail usage.Det
 	if r == nil {
 		return
 	}
-	detail = normalizeUsageDetail(detail)
+	detail = r.applyUsageEstimate(normalizeUsageDetail(detail), failed)
 	r.once.Do(func() {
 		usage.PublishRecord(ctx, r.buildRecord(detail, failed))
 	})
@@ -98,12 +102,17 @@ func (r *UsageReporter) SetThinkingFromPayload(payload []byte) {
 	if r == nil {
 		return
 	}
+	r.SetUsageEstimateFromPayload(payload)
 	r.thinking = parseThinkingFromPayload(payload)
 }
 
 // SetThinkingFromPayloadIfMissing extracts thinking settings only when none were captured earlier.
 func (r *UsageReporter) SetThinkingFromPayloadIfMissing(payload []byte) {
-	if r == nil || r.thinking != nil {
+	if r == nil {
+		return
+	}
+	r.SetUsageEstimateFromPayload(payload)
+	if r.thinking != nil {
 		return
 	}
 	r.thinking = parseThinkingFromPayload(payload)
@@ -134,11 +143,109 @@ func (r *UsageReporter) buildRecord(detail usage.Detail, failed bool) usage.Reco
 		AuthID:      r.authID,
 		AuthIndex:   r.authIndex,
 		AuthType:    r.authType,
+		StatusCode:  r.statusCode,
+		Request:     r.request,
+		ModelInfo:   r.modelInfo,
 		RequestedAt: r.requestedAt,
 		Latency:     r.latency(),
 		Failed:      failed,
 		Detail:      detail,
 	}
+}
+
+// SetUsageEstimateFromPayload records a best-effort prompt-token estimate for
+// successful responses whose upstream usage payload is absent or all-zero.
+// SetThinkingEffortIfMissing records a provider default thinking effort when the effective
+// payload did not contain an explicit thinking setting.
+func (r *UsageReporter) SetThinkingEffortIfMissing(effort string) {
+	if r == nil || r.thinking != nil {
+		return
+	}
+	r.thinking = buildThinkingFromEffort(effort)
+}
+
+func (r *UsageReporter) SetUsageEstimateFromPayload(payload []byte) {
+	if r == nil || !isZeroUsageDetail(r.estimate) {
+		return
+	}
+	count := EstimatePromptTokens(r.model, payload)
+	if count <= 0 {
+		return
+	}
+	r.estimate = usage.Detail{
+		InputTokens: count,
+		TotalTokens: count,
+	}
+}
+
+// SetStatusCode records the actual upstream HTTP status observed by the executor.
+func (r *UsageReporter) SetStatusCode(statusCode int) {
+	if r == nil || statusCode <= 0 {
+		return
+	}
+	r.statusCode = statusCode
+}
+
+// SetHTTPRequestMetadata records the effective upstream HTTP route shown in usage details.
+func (r *UsageReporter) SetHTTPRequestMetadata(specSource, method, displayName, adapter, upstreamURL string) {
+	if r == nil {
+		return
+	}
+	r.request = usage.RequestInfo{
+		Type:        "http",
+		SpecSource:  strings.TrimSpace(specSource),
+		Method:      strings.ToUpper(strings.TrimSpace(method)),
+		DisplayName: strings.TrimSpace(displayName),
+		Adapter:     strings.TrimSpace(adapter),
+		Upstream:    upstreamLabelFromURL(upstreamURL),
+		UpstreamURL: strings.TrimSpace(upstreamURL),
+	}
+}
+
+// SetModelMetadata records the client-visible and effective upstream model routing values.
+func (r *UsageReporter) SetModelMetadata(platformModel, upstreamModel, clientServiceTier, effectiveServiceTier string) {
+	if r == nil {
+		return
+	}
+	r.modelInfo = usage.ModelInfo{
+		PlatformModel:        strings.TrimSpace(platformModel),
+		UpstreamModel:        strings.TrimSpace(upstreamModel),
+		ClientServiceTier:    strings.TrimSpace(clientServiceTier),
+		EffectiveServiceTier: strings.TrimSpace(effectiveServiceTier),
+	}
+}
+
+func (r *UsageReporter) applyUsageEstimate(detail usage.Detail, failed bool) usage.Detail {
+	if r == nil || failed || !isZeroUsageDetail(detail) || isZeroUsageDetail(r.estimate) {
+		return detail
+	}
+	return normalizeUsageDetail(r.estimate)
+}
+
+// EstimatePromptTokens estimates prompt token count from a payload and model name.
+func EstimatePromptTokens(model string, payload []byte) int64 {
+	enc, err := TokenizerForModel(model)
+	if err != nil {
+		return 0
+	}
+	count, err := CountOpenAIChatTokens(enc, payload)
+	if err != nil || count <= 0 {
+		return 0
+	}
+	return count
+}
+
+func upstreamLabelFromURL(rawURL string) string {
+	value := strings.TrimSpace(rawURL)
+	if value == "" {
+		return ""
+	}
+	value = strings.TrimPrefix(value, "https://")
+	value = strings.TrimPrefix(value, "http://")
+	if idx := strings.IndexAny(value, "?#"); idx >= 0 {
+		value = value[:idx]
+	}
+	return strings.TrimRight(value, "/")
 }
 
 func cloneUsageThinking(in *usage.Thinking) *usage.Thinking {
@@ -162,6 +269,9 @@ func parseThinkingFromPayload(payload []byte) *usage.Thinking {
 		return nil
 	}
 
+	if thinking := parseDeepSeekThinkingPayload(payload); thinking != nil {
+		return thinking
+	}
 	if thinking := parseClaudeThinkingPayload(payload); thinking != nil {
 		return thinking
 	}
@@ -188,6 +298,32 @@ func parseThinkingFromPayload(payload []byte) *usage.Thinking {
 		return buildThinkingFromBudget(budget)
 	}
 
+	return nil
+}
+
+func parseDeepSeekThinkingPayload(payload []byte) *usage.Thinking {
+	// Only handle DeepSeek-style extra_body.thinking / thinking.type payloads.
+	// Skip if the payload has Claude-style thinking or Gemini output_config,
+	// which have their own dedicated parsers.
+	if gjson.GetBytes(payload, "output_config.effort").Exists() || gjson.GetBytes(payload, "thinking.budget_tokens").Exists() {
+		return nil
+	}
+	thinkingType := firstNonEmptyPath(payload, []string{"thinking.type", "extra_body.thinking.type"})
+	effort := firstNonEmptyPath(payload, []string{"reasoning_effort"})
+	if thinkingType == "" && effort == "" {
+		return nil
+	}
+
+	thinkingType = strings.ToLower(strings.TrimSpace(thinkingType))
+	if thinkingType == "disabled" || thinkingType == "none" || thinkingType == "0" {
+		return buildThinkingFromEffort("none")
+	}
+	if effort != "" {
+		return buildThinkingFromEffort(effort)
+	}
+	if thinkingType == "enabled" || thinkingType == "adaptive" || thinkingType == "auto" {
+		return buildThinkingFromEffort("auto")
+	}
 	return nil
 }
 

@@ -138,6 +138,71 @@ func TestConvertOpenAIChatCompletionsResponseToOpenAIResponses_ResponseCompleted
 	}
 }
 
+func TestConvertOpenAIChatCompletionsResponseToOpenAIResponses_DoneCompletesStreamWithoutFinishReason(t *testing.T) {
+	t.Parallel()
+
+	request := []byte(`{"model":"deepseek/deepseek-v4-flash"}`)
+	in := []string{
+		`data: {"id":"resp_no_finish","object":"chat.completion.chunk","created":1773896263,"model":"model","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":null}]}`,
+		`data: [DONE]`,
+	}
+
+	var param any
+	var out [][]byte
+	for _, line := range in {
+		out = append(out, ConvertOpenAIChatCompletionsResponseToOpenAIResponses(context.Background(), "model", request, request, []byte(line), &param)...)
+	}
+
+	completedCount := 0
+	outputTextDoneCount := 0
+	contentPartDoneCount := 0
+	outputItemDoneCount := 0
+	var completedData gjson.Result
+
+	for _, chunk := range out {
+		event, data := parseOpenAIResponsesSSEEvent(t, chunk)
+		switch event {
+		case "response.output_text.done":
+			outputTextDoneCount++
+			if got := data.Get("text").String(); got != "ok" {
+				t.Fatalf("unexpected output_text.done text: got %q want ok", got)
+			}
+		case "response.content_part.done":
+			contentPartDoneCount++
+			if got := data.Get("part.text").String(); got != "ok" {
+				t.Fatalf("unexpected content_part.done text: got %q want ok", got)
+			}
+		case "response.output_item.done":
+			if data.Get("item.type").String() != "message" {
+				continue
+			}
+			outputItemDoneCount++
+			if got := data.Get("item.content.0.text").String(); got != "ok" {
+				t.Fatalf("unexpected output_item.done text: got %q want ok", got)
+			}
+		case "response.completed":
+			completedCount++
+			completedData = data
+		}
+	}
+
+	if outputTextDoneCount != 1 {
+		t.Fatalf("expected exactly 1 response.output_text.done event, got %d", outputTextDoneCount)
+	}
+	if contentPartDoneCount != 1 {
+		t.Fatalf("expected exactly 1 response.content_part.done event, got %d", contentPartDoneCount)
+	}
+	if outputItemDoneCount != 1 {
+		t.Fatalf("expected exactly 1 message response.output_item.done event, got %d", outputItemDoneCount)
+	}
+	if completedCount != 1 {
+		t.Fatalf("expected exactly 1 response.completed event, got %d", completedCount)
+	}
+	if got := completedData.Get("response.output.0.content.0.text").String(); got != "ok" {
+		t.Fatalf("unexpected completed response output text: got %q want ok", got)
+	}
+}
+
 func TestConvertOpenAIChatCompletionsResponseToOpenAIResponses_MultipleToolCallsRemainSeparate(t *testing.T) {
 	in := []string{
 		`data: {"id":"resp_test","object":"chat.completion.chunk","created":1773896263,"model":"model","choices":[{"index":0,"delta":{"role":"assistant","content":null,"reasoning_content":null,"tool_calls":[{"index":0,"id":"call_read","type":"function","function":{"name":"read","arguments":""}}]},"finish_reason":null}]}`,

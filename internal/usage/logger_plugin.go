@@ -6,6 +6,7 @@ package usage
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -89,13 +90,14 @@ type modelStats struct {
 
 // RequestDetail stores the timestamp, latency, and token usage for a single request.
 type RequestDetail struct {
-	Timestamp time.Time  `json:"timestamp"`
-	LatencyMs int64      `json:"latency_ms"`
-	Source    string     `json:"source"`
-	AuthIndex string     `json:"auth_index"`
-	Thinking  *Thinking  `json:"thinking,omitempty"`
-	Tokens    TokenStats `json:"tokens"`
-	Failed    bool       `json:"failed"`
+	Timestamp  time.Time  `json:"timestamp"`
+	LatencyMs  int64      `json:"latency_ms"`
+	Source     string     `json:"source"`
+	AuthIndex  string     `json:"auth_index"`
+	StatusCode int        `json:"status_code"`
+	Thinking   *Thinking  `json:"thinking,omitempty"`
+	Tokens     TokenStats `json:"tokens"`
+	Failed     bool       `json:"failed"`
 }
 
 // Thinking captures normalized thinking settings for one request.
@@ -183,6 +185,7 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 		failed = !resolveSuccess(ctx)
 	}
 	success := !failed
+	statusCode := normaliseStatusCode(record.StatusCode, failed)
 	modelName := record.Model
 	if modelName == "" {
 		modelName = "unknown"
@@ -207,13 +210,14 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 		s.apis[statsKey] = stats
 	}
 	s.updateAPIStats(stats, modelName, RequestDetail{
-		Timestamp: timestamp,
-		LatencyMs: normaliseLatency(record.Latency),
-		Source:    record.Source,
-		AuthIndex: record.AuthIndex,
-		Thinking:  normaliseThinking(record.Detail.Thinking),
-		Tokens:    detail,
-		Failed:    failed,
+		Timestamp:  timestamp,
+		LatencyMs:  normaliseLatency(record.Latency),
+		Source:     record.Source,
+		AuthIndex:  record.AuthIndex,
+		StatusCode: statusCode,
+		Thinking:   normaliseThinking(record.Detail.Thinking),
+		Tokens:     detail,
+		Failed:     failed,
 	})
 
 	s.requestsByDay[dayKey]++
@@ -350,6 +354,7 @@ func (s *RequestStatistics) MergeSnapshot(snapshot StatisticsSnapshot) MergeResu
 			for _, detail := range modelSnapshot.Details {
 				detail.Tokens = normaliseTokenStats(detail.Tokens)
 				detail.Thinking = normaliseThinkingValue(detail.Thinking)
+				detail.StatusCode = normaliseStatusCode(detail.StatusCode, detail.Failed)
 				if detail.LatencyMs < 0 {
 					detail.LatencyMs = 0
 				}
@@ -482,6 +487,16 @@ func positiveInt64(value int64) int64 {
 		return 0
 	}
 	return value
+}
+
+func normaliseStatusCode(statusCode int, failed bool) int {
+	if statusCode > 0 {
+		return statusCode
+	}
+	if !failed {
+		return http.StatusOK
+	}
+	return 0
 }
 
 func parseHourKey(hour string) int {

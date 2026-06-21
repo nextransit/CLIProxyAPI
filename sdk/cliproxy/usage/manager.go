@@ -9,6 +9,24 @@ import (
 )
 
 // Record contains the usage statistics captured for a single provider request.
+type RequestInfo struct {
+	Type        string `json:"type,omitempty"`
+	SpecSource  string `json:"spec_source,omitempty"`
+	Method      string `json:"method,omitempty"`
+	DisplayName string `json:"display_name,omitempty"`
+	Adapter     string `json:"adapter,omitempty"`
+	Upstream    string `json:"upstream,omitempty"`
+	UpstreamURL string `json:"upstream_url,omitempty"`
+}
+
+type ModelInfo struct {
+	PlatformModel        string `json:"platform_model,omitempty"`
+	UpstreamModel        string `json:"upstream_model,omitempty"`
+	ActualSource         string `json:"actual_source,omitempty"`
+	ClientServiceTier    string `json:"client_service_tier,omitempty"`
+	EffectiveServiceTier string `json:"effective_service_tier,omitempty"`
+}
+
 type Record struct {
 	Provider    string
 	Model       string
@@ -17,6 +35,9 @@ type Record struct {
 	AuthIndex   string
 	AuthType    string
 	Source      string
+	StatusCode  int
+	Request     RequestInfo
+	ModelInfo   ModelInfo
 	RequestedAt time.Time
 	Latency     time.Duration
 	Failed      bool

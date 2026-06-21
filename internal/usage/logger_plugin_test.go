@@ -2,6 +2,7 @@ package usage
 
 import (
 	"context"
+	"net/http"
 	"testing"
 	"time"
 
@@ -29,6 +30,29 @@ func TestRequestStatisticsRecordIncludesLatency(t *testing.T) {
 	}
 	if details[0].LatencyMs != 1500 {
 		t.Fatalf("latency_ms = %d, want 1500", details[0].LatencyMs)
+	}
+}
+
+func TestRequestStatisticsRecordDefaultsSuccessfulMissingStatusToOK(t *testing.T) {
+	stats := NewRequestStatistics()
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "gpt-5.4",
+		RequestedAt: time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC),
+		Detail: coreusage.Detail{
+			InputTokens:  10,
+			OutputTokens: 20,
+			TotalTokens:  30,
+		},
+	})
+
+	snapshot := stats.Snapshot()
+	details := snapshot.APIs["test-key"].Models["gpt-5.4"].Details
+	if len(details) != 1 {
+		t.Fatalf("details len = %d, want 1", len(details))
+	}
+	if details[0].StatusCode != http.StatusOK {
+		t.Fatalf("status_code = %d, want %d", details[0].StatusCode, http.StatusOK)
 	}
 }
 

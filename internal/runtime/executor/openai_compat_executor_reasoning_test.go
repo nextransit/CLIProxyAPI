@@ -54,6 +54,71 @@ func TestEnsureDeepSeekReasoningContentFallbackPlaceholder(t *testing.T) {
 	}
 }
 
+func TestNormalizeDeepSeekThinkingRequestSensenovaDefaultsHigh(t *testing.T) {
+	input := []byte(`{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}`)
+
+	out := normalizeDeepSeekThinkingRequest(input, "deepseek-v4-flash", "sensenova")
+
+	if got := gjson.GetBytes(out, "reasoning_effort").String(); got != "high" {
+		t.Fatalf("reasoning_effort = %q, want high; body=%s", got, string(out))
+	}
+	if gjson.GetBytes(out, "extra_body.thinking.type").Exists() {
+		t.Fatalf("thinking.type should not be sent to Sensenova; body=%s", string(out))
+	}
+}
+
+func TestNormalizeDeepSeekThinkingRequestOpenRouterDefaultsHigh(t *testing.T) {
+	input := []byte(`{"model":"deepseek/deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}`)
+
+	out := normalizeDeepSeekThinkingRequest(input, "deepseek/deepseek-v4-flash", "openrouter")
+
+	if got := gjson.GetBytes(out, "reasoning_effort").String(); got != "high" {
+		t.Fatalf("reasoning_effort = %q, want high; body=%s", got, string(out))
+	}
+	if gjson.GetBytes(out, "extra_body.thinking.type").Exists() {
+		t.Fatalf("thinking.type should not be sent to OpenRouter; body=%s", string(out))
+	}
+}
+
+func TestNormalizeDeepSeekThinkingRequestSensenovaMapsUnsupportedEffort(t *testing.T) {
+	input := []byte(`{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"xhigh"}`)
+
+	out := normalizeDeepSeekThinkingRequest(input, "deepseek-v4-flash", "sensenova")
+
+	if got := gjson.GetBytes(out, "reasoning_effort").String(); got != "high" {
+		t.Fatalf("reasoning_effort = %q, want high; body=%s", got, string(out))
+	}
+	if gjson.GetBytes(out, "extra_body.thinking.type").Exists() {
+		t.Fatalf("thinking.type should not be sent to Sensenova; body=%s", string(out))
+	}
+}
+
+func TestNormalizeDeepSeekThinkingRequestOpenRouterMapsAutoToHigh(t *testing.T) {
+	input := []byte(`{"model":"deepseek/deepseek-v4-flash","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"auto"}`)
+
+	out := normalizeDeepSeekThinkingRequest(input, "deepseek/deepseek-v4-flash", "openrouter")
+
+	if got := gjson.GetBytes(out, "reasoning_effort").String(); got != "high" {
+		t.Fatalf("reasoning_effort = %q, want high; body=%s", got, string(out))
+	}
+	if gjson.GetBytes(out, "extra_body.thinking.type").Exists() {
+		t.Fatalf("thinking.type should not be sent to OpenRouter; body=%s", string(out))
+	}
+}
+
+func TestNormalizeDeepSeekThinkingRequestSensenovaPreservesNone(t *testing.T) {
+	input := []byte(`{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"none"}`)
+
+	out := normalizeDeepSeekThinkingRequest(input, "deepseek-v4-flash", "sensenova")
+
+	if got := gjson.GetBytes(out, "reasoning_effort").String(); got != "none" {
+		t.Fatalf("reasoning_effort = %q, want none; body=%s", got, string(out))
+	}
+	if gjson.GetBytes(out, "extra_body.thinking.type").Exists() {
+		t.Fatalf("thinking.type should not be sent to Sensenova; body=%s", string(out))
+	}
+}
+
 func TestSanitizeOpenAICompatThinkingResponseMiniMaxM27(t *testing.T) {
 	input := []byte(`{
 		"choices":[
@@ -138,7 +203,7 @@ func TestNormalizeMiniMaxM3RequestMapsReasoningEffort(t *testing.T) {
 	if gjson.GetBytes(out, "reasoning_effort").Exists() {
 		t.Fatalf("reasoning_effort should be removed, body=%s", string(out))
 	}
-	if got := gjson.GetBytes(out, "thinking.type").String(); got != "adaptive" {
+	if got := gjson.GetBytes(out, "extra_body.thinking.type").String(); got != "adaptive" {
 		t.Fatalf("thinking.type = %q, want adaptive, body=%s", got, string(out))
 	}
 	if got := gjson.GetBytes(out, "reasoning_split").Bool(); !got {
@@ -154,7 +219,7 @@ func TestNormalizeMiniMaxM3RequestMapsXHighReasoningEffort(t *testing.T) {
 	if gjson.GetBytes(out, "reasoning_effort").Exists() {
 		t.Fatalf("reasoning_effort should be removed, body=%s", string(out))
 	}
-	if got := gjson.GetBytes(out, "thinking.type").String(); got != "adaptive" {
+	if got := gjson.GetBytes(out, "extra_body.thinking.type").String(); got != "adaptive" {
 		t.Fatalf("thinking.type = %q, want adaptive, body=%s", got, string(out))
 	}
 	if got := gjson.GetBytes(out, "reasoning_split").Bool(); !got {
@@ -167,7 +232,7 @@ func TestNormalizeMiniMaxM3RequestMapsClaudeEnabledThinking(t *testing.T) {
 
 	out := normalizeMiniMaxM3Request(input, "MiniMax-M3")
 
-	if got := gjson.GetBytes(out, "thinking.type").String(); got != "adaptive" {
+	if got := gjson.GetBytes(out, "extra_body.thinking.type").String(); got != "adaptive" {
 		t.Fatalf("thinking.type = %q, want adaptive, body=%s", got, string(out))
 	}
 	if gjson.GetBytes(out, "thinking.budget_tokens").Exists() {
@@ -186,7 +251,7 @@ func TestNormalizeMiniMaxM3RequestNormalizesForcedToolChoice(t *testing.T) {
 	if got := gjson.GetBytes(out, "tool_choice.type").String(); got != "auto" {
 		t.Fatalf("tool_choice.type = %q, want auto, body=%s", got, string(out))
 	}
-	if got := gjson.GetBytes(out, "thinking.type").String(); got != "disabled" {
+	if got := gjson.GetBytes(out, "extra_body.thinking.type").String(); got != "disabled" {
 		t.Fatalf("thinking.type = %q, want disabled, body=%s", got, string(out))
 	}
 	if gjson.GetBytes(out, "reasoning_split").Exists() {
@@ -225,7 +290,7 @@ func TestNormalizeMiniMaxM3RequestDisablesThinking(t *testing.T) {
 
 	out := normalizeMiniMaxM3Request(input, "MiniMax-M3")
 
-	if got := gjson.GetBytes(out, "thinking.type").String(); got != "disabled" {
+	if got := gjson.GetBytes(out, "extra_body.thinking.type").String(); got != "disabled" {
 		t.Fatalf("thinking.type = %q, want disabled, body=%s", got, string(out))
 	}
 	if gjson.GetBytes(out, "reasoning_split").Exists() {
@@ -248,7 +313,7 @@ func TestNormalizeMiniMaxM3RequestNoReasoningEffortWithThinkingDisabled(t *testi
 
 	out := normalizeMiniMaxM3Request(input, "MiniMax-M3")
 
-	if got := gjson.GetBytes(out, "thinking.type").String(); got != "disabled" {
+	if got := gjson.GetBytes(out, "extra_body.thinking.type").String(); got != "disabled" {
 		t.Fatalf("thinking.type = %q, want preserved disabled, body=%s", got, string(out))
 	}
 	if gjson.GetBytes(out, "reasoning_split").Exists() {
@@ -261,7 +326,7 @@ func TestNormalizeMiniMaxM3RequestNoReasoningEffortWithThinkingAdaptive(t *testi
 
 	out := normalizeMiniMaxM3Request(input, "MiniMax-M3")
 
-	if got := gjson.GetBytes(out, "thinking.type").String(); got != "adaptive" {
+	if got := gjson.GetBytes(out, "extra_body.thinking.type").String(); got != "adaptive" {
 		t.Fatalf("thinking.type = %q, want preserved adaptive, body=%s", got, string(out))
 	}
 	if got := gjson.GetBytes(out, "reasoning_split").Bool(); !got {
@@ -274,7 +339,7 @@ func TestNormalizeMiniMaxM3RequestNoReasoningEffortEmptyThinkingDefaultsAdaptive
 
 	out := normalizeMiniMaxM3Request(input, "MiniMax-M3")
 
-	if got := gjson.GetBytes(out, "thinking.type").String(); got != "adaptive" {
+	if got := gjson.GetBytes(out, "extra_body.thinking.type").String(); got != "adaptive" {
 		t.Fatalf("thinking.type = %q, want adaptive (default), body=%s", got, string(out))
 	}
 	if got := gjson.GetBytes(out, "reasoning_split").Bool(); !got {
