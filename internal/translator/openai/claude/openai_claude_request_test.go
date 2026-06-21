@@ -696,3 +696,40 @@ func TestConvertClaudeRequestToOpenAI_AssistantThinkingToolUseThinkingSplit(t *t
 		t.Fatalf("Expected reasoning_content %q, got %q", "t1\n\nt2", got)
 	}
 }
+
+func TestConvertClaudeRequestToOpenAI_ClaudeCodeToolList(t *testing.T) {
+	inputJSON := `{
+		"model": "deepseek-v4-flash",
+		"messages": [{"role": "user", "content": "Use tools if needed."}],
+		"tools": [
+			{"name": "Agent", "description": "Start a sub agent", "input_schema": {"type": "object", "properties": {"subagent_type": {"type": "string"}}}},
+			{"name": "AskUserQuestion", "description": "Ask the user", "input_schema": {"type": "object", "properties": {"questions": {"type": "array", "items": {"type": "object", "properties": {"question": {"type": "string"}}}}}}},
+			{"name": "Bash", "description": "Run bash", "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}}},
+			{"name": "Edit", "description": "Edit a file", "input_schema": {"type": "object", "properties": {"file_path": {"type": "string"}}}},
+			{"name": "Read", "description": "Read a file", "input_schema": {"type": "object", "properties": {"file_path": {"type": "string"}}}},
+			{"name": "ScheduleWakeup", "description": "Schedule a wakeup", "input_schema": {"type": "object", "properties": {"delaySeconds": {"type": "number"}}}},
+			{"name": "Skill", "description": "Run a skill", "input_schema": {"type": "object", "properties": {"skill": {"type": "string"}}}},
+			{"name": "ToolSearch", "description": "Search for tools", "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}}},
+			{"name": "Workflow", "description": "Run a workflow", "input_schema": {"type": "object", "properties": {"script": {"type": "string"}}}},
+			{"name": "Write", "description": "Write a file", "input_schema": {"type": "object", "properties": {"file_path": {"type": "string"}}}}
+		],
+		"tool_choice": {"type": "auto"}
+	}`
+
+	result := ConvertClaudeRequestToOpenAI("deepseek-v4-flash", []byte(inputJSON), true)
+	resultJSON := gjson.ParseBytes(result)
+	tools := resultJSON.Get("tools").Array()
+
+	if len(tools) != 10 {
+		t.Fatalf("Expected 10 tools, got %d. Tools: %s", len(tools), resultJSON.Get("tools").Raw)
+	}
+	if got := resultJSON.Get("tools.1.function.name").String(); got != "AskUserQuestion" {
+		t.Fatalf("Expected tools[1].function.name %q, got %q", "AskUserQuestion", got)
+	}
+	if got := resultJSON.Get("tools.1.function.parameters.properties.questions.type").String(); got != "array" {
+		t.Fatalf("Expected AskUserQuestion questions schema type %q, got %q", "array", got)
+	}
+	if got := resultJSON.Get("tool_choice").String(); got != "auto" {
+		t.Fatalf("Expected tool_choice %q, got %q", "auto", got)
+	}
+}

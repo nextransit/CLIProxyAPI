@@ -112,7 +112,7 @@ func ConvertOpenAIResponseToClaude(_ context.Context, _ string, originalRequestR
 
 	streamResult := gjson.GetBytes(originalRequestRawJSON, "stream")
 	if !streamResult.Exists() || (streamResult.Exists() && streamResult.Type == gjson.False) {
-		return convertOpenAINonStreamingToAnthropic(rawJSON)
+		return convertOpenAINonStreamingToAnthropic(rawJSON, (*param).(*ConvertOpenAIResponseToAnthropicParams).ToolNameMap)
 	} else {
 		return convertOpenAIStreamingChunkToAnthropic(rawJSON, (*param).(*ConvertOpenAIResponseToAnthropicParams))
 	}
@@ -386,7 +386,7 @@ func convertOpenAIDoneToAnthropic(param *ConvertOpenAIResponseToAnthropicParams)
 }
 
 // convertOpenAINonStreamingToAnthropic converts OpenAI non-streaming response to Anthropic format
-func convertOpenAINonStreamingToAnthropic(rawJSON []byte) [][]byte {
+func convertOpenAINonStreamingToAnthropic(rawJSON []byte, toolNameMap map[string]string) [][]byte {
 	root := gjson.ParseBytes(rawJSON)
 
 	out := []byte(`{"id":"","type":"message","role":"assistant","model":"","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}`)
@@ -419,7 +419,7 @@ func convertOpenAINonStreamingToAnthropic(rawJSON []byte) [][]byte {
 			toolCalls.ForEach(func(_, toolCall gjson.Result) bool {
 				toolUseBlock := []byte(`{"type":"tool_use","id":"","name":"","input":{}}`)
 				toolUseBlock, _ = sjson.SetBytes(toolUseBlock, "id", util.SanitizeClaudeToolID(toolCall.Get("id").String()))
-				toolUseBlock, _ = sjson.SetBytes(toolUseBlock, "name", toolCall.Get("function.name").String())
+				toolUseBlock, _ = sjson.SetBytes(toolUseBlock, "name", util.MapToolName(toolNameMap, toolCall.Get("function.name").String()))
 
 				argsStr := util.FixJSON(toolCall.Get("function.arguments").String())
 				if argsStr != "" && gjson.Valid(argsStr) {

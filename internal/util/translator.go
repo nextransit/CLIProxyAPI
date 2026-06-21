@@ -228,6 +228,24 @@ func CanonicalToolName(name string) string {
 	return strings.ToLower(canonical)
 }
 
+func compactCanonicalToolName(name string) string {
+	canonical := CanonicalToolName(name)
+	if canonical == "" {
+		return ""
+	}
+	var compact strings.Builder
+	compact.Grow(len(canonical))
+	for _, r := range canonical {
+		switch r {
+		case '_', '-', '.', ':', ' ':
+			continue
+		default:
+			compact.WriteRune(r)
+		}
+	}
+	return compact.String()
+}
+
 // ToolNameMapFromClaudeRequest returns a canonical-name -> original-name map extracted from a Claude request.
 // It is used to restore exact tool name casing for clients that require strict tool name matching (e.g. Claude Code).
 func ToolNameMapFromClaudeRequest(rawJSON []byte) map[string]string {
@@ -257,6 +275,11 @@ func ToolNameMapFromClaudeRequest(rawJSON []byte) map[string]string {
 		if _, exists := out[key]; !exists {
 			out[key] = name
 		}
+		if compactKey := compactCanonicalToolName(name); compactKey != "" && compactKey != key {
+			if _, exists := out[compactKey]; !exists {
+				out[compactKey] = name
+			}
+		}
 		return true
 	})
 
@@ -270,8 +293,14 @@ func MapToolName(toolNameMap map[string]string, name string) string {
 	if name == "" || toolNameMap == nil {
 		return name
 	}
-	if mapped, ok := toolNameMap[CanonicalToolName(name)]; ok && mapped != "" {
+	key := CanonicalToolName(name)
+	if mapped, ok := toolNameMap[key]; ok && mapped != "" {
 		return mapped
+	}
+	if compactKey := compactCanonicalToolName(name); compactKey != "" && compactKey != key {
+		if mapped, ok := toolNameMap[compactKey]; ok && mapped != "" {
+			return mapped
+		}
 	}
 	return name
 }
