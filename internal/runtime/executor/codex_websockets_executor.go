@@ -201,6 +201,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	if err != nil {
 		return resp, err
 	}
+	reporter.SetThinkingFromPayload(body)
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
@@ -221,7 +222,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 
 	body, wsHeaders := applyCodexPromptCacheHeaders(from, req, body)
 	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg)
-	reporter.SetThinkingFromPayload(body)
+	reporter.SetThinkingFromPayloadIfMissing(body)
 
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
@@ -411,6 +412,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	if err != nil {
 		return nil, err
 	}
+	reporter.SetThinkingFromPayload(body)
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, body, requestedModel)
@@ -424,7 +426,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 
 	body, wsHeaders := applyCodexPromptCacheHeaders(from, req, body)
 	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg)
-	reporter.SetThinkingFromPayload(body)
+	reporter.SetThinkingFromPayloadIfMissing(body)
 
 	var authID, authLabel, authType, authValue string
 	authID = auth.ID

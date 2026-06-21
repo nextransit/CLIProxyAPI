@@ -250,6 +250,50 @@ func TestOpenAICompatExecutorSensenovaDeepSeekV4DefaultsHighThinking(t *testing.
 	}
 }
 
+func TestOpenAICompatExecutorDeepSeekV4UsagePreservesRequestedXHigh(t *testing.T) {
+	probe := &usageProbe{records: make(chan cliproxyusage.Record, 16)}
+	cliproxyusage.RegisterPlugin(probe)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if got := gjson.GetBytes(body, "reasoning_effort").String(); got != "high" {
+			t.Fatalf("reasoning_effort = %q, want high; body=%s", got, string(body))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-x","object":"chat.completion","usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3},"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
+	}))
+	defer server.Close()
+
+	executor := NewOpenAICompatExecutor("sensenova", &config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL + "/v1",
+		"api_key":  "test",
+	}}
+	model := "deepseek-v4-flash"
+	started := time.Now()
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   model,
+		Payload: []byte(`{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hello"}],"reasoning_effort":"xhigh"}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai"),
+		Stream:       false,
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	record := waitUsageRecord(t, probe.records, "sensenova", model, started)
+	if record.Detail.Thinking == nil {
+		t.Fatal("thinking should not be nil")
+	}
+	if got := record.Detail.Thinking.Intensity; got != "xhigh" {
+		t.Fatalf("thinking intensity = %q, want xhigh", got)
+	}
+	if got := record.Detail.Thinking.Level; got != "xhigh" {
+		t.Fatalf("thinking level = %q, want xhigh", got)
+	}
+}
+
 func TestOpenAICompatExecutorOpenRouterDeepSeekV4DefaultThinkingIsRecorded(t *testing.T) {
 	probe := &usageProbe{records: make(chan cliproxyusage.Record, 16)}
 	cliproxyusage.RegisterPlugin(probe)

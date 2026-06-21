@@ -112,6 +112,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	if err != nil {
 		return resp, err
 	}
+	reporter.SetThinkingFromPayload(translated)
 
 	translated, err = normalizeOpenAICompatToolMessages(translated)
 	if err != nil {
@@ -129,7 +130,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 			return resp, err
 		}
 	}
-	reporter.SetThinkingFromPayload(translated)
+	reporter.SetThinkingFromPayloadIfMissing(translated)
 	translated = normalizeMiniMaxM3Request(translated, baseModel)
 	translated = clampOpenAICompatMaxTokens(translated, baseModel, e.Identifier())
 	reporter.SetThinkingFromPayloadIfMissing(translated)
@@ -342,6 +343,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	if err != nil {
 		return nil, err
 	}
+	reporter.SetThinkingFromPayload(translated)
 
 	translated, err = normalizeOpenAICompatToolMessages(translated)
 	if err != nil {
@@ -359,7 +361,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			return nil, err
 		}
 	}
-	reporter.SetThinkingFromPayload(translated)
+	reporter.SetThinkingFromPayloadIfMissing(translated)
 	translated = normalizeMiniMaxM3Request(translated, baseModel)
 
 	// Request usage data in the final streaming chunk so that token statistics
