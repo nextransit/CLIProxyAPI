@@ -106,6 +106,42 @@ func TestConvertOpenAIResponseToClaudeRestoresStreamingToolNameVariant(t *testin
 	}
 }
 
+func TestConvertOpenAIResponseToClaudeDefersStreamingToolStartUntilName(t *testing.T) {
+	originalRequest := []byte(`{
+		"model": "deepseek-v4-flash",
+		"stream": true,
+		"tools": [{"name": "Bash", "input_schema": {"type": "object"}}],
+		"messages": []
+	}`)
+
+	var param any
+	firstChunks := ConvertOpenAIResponseToClaude(
+		context.Background(),
+		"deepseek-v4-flash",
+		originalRequest,
+		nil,
+		[]byte(`data: {"id":"chatcmpl-1","model":"deepseek-v4-flash","created":1,"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_789","type":"function","function":{"name":"","arguments":""}}]},"finish_reason":null}]}`),
+		&param,
+	)
+	if hasClaudeSSEEvent(firstChunks, "content_block_start") {
+		t.Fatalf("empty upstream function.name must not emit content_block_start: %q", string(firstChunks[0]))
+	}
+
+	secondChunks := ConvertOpenAIResponseToClaude(
+		context.Background(),
+		"deepseek-v4-flash",
+		originalRequest,
+		nil,
+		[]byte(`data: {"id":"chatcmpl-1","model":"deepseek-v4-flash","created":1,"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"bash","arguments":"{\"command\":\"pwd\"}"}}]},"finish_reason":null}]}`),
+		&param,
+	)
+
+	payload := findClaudeSSEPayload(t, secondChunks, "content_block_start")
+	if got := payload.Get("content_block.name").String(); got != "Bash" {
+		t.Fatalf("content_block.name = %q, want %q; payload=%s", got, "Bash", payload.Raw)
+	}
+}
+
 func findClaudeSSEPayload(t *testing.T, chunks [][]byte, event string) gjson.Result {
 	t.Helper()
 	prefix := "event: " + event + "\n"
@@ -123,4 +159,14 @@ func findClaudeSSEPayload(t *testing.T, chunks [][]byte, event string) gjson.Res
 	}
 	t.Fatalf("event %q not found in %d chunks", event, len(chunks))
 	return gjson.Result{}
+}
+
+func hasClaudeSSEEvent(chunks [][]byte, event string) bool {
+	prefix := "event: " + event + "\n"
+	for _, chunk := range chunks {
+		if strings.HasPrefix(string(chunk), prefix) {
+			return true
+		}
+	}
+	return false
 }
