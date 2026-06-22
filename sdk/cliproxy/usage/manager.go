@@ -35,6 +35,7 @@ type Record struct {
 	AuthIndex   string
 	AuthType    string
 	Source      string
+	RequestID   string
 	StatusCode  int
 	Request     RequestInfo
 	ModelInfo   ModelInfo
