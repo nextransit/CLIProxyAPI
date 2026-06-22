@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 	"github.com/tidwall/gjson"
@@ -72,7 +73,7 @@ func (r *UsageReporter) publishWithOutcome(ctx context.Context, detail usage.Det
 	}
 	detail = r.applyUsageEstimate(normalizeUsageDetail(detail), failed)
 	r.once.Do(func() {
-		usage.PublishRecord(ctx, r.buildRecord(detail, failed))
+		usage.PublishRecord(ctx, r.buildRecord(ctx, detail, failed))
 	})
 }
 
@@ -93,7 +94,7 @@ func (r *UsageReporter) EnsurePublishedWithDetail(ctx context.Context, detail us
 	}
 	detail = normalizeUsageDetail(detail)
 	r.once.Do(func() {
-		usage.PublishRecord(ctx, r.buildRecord(detail, false))
+		usage.PublishRecord(ctx, r.buildRecord(ctx, detail, false))
 	})
 }
 
@@ -128,7 +129,7 @@ func normalizeUsageDetail(detail usage.Detail) usage.Detail {
 	return detail
 }
 
-func (r *UsageReporter) buildRecord(detail usage.Detail, failed bool) usage.Record {
+func (r *UsageReporter) buildRecord(ctx context.Context, detail usage.Detail, failed bool) usage.Record {
 	if r == nil {
 		return usage.Record{Detail: detail, Failed: failed}
 	}
@@ -143,6 +144,7 @@ func (r *UsageReporter) buildRecord(detail usage.Detail, failed bool) usage.Reco
 		AuthID:      r.authID,
 		AuthIndex:   r.authIndex,
 		AuthType:    r.authType,
+		RequestID:   logging.GetRequestID(ctx),
 		StatusCode:  r.statusCode,
 		Request:     r.request,
 		ModelInfo:   r.modelInfo,

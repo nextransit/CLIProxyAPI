@@ -1,9 +1,11 @@
 package helps
 
 import (
+	"context"
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 )
 
@@ -227,7 +229,7 @@ func TestUsageReporterBuildRecordIncludesLatency(t *testing.T) {
 		requestedAt: time.Now().Add(-1500 * time.Millisecond),
 	}
 
-	record := reporter.buildRecord(usage.Detail{TotalTokens: 3}, false)
+	record := reporter.buildRecord(context.Background(), usage.Detail{TotalTokens: 3}, false)
 	if record.Latency < time.Second {
 		t.Fatalf("latency = %v, want >= 1s", record.Latency)
 	}
@@ -236,11 +238,24 @@ func TestUsageReporterBuildRecordIncludesLatency(t *testing.T) {
 	}
 }
 
+func TestUsageReporterBuildRecordIncludesRequestID(t *testing.T) {
+	reporter := &UsageReporter{
+		provider: "openai",
+		model:    "gpt-5.4",
+	}
+	ctx := logging.WithRequestID(context.Background(), "deadbeef")
+
+	record := reporter.buildRecord(ctx, usage.Detail{TotalTokens: 3}, false)
+	if record.RequestID != "deadbeef" {
+		t.Fatalf("request id = %q, want deadbeef", record.RequestID)
+	}
+}
+
 func TestUsageReporterSetThinkingFromPayload_OpenAIReasoningEffort(t *testing.T) {
 	reporter := &UsageReporter{}
 	reporter.SetThinkingFromPayload([]byte(`{"reasoning_effort":"high"}`))
 
-	record := reporter.buildRecord(usage.Detail{}, false)
+	record := reporter.buildRecord(context.Background(), usage.Detail{}, false)
 	if record.Detail.Thinking == nil {
 		t.Fatal("thinking should not be nil")
 	}
@@ -259,7 +274,7 @@ func TestUsageReporterSetThinkingFromPayload_DisabledReasoningEffort(t *testing.
 	reporter := &UsageReporter{}
 	reporter.SetThinkingFromPayload([]byte(`{"reasoning_effort":"disabled"}`))
 
-	record := reporter.buildRecord(usage.Detail{}, false)
+	record := reporter.buildRecord(context.Background(), usage.Detail{}, false)
 	if record.Detail.Thinking == nil {
 		t.Fatal("thinking should not be nil")
 	}
@@ -278,7 +293,7 @@ func TestUsageReporterSetThinkingFromPayload_GeminiBudget(t *testing.T) {
 	reporter := &UsageReporter{}
 	reporter.SetThinkingFromPayload([]byte(`{"generationConfig":{"thinkingConfig":{"thinkingBudget":8192}}}`))
 
-	record := reporter.buildRecord(usage.Detail{}, false)
+	record := reporter.buildRecord(context.Background(), usage.Detail{}, false)
 	if record.Detail.Thinking == nil {
 		t.Fatal("thinking should not be nil")
 	}
@@ -294,7 +309,7 @@ func TestUsageReporterSetThinkingFromPayload_ClaudeAdaptive(t *testing.T) {
 	reporter := &UsageReporter{}
 	reporter.SetThinkingFromPayload([]byte(`{"thinking":{"type":"adaptive"},"output_config":{"effort":"max"}}`))
 
-	record := reporter.buildRecord(usage.Detail{}, false)
+	record := reporter.buildRecord(context.Background(), usage.Detail{}, false)
 	if record.Detail.Thinking == nil {
 		t.Fatal("thinking should not be nil")
 	}
