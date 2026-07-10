@@ -119,6 +119,28 @@ func TestGetRequestDetails_PreservesSuffix(t *testing.T) {
 	}
 }
 
+func TestGetRequestDetails_UsesCaseInsensitiveRegisteredProvider(t *testing.T) {
+	modelRegistry := registry.GetGlobalRegistry()
+	modelRegistry.RegisterClient("test-request-details-case-alias", "codex", []*registry.ModelInfo{
+		{ID: "GPT-Case-Alias-Test"},
+	})
+	t.Cleanup(func() {
+		modelRegistry.UnregisterClient("test-request-details-case-alias")
+	})
+
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, coreauth.NewManager(nil, nil, nil))
+	providers, model, errMsg := handler.getRequestDetails("gpt-case-alias-test")
+	if errMsg != nil {
+		t.Fatalf("getRequestDetails() error = %v", errMsg)
+	}
+	if !reflect.DeepEqual(providers, []string{"codex"}) {
+		t.Fatalf("getRequestDetails() providers = %v, want %v", providers, []string{"codex"})
+	}
+	if model != "gpt-case-alias-test" {
+		t.Fatalf("getRequestDetails() model = %q, want %q", model, "gpt-case-alias-test")
+	}
+}
+
 func TestGetRequestDetails_ImageModelReturns503(t *testing.T) {
 	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, coreauth.NewManager(nil, nil, nil))
 

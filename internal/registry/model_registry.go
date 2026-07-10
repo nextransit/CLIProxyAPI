@@ -1037,6 +1037,15 @@ func (r *ModelRegistry) GetModelProviders(modelID string) []string {
 	defer r.mutex.RUnlock()
 
 	registration, exists := r.models[modelID]
+	if !exists {
+		for registeredID, candidate := range r.models {
+			if strings.EqualFold(registeredID, modelID) {
+				registration = candidate
+				exists = true
+				break
+			}
+		}
+	}
 	if !exists || registration == nil || len(registration.Providers) == 0 {
 		return nil
 	}
