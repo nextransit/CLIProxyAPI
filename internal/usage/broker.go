@@ -53,7 +53,8 @@ func (b *Broker) Publish(p UsagePayload) {
     if b.pending != nil {
         b.pending.Stop()
     }
-    b.pending = time.AfterFunc(b.debounce, b.flush)
+    // Stop() may lose the race with an already-firing timer; flush is idempotent.
+	b.pending = time.AfterFunc(b.debounce, b.flush)
     b.timerMu.Unlock()
 }
 
