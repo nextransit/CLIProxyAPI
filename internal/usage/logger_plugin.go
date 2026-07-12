@@ -72,6 +72,8 @@ type RequestStatistics struct {
 	requestsByHour map[int]int64
 	tokensByDay    map[string]int64
 	tokensByHour   map[int]int64
+
+	broker *Broker
 }
 
 // apiStats holds aggregated metrics for a single API key.
@@ -160,7 +162,17 @@ func NewRequestStatistics() *RequestStatistics {
 		requestsByHour: make(map[int]int64),
 		tokensByDay:    make(map[string]int64),
 		tokensByHour:   make(map[int]int64),
+		broker:         NewBroker(800 * time.Millisecond),
 	}
+}
+
+// Broker returns the SSE publish broker for this statistics store.
+// Subscribers receive debounced snapshots after each Record.
+func (s *RequestStatistics) Broker() *Broker {
+	if s == nil {
+		return nil
+	}
+	return s.broker
 }
 
 // Record ingests a new usage record and updates the aggregates.
@@ -226,6 +238,14 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	s.requestsByHour[hourKey]++
 	s.tokensByDay[dayKey] += totalTokens
 	s.tokensByHour[hourKey] += totalTokens
+
+	// Snapshot values needed by the broker outside the lock so we don't
+	// extend lock hold time. broker.Publish itself is non-blocking.
+	snapshot := UsagePayload{
+		TotalRequests: s.totalRequests,
+		TotalTokens:   s.totalTokens,
+	}
+	go s.broker.Publish(snapshot)
 }
 
 func (s *RequestStatistics) updateAPIStats(stats *apiStats, model string, detail RequestDetail) {

@@ -80,6 +80,28 @@ func TestRequestStatisticsRecordDefaultsSuccessfulMissingStatusToOK(t *testing.T
 	}
 }
 
+func TestRequestStatisticsRecordPublishesToBroker(t *testing.T) {
+	stats := NewRequestStatistics()
+	ch, cancel := stats.Broker().Subscribe()
+	defer cancel()
+
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "gpt-5.4",
+		RequestedAt: time.Now(),
+		Detail:      coreusage.Detail{TotalTokens: 10},
+	})
+
+	select {
+	case payload := <-ch:
+		if payload.TotalRequests < 1 {
+			t.Fatalf("TotalRequests = %d, want >= 1", payload.TotalRequests)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for broker publish")
+	}
+}
+
 func TestRequestStatisticsRecordIncludesThinking(t *testing.T) {
 	stats := NewRequestStatistics()
 	budget := int64(8192)
