@@ -3,6 +3,7 @@ package executor
 import (
 	"net/http"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -70,6 +71,22 @@ func TestNewCodexStatusErrTreatsCapacityAsRetryableRateLimit(t *testing.T) {
 	}
 	if err.RetryAfter() != nil {
 		t.Fatalf("expected nil explicit retryAfter for capacity fallback, got %v", *err.RetryAfter())
+	}
+}
+
+func TestNewCodexStatusErrSummarizesCloudflareHTML(t *testing.T) {
+	body := []byte(`upstream server error: <html><script>window._cf_chl_opt={cRay:'a1b754c94ba96518-LHR'}</script><span id="challenge-error-text">Enable JavaScript and cookies to continue</span></html>`)
+
+	err := newCodexStatusErr(http.StatusBadGateway, body)
+
+	if got := err.StatusCode(); got != http.StatusBadGateway {
+		t.Fatalf("status code = %d, want %d", got, http.StatusBadGateway)
+	}
+	if got := err.Error(); got != "upstream blocked by Cloudflare challenge (cf_ray=a1b754c94ba96518-LHR)" {
+		t.Fatalf("error = %q", got)
+	}
+	if strings.Contains(strings.ToLower(err.Error()), "<html") {
+		t.Fatalf("error leaked HTML body: %q", err.Error())
 	}
 }
 

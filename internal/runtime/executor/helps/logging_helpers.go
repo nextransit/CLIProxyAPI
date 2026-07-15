@@ -504,12 +504,15 @@ func formatAuthInfo(info UpstreamRequestLog) string {
 func SummarizeErrorBody(contentType string, body []byte) string {
 	isHTML := strings.Contains(strings.ToLower(contentType), "text/html")
 	if !isHTML {
-		trimmed := bytes.TrimSpace(bytes.ToLower(body))
-		if bytes.HasPrefix(trimmed, []byte("<!doctype html")) || bytes.HasPrefix(trimmed, []byte("<html")) {
+		lower := bytes.ToLower(body)
+		if bytes.Contains(lower, []byte("<!doctype html")) || bytes.Contains(lower, []byte("<html")) {
 			isHTML = true
 		}
 	}
 	if isHTML {
+		if summary := summarizeCloudflareChallenge(body); summary != "" {
+			return summary
+		}
 		if title := extractHTMLTitle(body); title != "" {
 			return title
 		}
@@ -522,6 +525,56 @@ func SummarizeErrorBody(contentType string, body []byte) string {
 	}
 
 	return string(body)
+}
+
+func summarizeCloudflareChallenge(body []byte) string {
+	lower := bytes.ToLower(body)
+	if !bytes.Contains(lower, []byte("cf_chl")) &&
+		!bytes.Contains(lower, []byte("challenge-error-text")) &&
+		!bytes.Contains(lower, []byte("cloudflare")) {
+		return ""
+	}
+	if ray := extractCloudflareRay(body); ray != "" {
+		return fmt.Sprintf("upstream blocked by Cloudflare challenge (cf_ray=%s)", ray)
+	}
+	return "upstream blocked by Cloudflare challenge"
+}
+
+func extractCloudflareRay(body []byte) string {
+	text := string(body)
+	lower := strings.ToLower(text)
+	for _, marker := range []string{"cf_ray=", "cf-ray=", "cray:"} {
+		start := strings.Index(lower, marker)
+		if start == -1 {
+			continue
+		}
+		start += len(marker)
+		for start < len(text) {
+			switch text[start] {
+			case ' ', '\t', '\r', '\n', '\'', '"':
+				start++
+			default:
+				goto scan
+			}
+		}
+	scan:
+		end := start
+		for end < len(text) {
+			ch := text[end]
+			if (ch >= 'a' && ch <= 'z') ||
+				(ch >= 'A' && ch <= 'Z') ||
+				(ch >= '0' && ch <= '9') ||
+				ch == '-' || ch == '_' {
+				end++
+				continue
+			}
+			break
+		}
+		if end > start {
+			return text[start:end]
+		}
+	}
+	return ""
 }
 
 func extractHTMLTitle(body []byte) string {

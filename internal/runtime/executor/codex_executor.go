@@ -825,7 +825,7 @@ func newCodexStatusErr(statusCode int, body []byte) statusErr {
 	if isCodexModelCapacityError(body) {
 		errCode = http.StatusTooManyRequests
 	}
-	err := statusErr{code: errCode, msg: string(body)}
+	err := statusErr{code: errCode, msg: helps.SummarizeErrorBody("", body)}
 	if retryAfter := parseCodexRetryAfter(errCode, body, time.Now()); retryAfter != nil {
 		err.retryAfter = retryAfter
 	}
