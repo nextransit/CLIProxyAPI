@@ -1,76 +1,60 @@
 package usage
 
 import (
-    "sync"
-    "time"
+	"sync"
+	"sync/atomic"
 )
 
-// UsagePayload is a minimal subset of the snapshot used for SSE push.
-// Full snapshot type lives in logger_plugin.go; we keep this decoupled
-// to avoid importing the whole stats package from tests.
-type UsagePayload struct {
-    TotalRequests int64 `json:"total_requests"`
-    TotalTokens   int64 `json:"total_tokens"`
+const subscriberQueueSize = 64
+
+type subscription struct {
+	ch      chan UsageEvent
+	dropped atomic.Uint64
 }
 
 type Broker struct {
-    debounce time.Duration
-
-    mu      sync.Mutex
-    clients map[chan UsagePayload]struct{}
-
-    timerMu sync.Mutex
-    pending *time.Timer
-    last    UsagePayload
+	mu      sync.Mutex
+	clients map[*subscription]struct{}
 }
 
-func NewBroker(debounce time.Duration) *Broker {
-    return &Broker{
-        debounce: debounce,
-        clients:  make(map[chan UsagePayload]struct{}),
-    }
+func NewBroker() *Broker {
+	return &Broker{clients: make(map[*subscription]struct{})}
 }
 
-func (b *Broker) Subscribe() (<-chan UsagePayload, func()) {
-    ch := make(chan UsagePayload, 1)
-    b.mu.Lock()
-    b.clients[ch] = struct{}{}
-    b.mu.Unlock()
-    cancel := func() {
-        b.mu.Lock()
-        if _, ok := b.clients[ch]; ok {
-            delete(b.clients, ch)
-            close(ch)
-        }
-        b.mu.Unlock()
-    }
-    return ch, cancel
+func (b *Broker) Subscribe() (<-chan UsageEvent, func()) {
+	sub := &subscription{ch: make(chan UsageEvent, subscriberQueueSize)}
+	b.mu.Lock()
+	b.clients[sub] = struct{}{}
+	b.mu.Unlock()
+	cancel := func() {
+		b.mu.Lock()
+		if _, ok := b.clients[sub]; ok {
+			delete(b.clients, sub)
+			close(sub.ch)
+		}
+		b.mu.Unlock()
+	}
+	return sub.ch, cancel
 }
 
-func (b *Broker) Publish(p UsagePayload) {
-    b.timerMu.Lock()
-    b.last = p
-    if b.pending != nil {
-        b.pending.Stop()
-    }
-    // Stop() may lose the race with an already-firing timer; flush is idempotent.
-	b.pending = time.AfterFunc(b.debounce, b.flush)
-    b.timerMu.Unlock()
+func (b *Broker) Publish(evt UsageEvent) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for sub := range b.clients {
+		select {
+		case sub.ch <- evt:
+		default:
+			sub.dropped.Add(1)
+		}
+	}
 }
 
-func (b *Broker) flush() {
-    b.timerMu.Lock()
-    payload := b.last
-    b.pending = nil
-    b.timerMu.Unlock()
-
-    b.mu.Lock()
-    defer b.mu.Unlock()
-    for ch := range b.clients {
-        select {
-        case ch <- payload:
-        default:
-            // drop stale value; slow consumer skips to newest
-        }
-    }
+func (b *Broker) Stats() (subs int, drops uint64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	subs = len(b.clients)
+	for sub := range b.clients {
+		drops += sub.dropped.Load()
+	}
+	return
 }

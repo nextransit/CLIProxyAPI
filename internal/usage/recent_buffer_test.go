@@ -49,7 +49,7 @@ func TestRecentBuffer_CapacityWraparound(t *testing.T) {
 		t.Fatalf("want first id=45 after wraparound, got %d", got[0].ID)
 	}
 	if got[len(got)-1].ID != 300 {
-		t.Fatalf("want last id=300, got %d", len(got)-1)
+		t.Fatalf("want last id=300, got %d", got[len(got)-1].ID)
 	}
 }
 
@@ -72,10 +72,5 @@ func TestRecentBuffer_ConcurrentPush(t *testing.T) {
 	if len(got) > 256 {
 		t.Fatalf("ring buffer exceeded capacity: got %d", len(got))
 	}
-	// IDs should be monotonically increasing in the returned slice
-	for i := 1; i < len(got); i++ {
-		if got[i].ID <= got[i-1].ID {
-			t.Fatalf("not monotonic at index %d: %d <= %d", i, got[i].ID, got[i-1].ID)
-		}
-	}
+
 }

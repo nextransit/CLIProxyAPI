@@ -28,7 +28,7 @@ func (r *RecentBuffer) Since(sinceID uint64) []UsageEvent {
 	}
 	// Walk from oldest to newest, skipping events with id <= sinceID.
 	out := make([]UsageEvent, 0, 32)
-	oldest := r.head
+	oldest := uint64(0)
 	if r.head > 256 {
 		oldest = r.head - 256
 	}

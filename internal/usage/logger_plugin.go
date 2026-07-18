@@ -16,6 +16,32 @@ import (
 	coreusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 )
 
+// UsageEvent represents a single usage event pushed in real-time to SSE subscribers.
+// It is published by the Broker immediately (no debounce).
+type UsageEvent struct {
+	ID          uint64       `json:"id"`
+	APIKey      string       `json:"api_key"`
+	Model       string       `json:"model"`
+	Failed      bool         `json:"failed"`
+	Tokens      TokenSummary `json:"tokens"`
+	RequestedAt time.Time    `json:"requested_at"`
+	DurationMs  int64        `json:"duration_ms"`
+	StatusCode  int          `json:"status_code"`
+}
+
+// TokenSummary captures the token usage breakdown for a single usage event.
+type TokenSummary struct {
+	Input  int64 `json:"input"`
+	Output int64 `json:"output"`
+	Total  int64 `json:"total"`
+}
+
+// UsagePayload is a minimal subset of the snapshot used for SSE push.
+type UsagePayload struct {
+	TotalRequests int64 `json:"total_requests"`
+	TotalTokens   int64 `json:"total_tokens"`
+}
+
 var statisticsEnabled atomic.Bool
 
 func init() {
@@ -73,7 +99,8 @@ type RequestStatistics struct {
 	tokensByDay    map[string]int64
 	tokensByHour   map[int]int64
 
-	broker *Broker
+	broker       *Broker
+	eventCounter atomic.Uint64
 }
 
 // apiStats holds aggregated metrics for a single API key.
@@ -162,7 +189,7 @@ func NewRequestStatistics() *RequestStatistics {
 		requestsByHour: make(map[int]int64),
 		tokensByDay:    make(map[string]int64),
 		tokensByHour:   make(map[int]int64),
-		broker:         NewBroker(800 * time.Millisecond),
+		broker:         NewBroker(),
 	}
 }
 
@@ -239,13 +266,23 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	s.tokensByDay[dayKey] += totalTokens
 	s.tokensByHour[hourKey] += totalTokens
 
-	// Snapshot values needed by the broker outside the lock so we don't
-	// extend lock hold time. broker.Publish itself is non-blocking.
-	snapshot := UsagePayload{
-		TotalRequests: s.totalRequests,
-		TotalTokens:   s.totalTokens,
+	// Publish individual UsageEvent to broker for real-time fan-out.
+	// broker.Publish is non-blocking for slow consumers.
+	evt := UsageEvent{
+		ID:          s.eventCounter.Add(1),
+		APIKey:      statsKey,
+		Model:       modelName,
+		Failed:      failed,
+		Tokens: TokenSummary{
+			Input:  detail.InputTokens,
+			Output: detail.OutputTokens,
+			Total:  detail.TotalTokens,
+		},
+		RequestedAt: timestamp,
+		DurationMs:  normaliseLatency(record.Latency),
+		StatusCode:  statusCode,
 	}
-	go s.broker.Publish(snapshot)
+	go s.broker.Publish(evt)
 }
 
 func (s *RequestStatistics) updateAPIStats(stats *apiStats, model string, detail RequestDetail) {
