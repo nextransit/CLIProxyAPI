@@ -94,8 +94,8 @@ func TestRequestStatisticsRecordPublishesToBroker(t *testing.T) {
 
 	select {
 	case payload := <-ch:
-		if payload.TotalRequests < 1 {
-			t.Fatalf("TotalRequests = %d, want >= 1", payload.TotalRequests)
+		if payload.ID < 1 {
+			t.Fatalf("ID = %d, want >= 1", payload.ID)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timeout waiting for broker publish")
@@ -288,5 +288,73 @@ func TestRequestStatisticsMergeSnapshotPreservesAggregateTotalsWhenDetailsAreInc
 	}
 	if model.TotalTokens != 1000 {
 		t.Fatalf("after second merge model total tokens = %d, want 1000", model.TotalTokens)
+	}
+}
+
+func TestRequestStatistics_RecordEmitsUsageEvent(t *testing.T) {
+	s := NewRequestStatistics()
+	subs, cancel := s.Broker().Subscribe()
+	defer cancel()
+
+	rec := coreusage.Record{
+		APIKey: "key-1",
+		Model:  "gpt-4o",
+		Detail: coreusage.Detail{
+			InputTokens:  10,
+			OutputTokens: 20,
+			TotalTokens:  30,
+		},
+		StatusCode: 200,
+	}
+	s.Record(context.Background(), rec)
+
+	select {
+	case evt := <-subs:
+		if evt.ID != 1 {
+			t.Errorf("want id=1, got %d", evt.ID)
+		}
+		if evt.APIKey != "key-1" || evt.Model != "gpt-4o" {
+			t.Errorf("event mismatch: %+v", evt)
+		}
+		if evt.Tokens.Total != 30 {
+			t.Errorf("want tokens.total=30, got %d", evt.Tokens.Total)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no event received within 1s")
+	}
+
+	if got := s.RecentSince(0); len(got) != 1 || got[0].ID != 1 {
+		t.Errorf("ring buffer mismatch: %+v", got)
+	}
+	if got := s.LatestEventID(); got != 1 {
+		t.Errorf("latest id want 1, got %d", got)
+	}
+}
+
+func TestRequestStatistics_RecordMonotonicIDs(t *testing.T) {
+	s := NewRequestStatistics()
+	subs, cancel := s.Broker().Subscribe()
+	defer cancel()
+
+	for i := 0; i < 50; i++ {
+		s.Record(context.Background(), coreusage.Record{
+			APIKey:    "k",
+			Model:     "m",
+			Detail:    coreusage.Detail{TotalTokens: 1},
+			StatusCode: 200,
+		})
+	}
+
+	prev := uint64(0)
+	for i := 0; i < 50; i++ {
+		select {
+		case evt := <-subs:
+			if evt.ID <= prev {
+				t.Errorf("non-monotonic: id=%d after %d", evt.ID, prev)
+			}
+			prev = evt.ID
+		case <-time.After(time.Second):
+			t.Fatalf("only %d/50 events received", i)
+		}
 	}
 }

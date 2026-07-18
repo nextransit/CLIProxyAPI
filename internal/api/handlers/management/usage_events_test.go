@@ -53,9 +53,9 @@ func TestUsageEventsDeliversSnapshot(t *testing.T) {
 
 	// Wait for handler to subscribe.
 	time.Sleep(50 * time.Millisecond)
-	usage.GetRequestStatistics().Broker().Publish(usage.UsagePayload{TotalRequests: 7})
+	usage.GetRequestStatistics().Broker().Publish(usage.UsageEvent{ID: 42, APIKey: "test-key", Model: "gpt-4", Tokens: usage.TokenSummary{Total: 7}})
 
-	// Production broker debounces 800ms; wait long enough for flush,
+	// Wait for the event to be sent, then cancel the request context.
 	// then cancel the request context to unblock the handler.
 	time.Sleep(time.Second)
 	cancelCtx()
@@ -70,7 +70,7 @@ func TestUsageEventsDeliversSnapshot(t *testing.T) {
 	if !strings.Contains(body, "event: snapshot") {
 		t.Fatalf("body missing snapshot event:\n%s", body)
 	}
-	if !strings.Contains(body, `"total_requests":7`) {
+	if !strings.Contains(body, `"api_key":"test-key"`) {
 		t.Fatalf("body missing payload value:\n%s", body)
 	}
 }

@@ -68,7 +68,7 @@ func UsageEventsHandler(broker *usage.Broker) gin.HandlerFunc {
 	}
 }
 
-func writeSSEEvent(w http.ResponseWriter, event string, payload usage.UsagePayload) {
+func writeSSEEvent(w http.ResponseWriter, event string, payload usage.UsageEvent) {
 	body, err := jsonMarshal(payload)
 	if err != nil {
 		return

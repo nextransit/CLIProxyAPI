@@ -38,8 +38,9 @@ type TokenSummary struct {
 
 // UsagePayload is a minimal subset of the snapshot used for SSE push.
 type UsagePayload struct {
-	TotalRequests int64 `json:"total_requests"`
-	TotalTokens   int64 `json:"total_tokens"`
+	TotalRequests int64  `json:"total_requests"`
+	TotalTokens   int64  `json:"total_tokens"`
+	LatestID      uint64 `json:"latest_event_id"`
 }
 
 var statisticsEnabled atomic.Bool
@@ -100,7 +101,8 @@ type RequestStatistics struct {
 	tokensByHour   map[int]int64
 
 	broker       *Broker
-	eventCounter atomic.Uint64
+	nextEventID  atomic.Uint64
+		recent       RecentBuffer
 }
 
 // apiStats holds aggregated metrics for a single API key.
@@ -210,6 +212,7 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	if !statisticsEnabled.Load() {
 		return
 	}
+		id := s.nextEventID.Add(1)
 	timestamp := record.RequestedAt
 	if timestamp.IsZero() {
 		timestamp = time.Now()
@@ -269,7 +272,7 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	// Publish individual UsageEvent to broker for real-time fan-out.
 	// broker.Publish is non-blocking for slow consumers.
 	evt := UsageEvent{
-		ID:          s.eventCounter.Add(1),
+		ID:          id,
 		APIKey:      statsKey,
 		Model:       modelName,
 		Failed:      failed,
@@ -282,8 +285,11 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 		DurationMs:  normaliseLatency(record.Latency),
 		StatusCode:  statusCode,
 	}
-	go s.broker.Publish(evt)
+	s.recent.Push(evt)
+	s.broker.Publish(evt)
 }
+
+
 
 func (s *RequestStatistics) updateAPIStats(stats *apiStats, model string, detail RequestDetail) {
 	stats.TotalRequests++
@@ -722,4 +728,37 @@ func formatHour(hour int) string {
 	}
 	hour = hour % 24
 	return fmt.Sprintf("%02d", hour)
+}
+
+// SnapshotPayload returns a lightweight snapshot of aggregate counters.
+func (s *RequestStatistics) SnapshotPayload() UsagePayload {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return UsagePayload{
+		TotalRequests: s.totalRequests,
+		TotalTokens:   s.totalTokens,
+		LatestID:      s.recent.LastID(),
+	}
+}
+
+// RecentSince returns events with id > sinceID from the ring buffer.
+func (s *RequestStatistics) RecentSince(sinceID uint64) []UsageEvent {
+	return s.recent.Since(sinceID)
+}
+
+// LatestEventID returns the most recent event ID from the ring buffer.
+func (s *RequestStatistics) LatestEventID() uint64 {
+	return s.recent.LastID()
+}
+
+// RecordFromTest ingests a UsageEvent directly for testing purposes.
+func (s *RequestStatistics) RecordFromTest(evt UsageEvent) {
+	if s == nil {
+		return
+	}
+	if evt.ID == 0 {
+		evt.ID = s.nextEventID.Add(1)
+	}
+	s.recent.Push(evt)
+	s.broker.Publish(evt)
 }
