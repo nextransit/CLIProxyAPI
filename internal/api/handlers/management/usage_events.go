@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -19,20 +20,17 @@ var jsonMarshal = func(v any) ([]byte, error) {
 	return json.Marshal(v)
 }
 
-// UsageEventsHandler returns an SSE stream of usage snapshots.
+// UsageEventsHandler returns an SSE stream of usage events and summaries.
 // Auth is enforced by checking the Authorization header (the real management
 // middleware in server.go does the full check; this is a defensive fallback
 // so the handler is safe to register directly in tests or behind a different
 // auth scheme).
-func UsageEventsHandler(broker *usage.Broker) gin.HandlerFunc {
+func UsageEventsHandler(broker *usage.Broker, stats *usage.RequestStatistics) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if c.GetHeader("Authorization") == "" {
 			c.AbortWithStatus(http.StatusUnauthorized)
 			return
 		}
-
-		ch, cancel := broker.Subscribe()
-		defer cancel()
 
 		c.Writer.Header().Set("Content-Type", "text/event-stream")
 		c.Writer.Header().Set("Cache-Control", "no-cache")
@@ -46,6 +44,24 @@ func UsageEventsHandler(broker *usage.Broker) gin.HandlerFunc {
 			return
 		}
 
+		// 1. Replay missed events since Last-Event-ID.
+		var sinceID uint64
+		if h := c.GetHeader("Last-Event-ID"); h != "" {
+			if v, err := strconv.ParseUint(h, 10, 64); err == nil {
+				sinceID = v
+			}
+		}
+		if stats != nil {
+			for _, evt := range stats.RecentSince(sinceID) {
+				writeSSEEvent(c.Writer, "usage_event", evt)
+			}
+			writeSSEEvent(c.Writer, "summary", stats.SnapshotPayload())
+		}
+		flusher.Flush()
+
+		ch, cancel := broker.Subscribe()
+		defer cancel()
+
 		ticker := time.NewTicker(sseHeartbeatInterval)
 		defer ticker.Stop()
 
@@ -54,11 +70,11 @@ func UsageEventsHandler(broker *usage.Broker) gin.HandlerFunc {
 			select {
 			case <-ctx.Done():
 				return
-			case payload, ok := <-ch:
+			case evt, ok := <-ch:
 				if !ok {
 					return
 				}
-				writeSSEEvent(c.Writer, "snapshot", payload)
+				writeSSEEvent(c.Writer, "usage_event", evt)
 				flusher.Flush()
 			case t := <-ticker.C:
 				fmt.Fprintf(c.Writer, "event: heartbeat\ndata: {\"ts\":%q}\n\n", t.UTC().Format(time.RFC3339))
@@ -68,7 +84,7 @@ func UsageEventsHandler(broker *usage.Broker) gin.HandlerFunc {
 	}
 }
 
-func writeSSEEvent(w http.ResponseWriter, event string, payload usage.UsageEvent) {
+func writeSSEEvent(w http.ResponseWriter, event string, payload any) {
 	body, err := jsonMarshal(payload)
 	if err != nil {
 		return

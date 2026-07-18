@@ -518,7 +518,10 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/usage", s.mgmt.GetUsageStatistics)
 		mgmt.GET("/usage/export", s.mgmt.ExportUsageStatistics)
 		mgmt.POST("/usage/import", s.mgmt.ImportUsageStatistics)
-		mgmt.GET("/usage/events", managementHandlers.UsageEventsHandler(usage.GetRequestStatistics().Broker()))
+		mgmt.GET("/usage/events", managementHandlers.UsageEventsHandler(
+				usage.GetRequestStatistics().Broker(),
+				usage.GetRequestStatistics(),
+			))
 		mgmt.POST("/ai-ops/query", s.mgmt.QueryAIOps)
 		mgmt.POST("/text-ops/query", s.mgmt.QueryTextOps)
 		mgmt.GET("/model-prices", s.mgmt.GetModelPrices)
