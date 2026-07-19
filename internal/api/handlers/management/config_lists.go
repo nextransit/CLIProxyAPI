@@ -668,13 +668,14 @@ func (h *Handler) PutOpenAICompat(c *gin.Context) {
 }
 func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 	type openAICompatPatch struct {
-		Name          *string                             `json:"name"`
-		Prefix        *string                             `json:"prefix"`
-		BaseURL       *string                             `json:"base-url"`
-		Disabled      *bool                               `json:"disabled"`
-		APIKeyEntries *[]config.OpenAICompatibilityAPIKey `json:"api-key-entries"`
-		Models        *[]config.OpenAICompatibilityModel  `json:"models"`
-		Headers       *map[string]string                  `json:"headers"`
+		Name                       *string                             `json:"name"`
+		Prefix                     *string                             `json:"prefix"`
+		BaseURL                    *string                             `json:"base-url"`
+		Disabled                   *bool                               `json:"disabled"`
+		APIKeyEntries              *[]config.OpenAICompatibilityAPIKey `json:"api-key-entries"`
+		Models                     *[]config.OpenAICompatibilityModel  `json:"models"`
+		Headers                    *map[string]string                  `json:"headers"`
+		SessionAffinityMaxRequests *int                                `json:"session-affinity-max-requests"`
 	}
 	var body struct {
 		Name  *string            `json:"name"`
@@ -740,6 +741,13 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 	}
 	if body.Value.Headers != nil {
 		entry.Headers = config.NormalizeHeaders(*body.Value.Headers)
+	}
+	if body.Value.SessionAffinityMaxRequests != nil {
+		maxRequests := *body.Value.SessionAffinityMaxRequests
+		if maxRequests < 0 {
+			maxRequests = 0
+		}
+		entry.SessionAffinityMaxRequests = &maxRequests
 	}
 	normalizeOpenAICompatibilityEntry(&entry)
 	h.cfg.OpenAICompatibility[targetIndex] = entry

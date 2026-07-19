@@ -121,15 +121,19 @@ cleanup_build_cache() {
 
 usage() {
   cat <<'EOF'
-Usage: ./docker-build.sh [--source|--prebuilt] [--with-usage]
+Usage: ./docker-build.sh [--source|--prebuilt] [--with-usage] [--repair]
 
 Options:
   --source, 2   Build from Source and Run (For Developers). Default.
   --prebuilt, 1 Run using Pre-built Image (Recommended).
   --with-usage  Preserve usage statistics across rebuilds.
+  --repair      Auto-fix missing excluded-models / wrong indents in config.yaml
+                before starting the container. Skips repair on dry runs.
   -h, --help    Show this help.
 EOF
 }
+
+WITH_REPAIR=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -141,6 +145,9 @@ while [[ $# -gt 0 ]]; do
       ;;
     "--with-usage")
       WITH_USAGE=true
+      ;;
+    "--repair")
+      WITH_REPAIR=true
       ;;
     "-h"|"--help")
       usage
@@ -166,10 +173,21 @@ case "$RUN_MODE" in
     if [[ "${WITH_USAGE}" == "true" ]]; then
       export_stats
     fi
+    if [[ "${WITH_REPAIR}" == "true" ]] && [[ -f "scripts/auto-repair-keys.sh" ]]; then
+      echo "Running auto-repair-keys.sh against config.yaml..."
+      if bash scripts/auto-repair-keys.sh config.yaml --apply; then
+        echo "  (no repairs needed)"
+      fi
+    fi
     docker compose up -d --remove-orphans --no-build
     if [[ "${WITH_USAGE}" == "true" ]]; then
       wait_for_service
       import_stats
+    fi
+    if [[ "${WITH_REPAIR}" == "true" ]] && [[ -f "scripts/detect-key-health.sh" ]]; then
+      echo "Probing codex-api-key health (after service ready)..."
+      sleep 3
+      bash scripts/detect-key-health.sh config.yaml || true
     fi
     echo "Services are starting from remote image."
     echo "Run 'docker compose logs -f' to see the logs."
@@ -184,6 +202,18 @@ case "$RUN_MODE" in
       BACKUP_FILE="${BACKUP_DIR}/config.yaml.$(date +%Y%m%d_%H%M%S)"
       cp config.yaml "${BACKUP_FILE}"
       echo "Config backed up to: ${BACKUP_FILE}"
+    fi
+
+    # Auto-repair config.yaml structural defects if requested. Runs only
+    # against config.yaml (bind-mounted into the container at the same path)
+    # so the same repaired file is what the container reads on startup.
+    if [[ "${WITH_REPAIR}" == "true" ]] && [[ -f "scripts/auto-repair-keys.sh" ]]; then
+      echo "Running auto-repair-keys.sh against config.yaml..."
+      if bash scripts/auto-repair-keys.sh config.yaml --apply; then
+        echo "  (no repairs needed)"
+      fi
+    elif [[ "${WITH_REPAIR}" == "true" ]]; then
+      echo "WARN: --repair requested but scripts/auto-repair-keys.sh not found"
     fi
 
     # Get Version Information
@@ -218,6 +248,12 @@ case "$RUN_MODE" in
     if [[ "${WITH_USAGE}" == "true" ]]; then
       wait_for_service
       import_stats
+    fi
+
+    if [[ "${WITH_REPAIR}" == "true" ]] && [[ -f "scripts/detect-key-health.sh" ]]; then
+      echo "Probing codex-api-key health (after service ready)..."
+      sleep 3
+      bash scripts/detect-key-health.sh config.yaml || true
     fi
 
     echo "Build complete. Services are starting."

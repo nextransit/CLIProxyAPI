@@ -174,6 +174,82 @@ func TestSessionAffinity_ResetsCountAfterRotation(t *testing.T) {
 	}
 }
 
+func TestSessionAffinity_ProviderOverrideRotatesAcrossAllKeysAfterFiveRequests(t *testing.T) {
+	auths := []*Auth{
+		{ID: "auth-A", Provider: "sensenova", Attributes: map[string]string{"weight": "1"}},
+		{ID: "auth-B", Provider: "sensenova", Attributes: map[string]string{"weight": "1"}},
+		{ID: "auth-C", Provider: "sensenova", Attributes: map[string]string{"weight": "1"}},
+		{ID: "auth-D", Provider: "sensenova", Attributes: map[string]string{"weight": "1"}},
+		{ID: "auth-E", Provider: "sensenova", Attributes: map[string]string{"weight": "1"}},
+	}
+	opts := cliproxyexecutor.Options{
+		OriginalRequest: []byte(`{"metadata":{"user_id":"user_xxx_account__session_sensenova_rotation"}}`),
+	}
+	sel := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback:              &RoundRobinSelector{},
+		TTL:                   time.Hour,
+		MaxRequests:           20,
+		MaxRequestsByProvider: map[string]int{"sensenova": 5},
+	})
+
+	got := make([]string, 0, 25)
+	for i := 0; i < 25; i++ {
+		picked, err := sel.Pick(context.Background(), "sensenova", "deepseek-v4-flash", opts, auths)
+		if err != nil {
+			t.Fatalf("pick %d: %v", i+1, err)
+		}
+		got = append(got, picked.ID)
+	}
+
+	seen := make(map[string]struct{}, len(auths))
+	for block := 0; block < len(auths); block++ {
+		start := block * 5
+		boundID := got[start]
+		seen[boundID] = struct{}{}
+		for i := start + 1; i < start+5; i++ {
+			if got[i] != boundID {
+				t.Fatalf("requests %d-%d should stay on %s, got %v", start+1, start+5, boundID, got[start:start+5])
+			}
+		}
+		if block > 0 && boundID == got[start-5] {
+			t.Fatalf("request %d did not rotate away from %s, got %v", start+1, boundID, got)
+		}
+	}
+	if len(seen) != len(auths) {
+		t.Fatalf("five rotation windows used %d keys, want %d: %v", len(seen), len(auths), got)
+	}
+}
+
+func TestSessionAffinity_ProviderOverrideDoesNotChangeOtherProviders(t *testing.T) {
+	auths := []*Auth{
+		{ID: "auth-A", Provider: "other", Attributes: map[string]string{"weight": "1"}},
+		{ID: "auth-B", Provider: "other", Attributes: map[string]string{"weight": "1"}},
+	}
+	opts := cliproxyexecutor.Options{
+		OriginalRequest: []byte(`{"metadata":{"user_id":"user_xxx_account__session_other_provider"}}`),
+	}
+	sel := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback:              &RoundRobinSelector{},
+		TTL:                   time.Hour,
+		MaxRequests:           20,
+		MaxRequestsByProvider: map[string]int{"sensenova": 5},
+	})
+
+	first, err := sel.Pick(context.Background(), "other", "model-x", opts, auths)
+	if err != nil {
+		t.Fatalf("pick 1: %v", err)
+	}
+	for i := 2; i <= 6; i++ {
+		picked, err := sel.Pick(context.Background(), "other", "model-x", opts, auths)
+		if err != nil {
+			t.Fatalf("pick %d: %v", i, err)
+		}
+		if picked.ID != first.ID {
+			t.Fatalf("other provider should retain global MaxRequests=20; pick %d returned %s, want %s", i, picked.ID, first.ID)
+		}
+	}
+}
+
 // fixedPickSelector is a deterministic fallback used by tests: it returns
 // the auth with the preferred ID if present, otherwise the first available.
 type fixedPickSelector struct {

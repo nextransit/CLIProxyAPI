@@ -479,9 +479,10 @@ var sessionPattern = regexp.MustCompile(`_session_([a-f0-9-]+)$`)
 // It extracts session ID from multiple sources and maintains session-to-auth
 // mappings with automatic failover when the bound auth becomes unavailable.
 type SessionAffinitySelector struct {
-	fallback    Selector
-	cache       *SessionCache
-	maxRequests int
+	fallback              Selector
+	cache                 *SessionCache
+	maxRequests           int
+	maxRequestsByProvider map[string]int
 }
 
 // SessionAffinityConfig configures the session affinity selector.
@@ -491,6 +492,9 @@ type SessionAffinityConfig struct {
 	// MaxRequests forces a session to re-rotate through the fallback selector
 	// after this many requests. 0 keeps the legacy sticky-until-TTL behavior.
 	MaxRequests int
+	// MaxRequestsByProvider overrides MaxRequests for selected providers.
+	// Provider names are matched case-insensitively.
+	MaxRequestsByProvider map[string]int
 }
 
 // NewSessionAffinitySelector creates a new session-aware selector.
@@ -509,10 +513,22 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 	if cfg.TTL <= 0 {
 		cfg.TTL = time.Hour
 	}
+	maxRequestsByProvider := make(map[string]int, len(cfg.MaxRequestsByProvider))
+	for provider, maxRequests := range cfg.MaxRequestsByProvider {
+		provider = strings.ToLower(strings.TrimSpace(provider))
+		if provider == "" {
+			continue
+		}
+		if maxRequests < 0 {
+			maxRequests = 0
+		}
+		maxRequestsByProvider[provider] = maxRequests
+	}
 	return &SessionAffinitySelector{
-		fallback:    cfg.Fallback,
-		cache:       NewSessionCache(cfg.TTL),
-		maxRequests: cfg.MaxRequests,
+		fallback:              cfg.Fallback,
+		cache:                 NewSessionCache(cfg.TTL),
+		maxRequests:           cfg.MaxRequests,
+		maxRequestsByProvider: maxRequestsByProvider,
 	}
 }
 
@@ -548,16 +564,14 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	cacheKey := provider + "::" + primaryID + "::" + model
 
 	if cachedAuthID, count, ok := s.cache.GetAndRefresh(cacheKey); ok {
-		// When MaxRequests > 0 and the per-session counter has reached the
-		// threshold, ignore the cached auth and fall through to the fallback
-		// (weighted) selector so the session re-rotates.
-		if s.maxRequests <= 0 || count < s.maxRequests {
-			for _, auth := range available {
-				if auth.ID == cachedAuthID {
-					entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s count=%d", truncateSessionID(primaryID), auth.ID, provider, model, count)
-					return auth, nil
-				}
+		var cachedAuth *Auth
+		for _, auth := range available {
+			if auth.ID == cachedAuthID {
+				cachedAuth = auth
+				break
 			}
+		}
+		if cachedAuth == nil {
 			// Cached auth not available, reselect via the weighted-share path
 			// so the new binding respects the same weight/session distribution
 			// as a brand-new session, instead of just falling back to the
@@ -572,8 +586,21 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			entry.Infof("session-affinity: cache hit but auth unavailable, reselected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 			return auth, nil
 		}
-		// count >= maxRequests: deliberately fall through to fallback selector.
-		entry.Infof("session-affinity: rotation threshold reached | session=%s count=%d >= %d, reselecting via weighted selector", truncateSessionID(primaryID), count, s.maxRequests)
+
+		maxRequests, providerOverride := s.maxRequestsForProvider(cachedAuth.Provider)
+		if maxRequests <= 0 || count < maxRequests {
+			entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s count=%d", truncateSessionID(primaryID), cachedAuth.ID, provider, model, count)
+			return cachedAuth, nil
+		}
+		if providerOverride {
+			if rotated := nextAuthForProvider(cachedAuth, available); rotated != nil {
+				s.cache.Set(cacheKey, rotated.ID)
+				entry.Infof("session-affinity: provider rotation threshold reached | session=%s count=%d >= %d auth=%s next_auth=%s provider=%s model=%s", truncateSessionID(primaryID), count, maxRequests, cachedAuth.ID, rotated.ID, cachedAuth.Provider, model)
+				return rotated, nil
+			}
+		}
+		// count >= maxRequests: deliberately fall through to the weighted selector.
+		entry.Infof("session-affinity: rotation threshold reached | session=%s count=%d >= %d, reselecting via weighted selector", truncateSessionID(primaryID), count, maxRequests)
 	}
 
 	if fallbackID != "" && fallbackID != primaryID {
@@ -596,6 +623,41 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	s.cache.Set(cacheKey, auth.ID)
 	entry.Infof("session-affinity: cache miss, new binding | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 	return auth, nil
+}
+
+func (s *SessionAffinitySelector) maxRequestsForProvider(provider string) (int, bool) {
+	if s != nil {
+		provider = strings.ToLower(strings.TrimSpace(provider))
+		if maxRequests, ok := s.maxRequestsByProvider[provider]; ok {
+			return maxRequests, true
+		}
+		return s.maxRequests, false
+	}
+	return 0, false
+}
+
+func nextAuthForProvider(current *Auth, available []*Auth) *Auth {
+	if current == nil || len(available) < 2 {
+		return nil
+	}
+	provider := strings.TrimSpace(current.Provider)
+	currentIndex := -1
+	for i, auth := range available {
+		if auth != nil && auth.ID == current.ID {
+			currentIndex = i
+			break
+		}
+	}
+	if currentIndex < 0 {
+		return nil
+	}
+	for offset := 1; offset < len(available); offset++ {
+		candidate := available[(currentIndex+offset)%len(available)]
+		if candidate != nil && strings.EqualFold(strings.TrimSpace(candidate.Provider), provider) {
+			return candidate
+		}
+	}
+	return nil
 }
 
 // pickByWeightedSessionShare picks an auth using the configured weight and the

@@ -23,6 +23,7 @@ const (
 	textOpsIntentTokenConsumption = "TOKEN_CONSUMPTION"
 	textOpsIntentCacheMetrics     = "CACHE_METRICS"
 	textOpsIntentFinancialStatus  = "FINANCIAL_STATUS"
+	textOpsIntentGeneralAssistant = "GENERAL_ASSISTANT"
 
 	textOpsRoleAdmin    = "admin"
 	textOpsRoleReseller = "reseller"
@@ -54,6 +55,7 @@ type textOpsQueryRequest struct {
 	UserQuery string `json:"user_query"`
 
 	CurrentTime string `json:"current_time"`
+	FastMode    bool   `json:"fast_mode"`
 
 	OperatorContext textOpsOperatorContext `json:"operator_context"`
 
@@ -217,7 +219,26 @@ func (h *Handler) QueryTextOps(c *gin.Context) {
 		return
 	}
 
-	intentSpec, route, warnings := h.parseTextOpsIntent(c.Request.Context(), req, currentTime)
+	queryKind := classifyTextOpsQueryKind(userQuery)
+	if queryKind != textOpsQueryKindAnalytics {
+		response = h.executeTextOpsGeneralQuery(c.Request.Context(), req, currentTime, response, queryKind)
+		if response.Guardrail.Blocked {
+			c.JSON(http.StatusForbidden, response)
+			return
+		}
+		c.JSON(http.StatusOK, response)
+		return
+	}
+
+	var intentSpec textOpsIntentSpec
+	var route string
+	var warnings []string
+	if req.FastMode {
+		intentSpec = completeTextOpsIntentSpecFromQuery(h.parseTextOpsIntentHeuristic(userQuery, currentTime), userQuery)
+		route = "heuristic_fast"
+	} else {
+		intentSpec, route, warnings = h.parseTextOpsIntent(c.Request.Context(), req, currentTime)
+	}
 	response.Warnings = append(response.Warnings, warnings...)
 
 	filters, window, err := normalizeTextOpsFilters(intentSpec.Filters, currentTime)
@@ -260,7 +281,7 @@ func (h *Handler) QueryTextOps(c *gin.Context) {
 	}
 
 	presenterCfg := resolveTextOpsLLMConfig(req.Presenter, h, textOpsDefaultPresenterModel, textOpsDefaultPresenterToken)
-	if presenterCfg.Enabled {
+	if presenterCfg.Enabled && !req.FastMode {
 		if llmPresentation, errPresent := h.enhanceTextOpsPresentation(c.Request.Context(), presenterCfg, response); errPresent == nil {
 			response.Presentation = llmPresentation
 		} else {
@@ -924,7 +945,7 @@ func isoTextOpsWeekStart(year, week int) (time.Time, bool) {
 func normalizeTextOpsIntent(intent string) string {
 	value := strings.ToUpper(strings.TrimSpace(intent))
 	switch value {
-	case textOpsIntentTokenConsumption, textOpsIntentCacheMetrics, textOpsIntentFinancialStatus:
+	case textOpsIntentTokenConsumption, textOpsIntentCacheMetrics, textOpsIntentFinancialStatus, textOpsIntentGeneralAssistant:
 		return value
 	default:
 		return textOpsIntentTokenConsumption
@@ -1899,7 +1920,8 @@ func stripTextOpsThinkBlocks(raw string) string {
 }
 
 func resolveManagementLLMReasoningEffort(model string) string {
-	if strings.Contains(strings.ToLower(model), "minimax-m2.7") {
+	lowerModel := strings.ToLower(model)
+	if strings.Contains(lowerModel, "minimax-m3") {
 		return "none"
 	}
 	return ""

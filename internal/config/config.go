@@ -586,6 +586,11 @@ type OpenAICompatibility struct {
 	// Headers optionally adds extra HTTP headers for requests sent to this provider.
 	Headers map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
 
+	// SessionAffinityMaxRequests overrides the global request-count rotation limit
+	// for this provider. Nil inherits the global value; 0 disables count-based
+	// rotation for this provider.
+	SessionAffinityMaxRequests *int `yaml:"session-affinity-max-requests,omitempty" json:"session-affinity-max-requests,omitempty"`
+
 	// DisableCooling disables auth/model cooldown scheduling for this provider when true.
 	DisableCooling bool `yaml:"disable-cooling,omitempty" json:"disable-cooling,omitempty"`
 }
@@ -740,6 +745,12 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	}
 	if cfg.SessionAffinityMaxRequests < 0 {
 		cfg.SessionAffinityMaxRequests = 0
+	}
+	for i := range cfg.OpenAICompatibility {
+		maxRequests := cfg.OpenAICompatibility[i].SessionAffinityMaxRequests
+		if maxRequests != nil && *maxRequests < 0 {
+			*maxRequests = 0
+		}
 	}
 
 	// Sanitize client API key policy entries and derive the legacy flat key list.

@@ -74,6 +74,44 @@ func sessionAffinityMaxRequests(cfg *config.Config) int {
 	return cfg.SessionAffinityMaxRequests
 }
 
+func sessionAffinityMaxRequestsByProvider(cfg *config.Config) map[string]int {
+	if cfg == nil {
+		return nil
+	}
+	overrides := make(map[string]int)
+	for i := range cfg.OpenAICompatibility {
+		entry := &cfg.OpenAICompatibility[i]
+		if entry.SessionAffinityMaxRequests == nil {
+			continue
+		}
+		provider := strings.ToLower(strings.TrimSpace(entry.Name))
+		if provider == "" {
+			provider = "openai-compatibility"
+		}
+		maxRequests := *entry.SessionAffinityMaxRequests
+		if maxRequests < 0 {
+			maxRequests = 0
+		}
+		overrides[provider] = maxRequests
+	}
+	if len(overrides) == 0 {
+		return nil
+	}
+	return overrides
+}
+
+func equalSessionAffinityMaxRequestsByProvider(a, b map[string]int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for provider, maxRequests := range a {
+		if other, ok := b[provider]; !ok || other != maxRequests {
+			return false
+		}
+	}
+	return true
+}
+
 // NewBuilder creates a Builder with default dependencies left unset.
 // Use the fluent interface methods to configure the service before calling Build().
 //
@@ -241,9 +279,10 @@ func (b *Builder) Build() (*Service, error) {
 		// Wrap with session affinity if enabled (failover is always on)
 		if sessionAffinity {
 			selector = coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
-				Fallback:    selector,
-				TTL:         sessionAffinityTTL,
-				MaxRequests: sessionAffinityMaxRequests(b.cfg),
+				Fallback:              selector,
+				TTL:                   sessionAffinityTTL,
+				MaxRequests:           sessionAffinityMaxRequests(b.cfg),
+				MaxRequestsByProvider: sessionAffinityMaxRequestsByProvider(b.cfg),
 			})
 		}
 

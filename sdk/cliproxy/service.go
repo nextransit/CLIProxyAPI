@@ -620,12 +620,14 @@ func (s *Service) Run(ctx context.Context) error {
 		var previousSessionAffinity bool
 		var previousSessionAffinityTTL string
 		previousSessionAffinityMaxRequests := 20
+		var previousSessionAffinityMaxRequestsByProvider map[string]int
 		s.cfgMu.RLock()
 		if s.cfg != nil {
 			previousStrategy = strings.ToLower(strings.TrimSpace(s.cfg.Routing.Strategy))
 			previousSessionAffinity = s.cfg.Routing.SessionAffinity
 			previousSessionAffinityTTL = s.cfg.Routing.SessionAffinityTTL
 			previousSessionAffinityMaxRequests = sessionAffinityMaxRequests(s.cfg)
+			previousSessionAffinityMaxRequestsByProvider = sessionAffinityMaxRequestsByProvider(s.cfg)
 		}
 		s.cfgMu.RUnlock()
 
@@ -654,11 +656,13 @@ func (s *Service) Run(ctx context.Context) error {
 		nextSessionAffinity := newCfg.Routing.SessionAffinity
 		nextSessionAffinityTTL := newCfg.Routing.SessionAffinityTTL
 		nextSessionAffinityMaxRequests := sessionAffinityMaxRequests(newCfg)
+		nextSessionAffinityMaxRequestsByProvider := sessionAffinityMaxRequestsByProvider(newCfg)
 
 		selectorChanged := previousStrategy != nextStrategy ||
 			previousSessionAffinity != nextSessionAffinity ||
 			previousSessionAffinityTTL != nextSessionAffinityTTL ||
-			previousSessionAffinityMaxRequests != nextSessionAffinityMaxRequests
+			previousSessionAffinityMaxRequests != nextSessionAffinityMaxRequests ||
+			!equalSessionAffinityMaxRequestsByProvider(previousSessionAffinityMaxRequestsByProvider, nextSessionAffinityMaxRequestsByProvider)
 
 		if s.coreManager != nil && selectorChanged {
 			var selector coreauth.Selector
@@ -677,9 +681,10 @@ func (s *Service) Run(ctx context.Context) error {
 					}
 				}
 				selector = coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
-					Fallback:    selector,
-					TTL:         ttl,
-					MaxRequests: nextSessionAffinityMaxRequests,
+					Fallback:              selector,
+					TTL:                   ttl,
+					MaxRequests:           nextSessionAffinityMaxRequests,
+					MaxRequestsByProvider: nextSessionAffinityMaxRequestsByProvider,
 				})
 			}
 

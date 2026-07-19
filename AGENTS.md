@@ -18,7 +18,7 @@ go build -o test-output ./cmd/server && rm test-output # Verify compile (REQUIRE
 
 ## Runtime and Deployment
 - This project is normally built and started through Docker. Use `./docker-build.sh` (default `--source` mode) as the final build/start and acceptance path; it runs `docker compose build` followed by `docker compose up -d`.
-- After every successful source Docker build, automatically remove the Docker build cache with `docker builder prune -af`. Preserve this cleanup behavior when changing `docker-build.sh`; do not leave stale build cache behind after a build.
+- After every successful source Docker build, automatically remove the Docker build cache with `docker builder prune -af`. Then verify with `docker system df` that `Build Cache` is `0B`; repeat the prune and report any residual cache if it is not. Preserve this cleanup behavior when changing `docker-build.sh`; do not leave stale build cache behind after a build.
 - Do not present a local Vite server or `go run` process as the completed runtime unless the user explicitly requests local development mode. After changes, rebuild with `./docker-build.sh` and validate the running container through the configured port, HTTP behavior, and Docker logs.
 - The management frontend source is the separate nested Git repository at `Cli-Proxy-API-Management-Center/`. Make frontend source changes and run frontend tests/builds from that directory.
 - After frontend changes, run the frontend deploy flow to regenerate `assets/management.html`, then run `./docker-build.sh` so the Docker image and running container include the updated management page. Never edit `assets/management.html` as source.

@@ -240,9 +240,11 @@ func TestStripTextOpsThinkBlocksHandlesEndMarkerPrefix(t *testing.T) {
 	}
 }
 
-func TestResolveManagementLLMReasoningEffortDisablesMiniMaxM27(t *testing.T) {
-	got := resolveManagementLLMReasoningEffort("MiniMax-M2.7-highspeed")
-	if got != "none" {
-		t.Fatalf("resolveManagementLLMReasoningEffort = %q, want none", got)
+func TestResolveManagementLLMReasoningEffortDisablesMiniMaxThinking(t *testing.T) {
+	if got := resolveManagementLLMReasoningEffort("MiniMax-M3"); got != "none" {
+		t.Fatalf("resolveManagementLLMReasoningEffort(MiniMax-M3) = %q, want none", got)
+	}
+	if got := resolveManagementLLMReasoningEffort("MiniMax-M2.7-highspeed"); got != "" {
+		t.Fatalf("resolveManagementLLMReasoningEffort(MiniMax-M2.7-highspeed) = %q, want empty", got)
 	}
 }
