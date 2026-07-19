@@ -93,6 +93,19 @@ func TestNormalizeDeepSeekThinkingRequestSensenovaMapsUnsupportedEffort(t *testi
 	}
 }
 
+func TestNormalizeDeepSeekThinkingRequestXHighMapsToMax(t *testing.T) {
+	input := []byte(`{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"xhigh"}`)
+
+	out := normalizeDeepSeekThinkingRequest(input, "deepseek-v4-flash", "direct")
+
+	if got := gjson.GetBytes(out, "reasoning_effort").String(); got != "max" {
+		t.Fatalf("reasoning_effort = %q, want max; body=%s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "extra_body.thinking.type").String(); got != "enabled" {
+		t.Fatalf("thinking.type = %q, want enabled; body=%s", got, string(out))
+	}
+}
+
 func TestNormalizeDeepSeekThinkingRequestOpenRouterMapsAutoToHigh(t *testing.T) {
 	input := []byte(`{"model":"deepseek/deepseek-v4-flash","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"auto"}`)
 
