@@ -286,9 +286,10 @@ Replace the local palette constants and their usage. Concretely:
 ```ts
 import {
   getRankColor,
-  TAIL_LINE_COLOR,
   buildAreaGradient,
 } from '@/utils/usage/chartPalette';
+// TAIL_LINE_COLOR is intentionally NOT imported: getRankColor already
+// returns it for rank ≥ 8, so direct reference is unnecessary.
 ```
 
 3. In the function that builds each dataset (the block at L322-351), replace the rank→color logic. The exact code depends on the existing local variables; below is the target behavior:
