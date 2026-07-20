@@ -75,6 +75,8 @@ const (
 
 var quotaCooldownDisabled atomic.Bool
 
+var miniMaxM3QuotaLocation = time.FixedZone("Asia/Shanghai", 8*60*60)
+
 // SetQuotaCooldownDisabled toggles quota cooldown scheduling globally.
 func SetQuotaCooldownDisabled(disable bool) {
 	quotaCooldownDisabled.Store(disable)
@@ -2197,7 +2199,10 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							var next time.Time
 							backoffLevel := state.Quota.BackoffLevel
 							if !disableCooling {
-								if result.RetryAfter != nil {
+								if fixedRetryAt, ok := miniMaxM3TokenPlanRetryAt(result.Model, result.Error, now); ok {
+									next = fixedRetryAt
+									backoffLevel = 0
+								} else if result.RetryAfter != nil {
 									next = now.Add(*result.RetryAfter)
 								} else {
 									cooldown, nextLevel := nextQuotaCooldown(backoffLevel, disableCooling)
@@ -2686,6 +2691,36 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 			auth.StatusMessage = "request failed"
 		}
 	}
+}
+
+func miniMaxM3TokenPlanRetryAt(model string, resultErr *Error, now time.Time) (time.Time, bool) {
+	switch strings.ToLower(strings.TrimSpace(model)) {
+	case "minimax-m3", "minimax-claude/minimax-m3":
+	default:
+		return time.Time{}, false
+	}
+	if resultErr == nil || resultErr.HTTPStatus != http.StatusTooManyRequests {
+		return time.Time{}, false
+	}
+	message := strings.ToLower(strings.TrimSpace(resultErr.Code + " " + resultErr.Message))
+	if !strings.Contains(message, "token plan") {
+		return time.Time{}, false
+	}
+	if !strings.Contains(message, "2056") &&
+		!strings.Contains(message, "usage limit") &&
+		!strings.Contains(message, "用量上限") {
+		return time.Time{}, false
+	}
+
+	localNow := now.In(miniMaxM3QuotaLocation)
+	year, month, day := localNow.Date()
+	for _, hour := range [...]int{5, 10, 15, 20} {
+		candidate := time.Date(year, month, day, hour, 0, 0, 0, miniMaxM3QuotaLocation)
+		if candidate.After(localNow) {
+			return candidate, true
+		}
+	}
+	return time.Date(year, month, day+1, 0, 0, 0, 0, miniMaxM3QuotaLocation), true
 }
 
 // nextQuotaCooldown returns the next cooldown duration and updated backoff level for repeated quota errors.
