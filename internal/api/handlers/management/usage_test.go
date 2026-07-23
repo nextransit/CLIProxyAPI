@@ -1,6 +1,7 @@
 package management
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 )
 
 type stubUsageStore struct {
@@ -253,5 +255,63 @@ func TestFilterUsageSnapshotByTimeRangeTodayUsesLocalDay(t *testing.T) {
 	}
 	if got := filtered.TokensByDay["2026-06-04"]; got != 300 {
 		t.Fatalf("tokens_by_day[2026-06-04] = %d, want 300", got)
+	}
+}
+
+func TestGetUsageDashboard_RendersAggregatePayload(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	handler := NewHandler(&config.Config{}, "", nil)
+	stats := usage.NewRequestStatistics()
+	handler.SetUsageStatistics(stats)
+
+	now := time.Now().UTC()
+	for i, when := range []time.Duration{-10 * time.Minute, -25 * time.Minute, -3 * time.Hour} {
+		stats.Record(context.Background(), coreusage.Record{
+			Provider:    "test",
+			Model:       "gpt-5.4",
+			APIKey:      "test-key",
+			AuthIndex:   "test-auth",
+			Source:      "test-source",
+			RequestID:   "rid-" + string(rune('a'+i)),
+			StatusCode:  200,
+			RequestedAt: now.Add(when),
+			Latency:     200 * time.Millisecond,
+			Failed:      false,
+			Detail: coreusage.Detail{
+				InputTokens:  10,
+				OutputTokens: 5,
+				TotalTokens:  15,
+			},
+		})
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/usage/dashboard?window=24h&bucket_count=12&model_top=5&latest_count=7", nil)
+	handler.GetUsageDashboard(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want 200, body=%s", recorder.Code, recorder.Body.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("Unmarshal(response) error = %v", err)
+	}
+	dash, ok := response["dashboard"].(map[string]any)
+	if !ok {
+		t.Fatalf("response.dashboard type = %T, want map", response["dashboard"])
+	}
+	if totalRequests := int(dash["window_requests"].(float64)); totalRequests != 3 {
+		t.Fatalf("dashboard.window_requests = %d, want 3", totalRequests)
+	}
+	if flowBuckets, ok := dash["flow_buckets"].([]any); !ok || len(flowBuckets) != 12 {
+		t.Fatalf("dashboard.flow_buckets length/type = %d %T, want 12 []any", len(flowBuckets), dash["flow_buckets"])
+	}
+	if modelTop, ok := dash["model_top"].([]any); !ok || len(modelTop) != 1 {
+		t.Fatalf("dashboard.model_top length/type = %d %T, want 1 []any", len(modelTop), dash["model_top"])
+	}
+	if size := recorder.Body.Len(); size > 4_000 {
+		t.Fatalf("dashboard payload size = %d bytes, want < 2000", size)
 	}
 }

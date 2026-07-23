@@ -3,6 +3,7 @@ package management
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -248,4 +249,83 @@ func (h *Handler) ImportUsageStatistics(c *gin.Context) {
 		}
 	}
 	c.JSON(http.StatusOK, response)
+}
+
+// dashboardViewResponse wraps DashboardSnapshot so the JSON shape stays
+// stable across schema additions and so future fields can ride alongside
+// without touching the frontend consumer.
+type dashboardViewResponse struct {
+	Dashboard   usage.DashboardSnapshot `json:"dashboard"`
+	GeneratedAt time.Time               `json:"generated_at"`
+}
+
+// GetUsageDashboard returns the lightweight dashboard view that the
+// management home page renders. Compared to the full /usage endpoint it
+// returns only the aggregates, a fixed number of flow buckets, a top-N
+// model slice, and the most recent request events, which lets the dashboard
+// hydrate with a small payload even on busy servers.
+func (h *Handler) GetUsageDashboard(c *gin.Context) {
+	cfg := usage.DefaultDashboardConfig()
+	switch strings.ToLower(strings.TrimSpace(c.Query("window"))) {
+	case "1h":
+		cfg.Window = time.Hour
+	case "7h":
+		cfg.Window = 7 * time.Hour
+	case "24h":
+		cfg.Window = 24 * time.Hour
+	case "7d":
+		cfg.Window = 7 * 24 * time.Hour
+	case "all", "":
+		cfg.Window = 0
+	default:
+		cfg.Window = 24 * time.Hour
+	}
+	if v := parsePositiveInt(c.Query("bucket_count"), 0); v > 0 && v <= 96 {
+		cfg.BucketCount = v
+	}
+	if v := parsePositiveInt(c.Query("model_top"), 0); v > 0 && v <= 50 {
+		cfg.ModelTopN = v
+	}
+	if v := parsePositiveInt(c.Query("latest_count"), 0); v > 0 && v <= 50 {
+		cfg.LatestCount = v
+	}
+
+	var snap usage.DashboardSnapshot
+	if h != nil && h.usageStats != nil {
+		if _, err := usage.RestoreStatisticsIfEmpty(h.usageStats); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		snap = h.usageStats.BuildDashboardSnapshot(cfg)
+	}
+	if h != nil {
+		displayMap := h.authIndexDisplayMap()
+		if len(displayMap) > 0 {
+			for i := range snap.LatestRequests {
+				req := &snap.LatestRequests[i]
+				if req.APIKey == "" {
+					continue
+				}
+				if displayName, ok := displayMap[req.APIKey]; ok {
+					req.APIKey = displayName
+				}
+			}
+		}
+	}
+
+	c.JSON(http.StatusOK, dashboardViewResponse{
+		Dashboard:   snap,
+		GeneratedAt: time.Now().UTC(),
+	})
+}
+
+func parsePositiveInt(raw string, fallback int) int {
+	if raw == "" {
+		return fallback
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil || v <= 0 {
+		return fallback
+	}
+	return v
 }
