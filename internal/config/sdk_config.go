@@ -150,4 +150,11 @@ type StreamingConfig struct {
 	// to allow auth rotation / transient recovery.
 	// <= 0 disables bootstrap retries. Default is 0.
 	BootstrapRetries int `yaml:"bootstrap-retries,omitempty" json:"bootstrap-retries,omitempty"`
+
+	// UpstreamIdleTimeoutSeconds controls how long the proxy waits for data from the upstream
+	// streaming response before closing the connection with a timeout error.
+	// This prevents "Response stalled mid-stream" errors from the client when the upstream
+	// stops sending data mid-stream without closing the connection.
+	// <= 0 disables the timeout (no idle timeout). Default is 0.
+	UpstreamIdleTimeoutSeconds int `yaml:"upstream-idle-timeout-seconds,omitempty" json:"upstream-idle-timeout-seconds,omitempty"`
 }

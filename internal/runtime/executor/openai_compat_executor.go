@@ -547,15 +547,21 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			return nil, err
 		}
 	}
+	// Wrap the response body with an idle timeout to prevent infinite blocking
+	// when the upstream stops sending data mid-stream without closing the connection.
+	// This causes "Response stalled mid-stream" errors from the client.
+	upstreamIdleTimeout := time.Duration(e.cfg.Streaming.UpstreamIdleTimeoutSeconds) * time.Second
+	readCloser := helps.NewIdleTimeoutReadCloser(httpResp.Body, upstreamIdleTimeout)
+
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		defer close(out)
 		defer func() {
-			if errClose := httpResp.Body.Close(); errClose != nil {
+			if errClose := readCloser.Close(); errClose != nil {
 				log.Errorf("openai compat executor: close response body error: %v", errClose)
 			}
 		}()
-		scanner := bufio.NewScanner(httpResp.Body)
+		scanner := bufio.NewScanner(readCloser)
 		scanner.Buffer(nil, 52_428_800) // 50MB
 		var param any
 		insideThinkBlock := false
