@@ -1,6 +1,7 @@
 package usage
 
 import (
+	"context"
 	"time"
 )
 
@@ -93,7 +94,13 @@ func DefaultDashboardConfig() DashboardConfig {
 
 // BuildDashboardSnapshot computes the dashboard-shaped snapshot synchronously.
 // Pass a zero DashboardConfig to use defaults. Safe for concurrent use.
-func (s *RequestStatistics) BuildDashboardSnapshot(cfg DashboardConfig) DashboardSnapshot {
+//
+// The internal RLock only protects a lightweight slice copy; bucket assignment,
+// model aggregation, and top-N selection run outside the lock to keep ingest
+// writes from being starved while a dashboard request is in flight. Honors
+// ctx cancellation: a cancelled context returns a zero-valued DashboardSnapshot
+// (LatestRequests may be nil) within a few milliseconds.
+func (s *RequestStatistics) BuildDashboardSnapshot(ctx context.Context, cfg DashboardConfig) DashboardSnapshot {
 	if cfg.BucketCount <= 0 || cfg.BucketSize <= 0 || cfg.LatestCount <= 0 || cfg.ModelTopN <= 0 {
 		cfg = DefaultDashboardConfig()
 	}
@@ -134,6 +141,21 @@ func (s *RequestStatistics) BuildDashboardSnapshot(cfg DashboardConfig) Dashboar
 		}
 	}
 
+	// Record the window we're about to filter by so the locked phase can use
+	// it without re-reading cfg. Done before locking so the value is visible
+	// to the locked snapshot helper that follows.
+	if cfg.Window > 0 {
+		s.lastDashboardWindow = cfg.Window
+	}
+
+	// Locked phase: copy aggregates + per-detail slices under RLock. Avoid
+	// running any heavy compute while holding the lock — ingest (Record)
+	// blocks on the matching write Lock until we return.
+	snapshotCopy := s.snapshotForDashboard(ctx, cfg.Window > 0, now)
+	if ctx.Err() != nil {
+		return result // zero-valued LatestRequests; handler decides 503
+	}
+
 	type modelAccum struct {
 		requests       int64
 		tokens         int64
@@ -148,109 +170,83 @@ func (s *RequestStatistics) BuildDashboardSnapshot(cfg DashboardConfig) Dashboar
 	// latencySum is per-bucket running sum of latency samples.
 	latencySumByBucket := make([]float64, cfg.BucketCount)
 
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	result.TotalRequests = s.totalRequests
-	result.TotalTokens = s.totalTokens
-	result.SuccessCount = s.successCount
-	result.FailureCount = s.failureCount
+	result.TotalRequests = snapshotCopy.TotalRequests
+	result.TotalTokens = snapshotCopy.TotalTokens
+	result.SuccessCount = snapshotCopy.SuccessCount
+	result.FailureCount = snapshotCopy.FailureCount
 	if result.TotalRequests > 0 {
 		result.FailureRate = float64(result.FailureCount) / float64(result.TotalRequests)
 	}
 
-	for apiName, stats := range s.apis {
-		if stats == nil {
-			continue
+	// Aggregation phase runs OUTSIDE the RLock so ingest isn't starved.
+	for _, d := range snapshotCopy.Details {
+		if ctx.Err() != nil {
+			return result
 		}
-		for modelName, modelStatsValue := range stats.Models {
-			if modelStatsValue == nil {
-				continue
+		totalRequests++
+		totalTokens += d.Tokens.TotalTokens
+		if d.Failed {
+			totalFailures++
+		} else {
+			totalSuccess++
+		}
+
+		// Bucket assignment; walk in reverse so the most recent
+		// buckets match first.
+		for bi := cfg.BucketCount - 1; bi >= 0; bi-- {
+			w := windows[bi]
+			if !d.Timestamp.Before(w.start) && d.Timestamp.Before(w.end) {
+				bucket := &result.FlowBuckets[bi]
+				bucket.Requests++
+				bucket.Tokens += d.Tokens.TotalTokens
+				if d.Failed {
+					bucket.Failures++
+				}
+				if d.LatencyMs > 0 {
+					latencySumByBucket[bi] += float64(d.LatencyMs)
+				}
+				break
 			}
-			details := modelStatsValue.Details
-			if len(details) == 0 {
-				continue
+		}
+
+		acc, ok := modelByName[d.Model]
+		if !ok {
+			acc = &modelAccum{}
+			modelByName[d.Model] = acc
+		}
+		acc.requests++
+		acc.tokens += d.Tokens.TotalTokens
+		if d.Failed {
+			acc.failures++
+		}
+		if d.LatencyMs > 0 {
+			acc.latencyTotal += d.LatencyMs
+			acc.latencySamples++
+		}
+
+		evt := DashboardLatestRequest{
+			EventID:      detailEventIDFor(d),
+			Timestamp:    d.Timestamp,
+			Model:        d.Model,
+			APIKey:       d.APIKey,
+			Failed:       d.Failed,
+			StatusCode:   d.StatusCode,
+			DurationMs:   d.LatencyMs,
+			InputTokens:  d.Tokens.InputTokens,
+			OutputTokens: d.Tokens.OutputTokens,
+			TotalTokens:  d.Tokens.TotalTokens,
+		}
+		if len(latest) < cfg.LatestCount {
+			latest = append(latest, evt)
+		} else {
+			oldest := 0
+			for j := 1; j < len(latest); j++ {
+				if latest[j].Timestamp.Before(latest[oldest].Timestamp) {
+					oldest = j
+				}
 			}
-			for i := range details {
-				detail := details[i]
-				if detail.Timestamp.IsZero() {
-					continue
-				}
-				if cfg.Window > 0 {
-					if detail.Timestamp.Before(result.WindowStart) || detail.Timestamp.After(result.WindowEnd) {
-						continue
-					}
-				}
-				if detail.Timestamp.After(now) {
-					continue
-				}
-
-				totalRequests++
-				totalTokens += detail.Tokens.TotalTokens
-				if detail.Failed {
-					totalFailures++
-				} else {
-					totalSuccess++
-				}
-
-				// Bucket assignment; walk in reverse so the most recent
-				// buckets match first.
-				for bi := cfg.BucketCount - 1; bi >= 0; bi-- {
-					w := windows[bi]
-					if !detail.Timestamp.Before(w.start) && detail.Timestamp.Before(w.end) {
-						bucket := &result.FlowBuckets[bi]
-						bucket.Requests++
-						bucket.Tokens += detail.Tokens.TotalTokens
-						if detail.Failed {
-							bucket.Failures++
-						}
-						if detail.LatencyMs > 0 {
-							latencySumByBucket[bi] += float64(detail.LatencyMs)
-						}
-						break
-					}
-				}
-
-				acc, ok := modelByName[modelName]
-				if !ok {
-					acc = &modelAccum{}
-					modelByName[modelName] = acc
-				}
-				acc.requests++
-				acc.tokens += detail.Tokens.TotalTokens
-				if detail.Failed {
-					acc.failures++
-				}
-				if detail.LatencyMs > 0 {
-					acc.latencyTotal += detail.LatencyMs
-					acc.latencySamples++
-				}
-
-				evt := DashboardLatestRequest{
-					EventID:      detailEventID(detail, apiName, modelName),
-					Timestamp:    detail.Timestamp,
-					Model:        modelName,
-					APIKey:       apiName,
-					Failed:       detail.Failed,
-					StatusCode:   detail.StatusCode,
-					DurationMs:   detail.LatencyMs,
-					InputTokens:  detail.Tokens.InputTokens,
-					OutputTokens: detail.Tokens.OutputTokens,
-					TotalTokens:  detail.Tokens.TotalTokens,
-				}
-				if len(latest) < cfg.LatestCount {
-					latest = append(latest, evt)
-				} else {
-					oldest := 0
-					for j := 1; j < len(latest); j++ {
-						if latest[j].Timestamp.Before(latest[oldest].Timestamp) {
-							oldest = j
-						}
-					}
-					if detail.Timestamp.After(latest[oldest].Timestamp) {
-						latest[oldest] = evt
-					}
-				}
+			if d.Timestamp.After(latest[oldest].Timestamp) {
+				latest[oldest] = evt
 			}
 		}
 	}
@@ -330,7 +326,7 @@ func (s *RequestStatistics) BuildDashboardSnapshot(cfg DashboardConfig) Dashboar
 	result.WindowTokens = totalTokens
 	result.WindowFailures = totalFailures
 	result.WindowSuccesses = totalSuccess
-	result.LatestEventID = s.nextEventID.Load()
+	result.LatestEventID = snapshotCopy.NextEventID
 
 	return result
 }
@@ -356,4 +352,98 @@ func fnvHash(s string) uint64 {
 		h *= 1099511628211
 	}
 	return h & 0x1FFFFFFFFFFFFF
+}
+
+// dashboardDetailCopy is the trimmed per-detail record used by the dashboard
+// snapshot. Holding only the bytes we need lets the unlocked aggregation phase
+// finish without contending with ingest.
+type dashboardDetailCopy struct {
+	APIKey     string
+	Model      string
+	Timestamp  time.Time
+	LatencyMs  int64
+	Failed     bool
+	StatusCode int
+	Tokens     TokenStats
+	AuthIndex  string
+}
+
+// snapshotForDashboard returns a thread-safe point-in-time view of the data
+// the unlocked dashboard aggregation phase needs. RLock only; never call
+// ingest while holding the returned slice.
+func (s *RequestStatistics) snapshotForDashboard(ctx context.Context, useWindow bool, now time.Time) struct {
+	TotalRequests, TotalTokens, SuccessCount, FailureCount int64
+	NextEventID                                            uint64
+	Details                                                []dashboardDetailCopy
+	WindowStart, WindowEnd                                 time.Time
+} {
+	var empty struct {
+		TotalRequests, TotalTokens, SuccessCount, FailureCount int64
+		NextEventID                                            uint64
+		Details                                                []dashboardDetailCopy
+		WindowStart, WindowEnd                                 time.Time
+	}
+	if s == nil {
+		return empty
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var windowStart, windowEnd time.Time
+	if useWindow {
+		windowEnd = now
+		windowStart = now.Add(-s.lastDashboardWindow)
+	}
+
+	out := empty
+	out.TotalRequests = s.totalRequests
+	out.TotalTokens = s.totalTokens
+	out.SuccessCount = s.successCount
+	out.FailureCount = s.failureCount
+	out.NextEventID = s.nextEventID.Load()
+	if useWindow {
+		out.WindowStart = windowStart
+		out.WindowEnd = windowEnd
+	}
+
+	for apiName, stats := range s.apis {
+		if stats == nil {
+			continue
+		}
+		for modelName, modelStatsValue := range stats.Models {
+			if modelStatsValue == nil || len(modelStatsValue.Details) == 0 {
+				continue
+			}
+			for i := range modelStatsValue.Details {
+				d := modelStatsValue.Details[i]
+				if d.Timestamp.IsZero() {
+					continue
+				}
+				if useWindow && (d.Timestamp.Before(windowStart) || d.Timestamp.After(windowEnd)) {
+					continue
+				}
+				if d.Timestamp.After(now) {
+					continue
+				}
+				out.Details = append(out.Details, dashboardDetailCopy{
+					APIKey:     apiName,
+					Model:      modelName,
+					Timestamp:  d.Timestamp,
+					LatencyMs:  d.LatencyMs,
+					Failed:     d.Failed,
+					StatusCode: d.StatusCode,
+					Tokens:     d.Tokens,
+					AuthIndex:  d.AuthIndex,
+				})
+			}
+		}
+	}
+	return out
+}
+
+// detailEventIDFor is the lockless variant that runs against the trimmed
+// snapshot. Mirrors detailEventID's FNV-1a fallback behavior when RequestID is
+// missing — timestamps are unique per detail, so the hash stays deterministic.
+func detailEventIDFor(d dashboardDetailCopy) uint64 {
+	return fnvHash(d.APIKey + "/" + d.Model + "/" + d.Timestamp.UTC().Format(time.RFC3339Nano))
 }

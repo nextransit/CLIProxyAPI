@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"math"
+	"sort"
+	"sync"
 	"testing"
 	"time"
 
@@ -55,7 +57,7 @@ func TestBuildDashboardSnapshot_ShapesBucketTopAndLatest(t *testing.T) {
 	}
 
 	cfg := DefaultDashboardConfig()
-	snap := stats.BuildDashboardSnapshot(cfg)
+	snap := stats.BuildDashboardSnapshot(context.Background(), cfg)
 
 	if snap.BucketCount != cfg.BucketCount {
 		t.Fatalf("BucketCount = %d, want %d", snap.BucketCount, cfg.BucketCount)
@@ -113,7 +115,7 @@ func TestBuildDashboardSnapshot_WindowFilter(t *testing.T) {
 
 	cfg := DefaultDashboardConfig()
 	cfg.Window = time.Hour
-	snap := stats.BuildDashboardSnapshot(cfg)
+	snap := stats.BuildDashboardSnapshot(context.Background(), cfg)
 
 	if snap.WindowRequests != 1 {
 		t.Fatalf("WindowRequests = %d, want 1 (old-model excluded)", snap.WindowRequests)
@@ -143,7 +145,7 @@ func TestBuildDashboardSnapshot_AllWindow(t *testing.T) {
 
 	cfg := DefaultDashboardConfig()
 	cfg.Window = 0 // all
-	snap := stats.BuildDashboardSnapshot(cfg)
+	snap := stats.BuildDashboardSnapshot(context.Background(), cfg)
 	if snap.WindowRequests != 2 {
 		t.Fatalf("WindowRequests = %d, want 2 (all window)", snap.WindowRequests)
 	}
@@ -159,4 +161,87 @@ func containsBytes(haystack []byte, needle string) bool {
 		}
 	}
 	return false
+}
+
+// TestBuildDashboardSnapshot_ConcurrentIngestKeepsP95Fast verifies that the
+// dashboard snapshot builder stays well under its 15s frontend budget while
+// ingest goroutines continuously mutate the shared store.
+func TestBuildDashboardSnapshot_ConcurrentIngestKeepsP95Fast(t *testing.T) {
+	stats := NewRequestStatistics()
+	ctx := context.Background()
+	now := time.Now()
+
+	stop := make(chan struct{})
+	var ingestWG sync.WaitGroup
+	ingestWG.Add(8)
+	for g := 0; g < 8; g++ {
+		go func(worker int) {
+			defer ingestWG.Done()
+			i := 0
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				stats.Record(ctx, makeRecord(
+					"model-worker",
+					"auth-w",
+					"rid-"+string(rune('a'+worker))+"-"+string(rune('a'+i%26)),
+					now.Add(time.Duration(i)*time.Millisecond),
+					100*time.Millisecond,
+					10,
+					false,
+				))
+				i++
+			}
+		}(g)
+	}
+
+	const samples = 50
+	latencies := make([]time.Duration, samples)
+	for i := 0; i < samples; i++ {
+		start := time.Now()
+		_ = stats.BuildDashboardSnapshot(ctx, DefaultDashboardConfig())
+		latencies[i] = time.Since(start)
+	}
+	close(stop)
+	ingestWG.Wait()
+
+	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+	p95Idx := (samples*95 + 99) / 100
+	if p95Idx >= samples {
+		p95Idx = samples - 1
+	}
+	p95 := latencies[p95Idx]
+	if p95 > 200*time.Millisecond {
+		t.Fatalf("p95 BuildDashboardSnapshot under concurrent ingest = %v, want < 200ms", p95)
+	}
+}
+
+// TestBuildDashboardSnapshot_CtxCancelReturnsImmediately ensures the builder
+// honors context cancellation so a stalled dashboard request can't keep the
+// frontend loading state pinned.
+func TestBuildDashboardSnapshot_CtxCancelReturnsImmediately(t *testing.T) {
+	stats := NewRequestStatistics()
+	seedCtx := context.Background()
+	now := time.Now()
+	for i := 0; i < 1000; i++ {
+		stats.Record(seedCtx, makeRecord("m", "auth", "r-"+string(rune('a'+i%26)),
+			now.Add(time.Duration(i)*time.Millisecond), 50*time.Millisecond, 1, false))
+	}
+
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel up front
+
+	start := time.Now()
+	snap := stats.BuildDashboardSnapshot(cancelCtx, DefaultDashboardConfig())
+	elapsed := time.Since(start)
+
+	if elapsed > 50*time.Millisecond {
+		t.Fatalf("BuildDashboardSnapshot took %v after ctx cancel, want < 50ms", elapsed)
+	}
+	if snap.WindowRequests != 0 {
+		t.Fatalf("WindowRequests = %d after immediate cancel, want 0", snap.WindowRequests)
+	}
 }

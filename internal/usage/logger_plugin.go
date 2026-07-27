@@ -103,6 +103,12 @@ type RequestStatistics struct {
 	broker       *Broker
 	nextEventID  atomic.Uint64
 		recent       RecentBuffer
+
+	// lastDashboardWindow is the most recent window duration used by a
+	// dashboard snapshot request. Read under RLock by the locked phase to
+	// filter detail rows; written without the lock by the unlocked caller
+	// (single-writer, monotonic — last-write-wins is fine).
+	lastDashboardWindow time.Duration
 }
 
 // apiStats holds aggregated metrics for a single API key.
