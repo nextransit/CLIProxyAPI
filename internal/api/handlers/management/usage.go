@@ -1,6 +1,7 @@
 package management
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strconv"
@@ -264,7 +265,13 @@ type dashboardViewResponse struct {
 // returns only the aggregates, a fixed number of flow buckets, a top-N
 // model slice, and the most recent request events, which lets the dashboard
 // hydrate with a small payload even on busy servers.
+//
+// The handler enforces a 10s context timeout and surfaces a 503 with
+// dashboard_build_cancelled if the snapshot builder aborts via ctx.
 func (h *Handler) GetUsageDashboard(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+
 	cfg := usage.DefaultDashboardConfig()
 	switch strings.ToLower(strings.TrimSpace(c.Query("window"))) {
 	case "1h":
@@ -296,8 +303,18 @@ func (h *Handler) GetUsageDashboard(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
-		snap = h.usageStats.BuildDashboardSnapshot(cfg)
+		snap = h.usageStats.BuildDashboardSnapshot(ctx, cfg)
 	}
+
+	if ctx.Err() != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error":  "dashboard_build_cancelled",
+			"reason": ctx.Err().Error(),
+			"window": cfg.Window.String(),
+		})
+		return
+	}
+
 	if h != nil {
 		displayMap := h.authIndexDisplayMap()
 		if len(displayMap) > 0 {

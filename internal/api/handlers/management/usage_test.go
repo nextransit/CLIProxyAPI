@@ -315,3 +315,30 @@ func TestGetUsageDashboard_RendersAggregatePayload(t *testing.T) {
 		t.Fatalf("dashboard payload size = %d bytes, want < 2000", size)
 	}
 }
+
+// TestGetUsageDashboard_ReturnsServiceUnavailableWhenCancelled ensures the
+// dashboard handler exposes a clean 503 when its ctx is cancelled before the
+// snapshot completes.
+func TestGetUsageDashboard_ReturnsServiceUnavailableWhenCancelled(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	handler := NewHandler(&config.Config{}, "", nil)
+	stats := usage.NewRequestStatistics()
+	handler.SetUsageStatistics(stats)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/usage/dashboard?window=24h", nil)
+	cancelledCtx, cancel := context.WithCancel(ctx.Request.Context())
+	cancel()
+	ctx.Request = ctx.Request.WithContext(cancelledCtx)
+
+	handler.GetUsageDashboard(ctx)
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d (body=%s)", recorder.Code, http.StatusServiceUnavailable, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "dashboard_build_cancelled") {
+		t.Fatalf("body = %q, want it to contain dashboard_build_cancelled", recorder.Body.String())
+	}
+}
