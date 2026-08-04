@@ -429,6 +429,10 @@ func shouldReplaceWebsocketTranscript(rawJSON []byte, nextInput gjson.Result) bo
 	if requestType != wsRequestTypeCreate && requestType != wsRequestTypeAppend {
 		return false
 	}
+	previousResponseID := gjson.GetBytes(rawJSON, "previous_response_id")
+	if requestType == wsRequestTypeCreate && !previousResponseID.Exists() && inputHasCodexLocalCompactionSummary(nextInput) {
+		return true
+	}
 	return shouldReplaceResponsesTranscript(rawJSON, nextInput)
 }
 

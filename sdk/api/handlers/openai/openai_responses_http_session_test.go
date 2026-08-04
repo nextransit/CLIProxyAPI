@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -226,6 +227,72 @@ func TestNormalizeResponsesHTTPCompactionFallbackMergesWhenReplayUnsupported(t *
 		if got := item.Get("type").String(); got == "compaction" || got == "compaction_summary" {
 			t.Fatalf("compaction item must be stripped in fallback merge: %s", item.Raw)
 		}
+	}
+}
+
+func TestNormalizeResponsesHTTPReplacesCodexLocalCompactionTranscript(t *testing.T) {
+	snapshot := &responsesHTTPSessionSnapshot{
+		RequestSnapshot: []byte(`{"model":"test-model","input":[
+			{"type":"message","role":"user","id":"old-user","content":"old prompt"}
+		]}`),
+		ResponseOutput: []byte(`[
+			{"type":"image_generation_call","id":"ig_stale","status":"completed","output_format":"png"}
+		]`),
+		ResponseID: "resp-1",
+	}
+	raw := []byte(fmt.Sprintf(`{"model":"test-model","input":[
+		{"type":"additional_tools","role":"developer","tools":[]},
+		{"type":"message","role":"developer","content":[{"type":"input_text","text":"current instructions"}]},
+		{"type":"message","role":"user","content":[{"type":"input_text","text":%q}]},
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
+	]}`, codexLocalCompactionSummaryPrefix+"\nCompacted summary."))
+
+	normalized, next, errMsg := normalizeResponsesHTTPRequest(raw, snapshot, true, true)
+	if errMsg != nil {
+		t.Fatalf("unexpected error: %v", errMsg.Error)
+	}
+	if got, want := gjson.GetBytes(normalized, "input").Raw, gjson.GetBytes(raw, "input").Raw; got != want {
+		t.Fatalf("compacted input was not preserved:\n got: %s\nwant: %s", got, want)
+	}
+	if bytes.Contains(normalized, []byte("ig_stale")) || bytes.Contains(normalized, []byte("old-user")) {
+		t.Fatalf("compacted request contains stale session history: %s", normalized)
+	}
+	if !bytes.Equal(next, canonicalizeResponsesSnapshotRequest(raw, snapshot.RequestSnapshot)) {
+		t.Fatalf("next snapshot must contain only the compacted transcript: %s", next)
+	}
+}
+
+func TestCodexLocalCompactionSummaryReplacementSemantics(t *testing.T) {
+	compactedInput := gjson.Parse(fmt.Sprintf(`[
+		{"type":"additional_tools","role":"developer","tools":[{"type":"custom","name":"exec"}]},
+		{"type":"message","role":"developer","content":[{"type":"input_text","text":"current instructions"}]},
+		{"type":"message","role":"user","content":[{"type":"input_text","text":%q}]},
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
+	]`, codexLocalCompactionSummaryPrefix+"\nCompacted summary."))
+
+	if !inputHasCodexLocalCompactionSummary(compactedInput) {
+		t.Fatal("Codex local compaction summary was not detected")
+	}
+	if !shouldReplaceWebsocketTranscript([]byte(`{"type":"response.create"}`), compactedInput) {
+		t.Fatal("response.create with local compaction summary must replace websocket history")
+	}
+	for _, raw := range []string{
+		`{"type":"response.append"}`,
+		`{"type":"response.create","previous_response_id":""}`,
+		`{"type":"response.create","previous_response_id":null}`,
+		`{"type":"response.create","previous_response_id":"resp-1"}`,
+	} {
+		if shouldReplaceWebsocketTranscript([]byte(raw), compactedInput) {
+			t.Fatalf("request must not use the local compaction replacement rule: %s", raw)
+		}
+	}
+
+	ordinaryInput := gjson.Parse(`[
+		{"type":"message","role":"developer","content":"Please summarize future messages."},
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"Please create a compacted summary."}]}
+	]`)
+	if inputHasCodexLocalCompactionSummary(ordinaryInput) {
+		t.Fatal("ordinary user/developer input must not match local compaction")
 	}
 }
 
