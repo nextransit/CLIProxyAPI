@@ -100,9 +100,21 @@ type RequestStatistics struct {
 	tokensByDay    map[string]int64
 	tokensByHour   map[int]int64
 
-	broker       *Broker
-	nextEventID  atomic.Uint64
-		recent       RecentBuffer
+	broker      *Broker
+	nextEventID atomic.Uint64
+	recent      RecentBuffer
+
+	// Pre-aggregated rotating bucket rings. These are the read path's
+	// primary data source: Snapshot() and BuildDashboardSnapshot() can
+	// answer most queries by reading these rings (O(bucketCount)) without
+	// scanning the per-model Details[] slices (O(totalRequests)).
+	//
+	// The 5-minute ring covers the last hour (12 buckets); the 1-hour
+	// ring covers the last day (24 buckets). Together they give the
+	// dashboard and /usage/summary endpoints a fast read path while
+	// keeping memory bounded regardless of ingest volume.
+	bucketRing5m *BucketRing
+	bucketRing1h *BucketRing
 
 	// lastDashboardWindow is the most recent window duration used by a
 	// dashboard snapshot request. Read under RLock by the locked phase to
@@ -191,6 +203,7 @@ func GetRequestStatistics() *RequestStatistics { return defaultRequestStatistics
 
 // NewRequestStatistics constructs an empty statistics store.
 func NewRequestStatistics() *RequestStatistics {
+	now := time.Now()
 	return &RequestStatistics{
 		apis:           make(map[string]*apiStats),
 		requestsByDay:  make(map[string]int64),
@@ -198,6 +211,8 @@ func NewRequestStatistics() *RequestStatistics {
 		tokensByDay:    make(map[string]int64),
 		tokensByHour:   make(map[int]int64),
 		broker:         NewBroker(),
+		bucketRing5m:   NewBucketRing(12, 5*time.Minute, now),
+		bucketRing1h:   NewBucketRing(24, time.Hour, now),
 	}
 }
 
@@ -210,6 +225,64 @@ func (s *RequestStatistics) Broker() *Broker {
 	return s.broker
 }
 
+// TotalRequests returns the lifetime request counter.
+func (s *RequestStatistics) TotalRequests() int64 {
+	if s == nil {
+		return 0
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.totalRequests
+}
+
+// TotalTokens returns the lifetime token counter.
+func (s *RequestStatistics) TotalTokens() int64 {
+	if s == nil {
+		return 0
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.totalTokens
+}
+
+// SuccessCount returns the lifetime success counter.
+func (s *RequestStatistics) SuccessCount() int64 {
+	if s == nil {
+		return 0
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.successCount
+}
+
+// FailureCount returns the lifetime failure counter.
+func (s *RequestStatistics) FailureCount() int64 {
+	if s == nil {
+		return 0
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.failureCount
+}
+
+// BucketRing5m returns the 5-minute pre-aggregated rotating ring, or nil if
+// not initialized.
+func (s *RequestStatistics) BucketRing5m() *BucketRing {
+	if s == nil {
+		return nil
+	}
+	return s.bucketRing5m
+}
+
+// BucketRing1h returns the 1-hour pre-aggregated rotating ring, or nil if
+// not initialized.
+func (s *RequestStatistics) BucketRing1h() *BucketRing {
+	if s == nil {
+		return nil
+	}
+	return s.bucketRing1h
+}
+
 // Record ingests a new usage record and updates the aggregates.
 func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record) {
 	if s == nil {
@@ -218,7 +291,7 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	if !statisticsEnabled.Load() {
 		return
 	}
-		id := s.nextEventID.Add(1)
+	id := s.nextEventID.Add(1)
 	timestamp := record.RequestedAt
 	if timestamp.IsZero() {
 		timestamp = time.Now()
@@ -275,13 +348,20 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	s.tokensByDay[dayKey] += totalTokens
 	s.tokensByHour[hourKey] += totalTokens
 
+	// Update pre-aggregated rotating rings. These let the read path
+	// answer dashboard / summary queries in O(bucketCount) instead of
+	// O(totalRequests). We always update both rings; each ring rotates
+	// its own head based on the request timestamp.
+	s.bucketRing5m.Record(timestamp, modelName, record.AuthIndex, totalTokens, failed, normaliseLatency(record.Latency))
+	s.bucketRing1h.Record(timestamp, modelName, record.AuthIndex, totalTokens, failed, normaliseLatency(record.Latency))
+
 	// Publish individual UsageEvent to broker for real-time fan-out.
 	// broker.Publish is non-blocking for slow consumers.
 	evt := UsageEvent{
-		ID:          id,
-		APIKey:      statsKey,
-		Model:       modelName,
-		Failed:      failed,
+		ID:     id,
+		APIKey: statsKey,
+		Model:  modelName,
+		Failed: failed,
 		Tokens: TokenSummary{
 			Input:  detail.InputTokens,
 			Output: detail.OutputTokens,
@@ -294,8 +374,6 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	s.recent.Push(evt)
 	s.broker.Publish(evt)
 }
-
-
 
 func (s *RequestStatistics) updateAPIStats(stats *apiStats, model string, detail RequestDetail) {
 	stats.TotalRequests++

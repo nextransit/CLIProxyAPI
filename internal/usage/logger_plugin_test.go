@@ -338,9 +338,9 @@ func TestRequestStatistics_RecordMonotonicIDs(t *testing.T) {
 
 	for i := 0; i < 50; i++ {
 		s.Record(context.Background(), coreusage.Record{
-			APIKey:    "k",
-			Model:     "m",
-			Detail:    coreusage.Detail{TotalTokens: 1},
+			APIKey:     "k",
+			Model:      "m",
+			Detail:     coreusage.Detail{TotalTokens: 1},
 			StatusCode: 200,
 		})
 	}

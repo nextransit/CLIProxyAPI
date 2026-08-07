@@ -41,6 +41,26 @@ func (r *RecentBuffer) Since(sinceID uint64) []UsageEvent {
 	return out
 }
 
+// Events returns every event currently held in the buffer in chronological
+// (oldest first) order. Useful for serving a fixed-size "latest" view from
+// the pre-aggregated snapshot path without re-scanning per-request details.
+func (r *RecentBuffer) Events() []UsageEvent {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.head == 0 {
+		return nil
+	}
+	out := make([]UsageEvent, 0, 32)
+	oldest := uint64(0)
+	if r.head > 256 {
+		oldest = r.head - 256
+	}
+	for i := oldest; i < r.head; i++ {
+		out = append(out, r.buf[i%256])
+	}
+	return out
+}
+
 // LastID returns the most recently pushed ID, or 0 if empty.
 func (r *RecentBuffer) LastID() uint64 {
 	r.mu.Lock()
