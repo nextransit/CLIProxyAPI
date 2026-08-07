@@ -2,7 +2,10 @@ package management
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -298,10 +301,30 @@ func (h *Handler) GetUsageDashboard(c *gin.Context) {
 	}
 
 	var snap usage.DashboardSnapshot
+	var cheapTotals usage.StatisticsSnapshot
 	if h != nil && h.usageStats != nil {
 		if _, err := usage.RestoreStatisticsIfEmpty(h.usageStats); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
+		}
+		cheapTotals = h.usageStats.Snapshot()
+		if match := strings.TrimSpace(c.GetHeader("If-None-Match")); match != "" {
+			candidate := `"` + dashboardComputeETag(dashboardViewResponse{
+				Dashboard: usage.DashboardSnapshot{
+					TotalRequests: cheapTotals.TotalRequests,
+					TotalTokens:   cheapTotals.TotalTokens,
+					SuccessCount:  cheapTotals.SuccessCount,
+					FailureCount:  cheapTotals.FailureCount,
+					BucketCount:   cfg.BucketCount,
+					BucketSizeMs:  cfg.BucketSize.Milliseconds(),
+				},
+				GeneratedAt: time.Now().UTC(),
+			}) + `"`
+			if match == candidate {
+				c.Header("ETag", candidate)
+				c.Status(http.StatusNotModified)
+				return
+			}
 		}
 		snap = h.usageStats.BuildDashboardSnapshot(ctx, cfg)
 	}
@@ -330,10 +353,39 @@ func (h *Handler) GetUsageDashboard(c *gin.Context) {
 		}
 	}
 
-	c.JSON(http.StatusOK, dashboardViewResponse{
+	resp := dashboardViewResponse{
 		Dashboard:   snap,
 		GeneratedAt: time.Now().UTC(),
-	})
+	}
+	etag := dashboardComputeETag(resp)
+	if etag != "" {
+		c.Header("ETag", etag)
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
+// dashboardComputeETag derives a stable ETag from the cheap counters that
+// change on every request plus a coarse-grained timestamp. It deliberately
+// ignores LatestEventID (which is a 53-bit hash that changes per ingest and
+// would invalidate the tag on every single request) and the heavy fields
+// (flow_buckets, model_top). The 30s-aligned timestamp means the tag stays
+// stable for 30s while the cheap counters hold, giving the client a usable
+// 304 window without forcing it to refetch the full payload on every poll.
+// The value is short (sha1 hex, 40 chars) and safe to use as a header value.
+func dashboardComputeETag(resp dashboardViewResponse) string {
+	h := sha1.New()
+	const alignSeconds = int64(30)
+	aligned := resp.GeneratedAt.UTC().Unix() / alignSeconds * alignSeconds
+	fmt.Fprintf(h, "v1|req=%d|tok=%d|succ=%d|fail=%d|bucket=%d|size=%d|aligned=%d",
+		resp.Dashboard.TotalRequests,
+		resp.Dashboard.TotalTokens,
+		resp.Dashboard.SuccessCount,
+		resp.Dashboard.FailureCount,
+		resp.Dashboard.BucketCount,
+		resp.Dashboard.BucketSizeMs,
+		aligned,
+	)
+	return `"` + hex.EncodeToString(h.Sum(nil)) + `"`
 }
 
 func parsePositiveInt(raw string, fallback int) int {
