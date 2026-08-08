@@ -157,8 +157,16 @@ func (r *BucketRing) advanceLocked(now time.Time) {
 	}
 	for i := 0; i < delta; i++ {
 		r.head = (r.head + 1) % len(r.buckets)
-		r.buckets[r.head].startTime = r.buckets[r.head].startTime.Add(r.bucketSize)
 		r.buckets[r.head].resetSlot()
+	}
+	// Re-anchor all bucket startTimes after incremental rotation. The
+	// incremental loop only resets the slots that the head swept over;
+	// the remaining slots retain their old startTimes, which would
+	// corrupt the ring invariant. Re-anchoring from the new window
+	// start keeps every bucket coherent.
+	r.startTime = nowBucket.Add(-r.bucketSize * time.Duration(len(r.buckets)-1))
+	for i := range r.buckets {
+		r.buckets[i].startTime = r.startTime.Add(time.Duration(i) * r.bucketSize)
 	}
 }
 
@@ -230,6 +238,7 @@ func (r *BucketRing) Record(t time.Time, model string, authIndex string, tokens 
 // RingSnapshot is a flat, lock-free view of the ring at a point in time.
 type RingSnapshot struct {
 	BucketSize time.Duration
+	HeadIndex  int
 	Buckets    []RingBucket
 }
 
@@ -274,6 +283,7 @@ func (r *BucketRing) ReadSnapshot() RingSnapshot {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	out := RingSnapshot{
+		HeadIndex:  r.head,
 		BucketSize: r.bucketSize,
 		Buckets:    make([]RingBucket, len(r.buckets)),
 	}

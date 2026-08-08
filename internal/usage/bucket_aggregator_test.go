@@ -170,3 +170,58 @@ func TestRequestStatistics_AggregateRoundTripRestoresRingsAndModels(t *testing.T
 		t.Fatalf("expected some buckets to have requests after restore, got %d", total)
 	}
 }
+
+func TestRequestStatistics_RestoreFromLegacySnapshotRebuildsRings(t *testing.T) {
+	now := time.Now()
+	legacy := StatisticsSnapshot{
+		TotalRequests: 3,
+		TotalTokens:   600,
+		SuccessCount:  3,
+		APIs: map[string]APISnapshot{
+			"k": {
+				TotalRequests: 3,
+				TotalTokens:   600,
+				Models: map[string]ModelSnapshot{
+					"m": {
+						TotalRequests: 3,
+						TotalTokens:   600,
+						Details: []RequestDetail{
+							// All three records fall inside the 5-minute ring
+							// window (1h) so they must all be reflushed into the
+							// ring. The 90-minute record intentionally falls
+							// outside the 5-minute window; the 1-hour ring
+							// covers it.
+							{Timestamp: now.Add(-1 * time.Minute), Tokens: TokenStats{TotalTokens: 100}, Failed: false, LatencyMs: 50},
+							{Timestamp: now.Add(-15 * time.Minute), Tokens: TokenStats{TotalTokens: 200}, Failed: true, LatencyMs: 100},
+							{Timestamp: now.Add(-30 * time.Minute), Tokens: TokenStats{TotalTokens: 300}, Failed: false, LatencyMs: 75},
+						},
+					},
+				},
+			},
+		},
+	}
+	s := NewRequestStatistics()
+	s.RestoreFromLegacySnapshot(legacy)
+	if got := s.TotalRequests(); got != 3 {
+		t.Fatalf("total_requests = %d, want 3", got)
+	}
+	if got := s.TotalTokens(); got != 600 {
+		t.Fatalf("total_tokens = %d, want 600", got)
+	}
+	ring5 := s.BucketRing5m().ReadSnapshot()
+	var ring5Total int64
+	for _, b := range ring5.Buckets {
+		ring5Total += b.Requests
+	}
+	if ring5Total != 3 {
+		t.Fatalf("5m ring total = %d, want 3 (legacy details should refill the rings)", ring5Total)
+	}
+	ring1h := s.BucketRing1h().ReadSnapshot()
+	var ring1hTotal int64
+	for _, b := range ring1h.Buckets {
+		ring1hTotal += b.Requests
+	}
+	if ring1hTotal != 3 {
+		t.Fatalf("1h ring total = %d, want 3 (legacy details should refill the rings)", ring1hTotal)
+	}
+}

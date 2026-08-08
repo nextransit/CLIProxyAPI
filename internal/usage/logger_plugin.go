@@ -523,6 +523,24 @@ func (s *RequestStatistics) MergeSnapshot(snapshot StatisticsSnapshot) MergeResu
 				modelStatsValue = &modelStats{}
 				stats.Models[modelName] = modelStatsValue
 			}
+			// If this model's current totals already cover the snapshot's
+			// totals, the snapshot's details are either already present or
+			// already represented by the aggregate counters. Skip the detail
+			// import to avoid double-counting when the same snapshot is
+			// merged more than once (the "seen" set is built from the capped
+			// Details slice and cannot catch every duplicate beyond the cap).
+			//
+			// Only apply this shortcut when the snapshot actually carries
+			// aggregate totals (both > 0); a snapshot that only carries
+			// Details (totals zero) must still be imported so the Details are
+			// populated.
+			if (modelSnapshot.TotalRequests > 0 || modelSnapshot.TotalTokens > 0) &&
+				modelStatsValue.TotalRequests >= modelSnapshot.TotalRequests &&
+				modelStatsValue.TotalTokens >= modelSnapshot.TotalTokens {
+				result.Skipped += int64(len(modelSnapshot.Details))
+				s.preserveModelAggregates(stats, modelStatsValue, modelSnapshot)
+				continue
+			}
 			for _, detail := range modelSnapshot.Details {
 				detail.Tokens = normaliseTokenStats(detail.Tokens)
 				detail.Thinking = normaliseThinkingValue(detail.Thinking)
@@ -921,6 +939,7 @@ func snapshotRing(r *BucketRing) *RingSeed {
 	out := &RingSeed{
 		BucketSizeMs: r.BucketSize().Milliseconds(),
 		StartTimeMs:  snap.Buckets[0].StartTime.UnixMilli(),
+		HeadIndex:    snap.HeadIndex,
 		Buckets:      make([]RingSeedBucket, 0, len(snap.Buckets)),
 	}
 	for _, b := range snap.Buckets {
@@ -1048,6 +1067,161 @@ func (s *RequestStatistics) restoreRingFromSeed(r *BucketRing, seed *RingSeed) {
 		return
 	}
 	r.RestoreFromSeed(seed.StartTimeMs, seed.HeadIndex, seed.Buckets)
+}
+
+// RestoreFromLegacySnapshot rebuilds the rotating rings, counters, and
+// per-(apiKey,model) totals from a legacy StatisticsSnapshot whose
+// apis[api].models[model].details[] entries carry the per-request
+// timestamps we need to place records back into the 5-minute and 1-hour
+// bucket rings.
+//
+// The call is intentionally monotonic: it never decreases an existing
+// counter, so applying a legacy snapshot on top of an already-restored
+// aggregate snapshot is safe.
+//
+// This is the recovery path for installations that have a legacy
+// usage_statistics.snapshot file on disk but no usage_aggregates.json (or
+// whose aggregate file predates the RingSeed field and therefore lacks
+// the bucket view). Without it the dashboard view of "today" comes back
+// empty until ingest refills the rings.
+func (s *RequestStatistics) RestoreFromLegacySnapshot(snap StatisticsSnapshot) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	// Restore aggregate counters from the legacy snapshot. We take the
+	// max(existing, loaded) so callers can compose it with a prior
+	// ApplyAggregateSnapshot.
+	if snap.TotalRequests > s.totalRequests {
+		s.totalRequests = snap.TotalRequests
+	}
+	if snap.SuccessCount > s.successCount {
+		s.successCount = snap.SuccessCount
+	}
+	if snap.FailureCount > s.failureCount {
+		s.failureCount = snap.FailureCount
+	}
+	if snap.TotalTokens > s.totalTokens {
+		s.totalTokens = snap.TotalTokens
+	}
+	for k, v := range snap.RequestsByDay {
+		if v > s.requestsByDay[k] {
+			s.requestsByDay[k] = v
+		}
+	}
+	for k, v := range snap.TokensByDay {
+		if v > s.tokensByDay[k] {
+			s.tokensByDay[k] = v
+		}
+	}
+	for hour, v := range snap.RequestsByHour {
+		parsed := parseHourKey(hour)
+		if v > s.requestsByHour[parsed] {
+			s.requestsByHour[parsed] = v
+		}
+	}
+	for hour, v := range snap.TokensByHour {
+		parsed := parseHourKey(hour)
+		if v > s.tokensByHour[parsed] {
+			s.tokensByHour[parsed] = v
+		}
+	}
+	// Restore per-(apiKey,model) counter view from the legacy models.
+	for apiName, apiSnap := range snap.APIs {
+		apiName = strings.TrimSpace(apiName)
+		if apiName == "" {
+			continue
+		}
+		existing, ok := s.apis[apiName]
+		if !ok || existing == nil {
+			existing = &apiStats{Models: make(map[string]*modelStats, len(apiSnap.Models))}
+			s.apis[apiName] = existing
+		}
+		if apiSnap.TotalRequests > existing.TotalRequests {
+			existing.TotalRequests = apiSnap.TotalRequests
+		}
+		if apiSnap.TotalTokens > existing.TotalTokens {
+			existing.TotalTokens = apiSnap.TotalTokens
+		}
+		for modelName, modelSnap := range apiSnap.Models {
+			modelName = strings.TrimSpace(modelName)
+			if modelName == "" {
+				modelName = "unknown"
+			}
+			ms, ok := existing.Models[modelName]
+			if !ok || ms == nil {
+				ms = &modelStats{}
+				existing.Models[modelName] = ms
+			}
+			if modelSnap.TotalRequests > ms.TotalRequests {
+				ms.TotalRequests = modelSnap.TotalRequests
+			}
+			if modelSnap.TotalTokens > ms.TotalTokens {
+				ms.TotalTokens = modelSnap.TotalTokens
+			}
+			// Restore the legacy Details slice so that /usage and
+			// /usage?time_range=today have data to serve after a restart.
+			// The Details are capped at defaultModelDetailsCap to bound
+			// memory, matching the FIFO cap in updateAPIStats.
+			if len(ms.Details) == 0 && len(modelSnap.Details) > 0 {
+				capped := modelSnap.Details
+				if len(capped) > defaultModelDetailsCap {
+					n := len(capped) - defaultModelDetailsCap
+					capped = capped[n:]
+				}
+				ms.Details = make([]RequestDetail, len(capped))
+				copy(ms.Details, capped)
+			}
+		}
+	}
+	// We must drop s.mu before calling the rings because the ring
+	// mutators take their own mutex and we do not want to nest locks.
+	// Snapshot the details so we can release the main lock quickly.
+	type detailRow struct {
+		apiName, modelName, authIndex string
+		tokens                        int64
+		failed                        bool
+		latencyMs                     int64
+		timestamp                     time.Time
+	}
+	var rows []detailRow
+	for apiName, apiSnap := range snap.APIs {
+		for modelName, modelSnap := range apiSnap.Models {
+			for i := range modelSnap.Details {
+				d := modelSnap.Details[i]
+				if d.Timestamp.IsZero() {
+					continue
+				}
+				rows = append(rows, detailRow{
+					apiName:   apiName,
+					modelName: modelName,
+					authIndex: d.AuthIndex,
+					tokens:    d.Tokens.TotalTokens,
+					failed:    d.Failed,
+					latencyMs: d.LatencyMs,
+					timestamp: d.Timestamp,
+				})
+			}
+		}
+	}
+	s.mu.Unlock()
+
+	for _, r := range rows {
+		s.recordIntoRingsOnly(r.timestamp, r.modelName, r.authIndex, r.tokens, r.failed, r.latencyMs)
+	}
+}
+
+// recordIntoRingsOnly writes a single historical record into the rotating
+// rings without touching counters, the daymap, or the apis/models totals.
+// Used by RestoreFromLegacySnapshot to repopulate the dashboard buckets
+// after a restart.
+func (s *RequestStatistics) recordIntoRingsOnly(t time.Time, model, authIndex string, tokens int64, failed bool, latencyMs int64) {
+	if s.bucketRing5m != nil {
+		s.bucketRing5m.Record(t, model, authIndex, tokens, failed, latencyMs)
+	}
+	if s.bucketRing1h != nil {
+		s.bucketRing1h.Record(t, model, authIndex, tokens, failed, latencyMs)
+	}
 }
 
 // ApplyRecentEvents re-populates the RecentBuffer ring from a persisted

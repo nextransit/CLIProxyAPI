@@ -291,6 +291,84 @@ func TestRequestStatisticsMergeSnapshotPreservesAggregateTotalsWhenDetailsAreInc
 	}
 }
 
+func TestRequestStatisticsMergeSnapshotIdempotentWithCappedDetails(t *testing.T) {
+	// Regression test: when a snapshot has more than defaultModelDetailsCap (5000)
+	// details per model, a second MergeSnapshot with the same snapshot must not
+	// double-count tokens. The "seen" set is built from the in-memory Details,
+	// which are capped; the bug was that excess details beyond the cap were
+	// re-imported on the second merge, inflating the counters.
+	detailsCount := defaultModelDetailsCap + 1000 // 6000
+	stats := NewRequestStatistics()
+	baseTime := time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC)
+	details := make([]RequestDetail, detailsCount)
+	for i := range details {
+		details[i] = RequestDetail{
+			Timestamp:  baseTime.Add(time.Duration(i) * time.Second),
+			Source:     "test",
+			AuthIndex:  "0",
+			StatusCode: 200,
+			Tokens: TokenStats{
+				InputTokens:  10,
+				OutputTokens: 20,
+				TotalTokens:  30,
+			},
+		}
+	}
+	var totalTokens int64 = int64(detailsCount) * 30 // 6000 * 30 = 180000
+	var totalRequests int64 = int64(detailsCount)
+	snapshot := StatisticsSnapshot{
+		TotalRequests: totalRequests,
+		SuccessCount:  totalRequests,
+		FailureCount:  0,
+		TotalTokens:   totalTokens,
+		APIs: map[string]APISnapshot{
+			"test-key": {
+				TotalRequests: totalRequests,
+				TotalTokens:   totalTokens,
+				Models: map[string]ModelSnapshot{
+					"gpt-5.4": {
+						TotalRequests: totalRequests,
+						TotalTokens:   totalTokens,
+						Details:       details,
+					},
+				},
+			},
+		},
+		RequestsByDay: map[string]int64{"2026-03-20": totalRequests},
+		TokensByDay:   map[string]int64{"2026-03-20": totalTokens},
+	}
+
+	// First merge: all details should be added.
+	result := stats.MergeSnapshot(snapshot)
+	if result.Added != int64(detailsCount) {
+		t.Fatalf("first merge: added=%d, want %d", result.Added, detailsCount)
+	}
+
+	got := stats.Snapshot()
+	if got.TotalTokens != totalTokens {
+		t.Fatalf("after first merge: total_tokens=%d, want %d", got.TotalTokens, totalTokens)
+	}
+	if got.TotalRequests != totalRequests {
+		t.Fatalf("after first merge: total_requests=%d, want %d", got.TotalRequests, totalRequests)
+	}
+
+	// Second merge: ALL details must be skipped (added=0) because the data
+	// is already present. The bug was that the "seen" set only captured the
+	// capped 5000 details, so the remaining 1000 were re-imported.
+	result = stats.MergeSnapshot(snapshot)
+	if result.Added != 0 {
+		t.Fatalf("second merge: added=%d, want 0 (no double-counting)", result.Added)
+	}
+
+	got = stats.Snapshot()
+	if got.TotalTokens != totalTokens {
+		t.Fatalf("after second merge: total_tokens=%d, want %d (no change)", got.TotalTokens, totalTokens)
+	}
+	if got.TotalRequests != totalRequests {
+		t.Fatalf("after second merge: total_requests=%d, want %d (no change)", got.TotalRequests, totalRequests)
+	}
+}
+
 func TestRequestStatistics_RecordEmitsUsageEvent(t *testing.T) {
 	s := NewRequestStatistics()
 	subs, cancel := s.Broker().Subscribe()

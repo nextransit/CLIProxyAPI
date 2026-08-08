@@ -220,12 +220,25 @@ func (p *PersistentLoggerPlugin) Save() error {
 	return nil
 }
 
-// Load restores statistics from storage. Prefer the aggregate + recent-
-// events path when present; fall back to the legacy snapshot path (which
-// uses MergeSnapshot and is O(detailCount)).
+// Load restores statistics from storage. Order of preference:
+//  1. AggregateFileStore (cheap counters + RingSeed + ModelTotals).
+//  2. RecentEventsFileStore (SSE replay ring).
+//  3. Legacy StatisticsSnapshot (apis/models/Details). Used both as a
+//     counter source and as the source of per-request timestamps that
+//     refill the rotating rings when no RingSeed is available.
+//
+// The legacy path is the safe default for installations upgrading from
+// before the aggregate file existed: it costs O(detailCount) at startup
+// but restores the dashboard buckets for "today" instead of leaving them
+// empty until ingest refills the rings.
 func (p *PersistentLoggerPlugin) Load() error {
 	if p.stats == nil {
 		return nil
+	}
+
+	legacySnapshot, err := p.loadLegacySnapshot()
+	if err != nil {
+		return err
 	}
 
 	if p.aggregateStore != nil {
@@ -236,32 +249,83 @@ func (p *PersistentLoggerPlugin) Load() error {
 		if agg.TotalRequests > 0 || agg.TotalTokens > 0 {
 			p.stats.ApplyAggregateSnapshot(agg)
 		}
+		// When the aggregate snapshot lacks RingSeed data (older files)
+		// or the rings end up empty after restore, fall back to the
+		// legacy details to repopulate the dashboard buckets.
+		if ringsEmpty(p.stats) {
+			if legacySnapshot != nil {
+				p.stats.RestoreFromLegacySnapshot(*legacySnapshot)
+				log.Infof("restored usage statistics from aggregates + legacy details: %d requests, %d tokens",
+					agg.TotalRequests, agg.TotalTokens)
+			} else {
+				log.Infof("restored usage statistics from aggregates (no ring data): %d requests, %d tokens",
+					agg.TotalRequests, agg.TotalTokens)
+			}
+		} else {
+			log.Infof("restored usage statistics from aggregates (rings seeded): %d requests, %d tokens",
+				agg.TotalRequests, agg.TotalTokens)
+		}
 		if p.recentStore != nil {
 			evt, err := p.recentStore.Load()
 			if err == nil && len(evt.Events) > 0 {
 				p.stats.ApplyRecentEvents(evt.Events)
 			}
 		}
-		log.Infof("restored usage statistics from aggregates: %d requests, %d tokens loaded",
-			agg.TotalRequests, agg.TotalTokens)
 		return nil
 	}
 
-	if p.store == nil {
+	if legacySnapshot == nil {
 		return nil
 	}
-	snapshot, err := p.store.Load()
-	if err != nil {
-		return err
-	}
-	if snapshot.TotalRequests == 0 && snapshot.TotalTokens == 0 {
+	if legacySnapshot.TotalRequests == 0 && legacySnapshot.TotalTokens == 0 {
 		log.Debug("no previous usage statistics found")
 		return nil
 	}
-	result := p.stats.MergeSnapshot(snapshot)
-	log.Infof("restored usage statistics: %d requests, %d tokens loaded (%d added, %d skipped)",
-		snapshot.TotalRequests, snapshot.TotalTokens, result.Added, result.Skipped)
+	// No aggregate file: apply legacy snapshot directly. This rebuilds
+	// rings from the per-request details and also rehydrates apis/models.
+	p.stats.RestoreFromLegacySnapshot(*legacySnapshot)
+	log.Infof("restored usage statistics from legacy snapshot (rings rebuilt): %d requests, %d tokens",
+		legacySnapshot.TotalRequests, legacySnapshot.TotalTokens)
 	return nil
+}
+
+// loadLegacySnapshot returns the legacy StatisticsSnapshot, or nil if no
+// legacy store is attached. Errors propagate to the caller.
+func (p *PersistentLoggerPlugin) loadLegacySnapshot() (*StatisticsSnapshot, error) {
+	if p.store == nil {
+		return nil, nil
+	}
+	snap, err := p.store.Load()
+	if err != nil {
+		return nil, err
+	}
+	return &snap, nil
+}
+
+// ringsEmpty reports whether both pre-aggregated rings currently carry no
+// traffic. It is used to decide whether the legacy details need to refill
+// the rings after the aggregate restore.
+func ringsEmpty(s *RequestStatistics) bool {
+	if s == nil {
+		return true
+	}
+	if ring := s.BucketRing5m(); ring != nil {
+		snap := ring.ReadSnapshot()
+		for _, b := range snap.Buckets {
+			if b.Requests > 0 {
+				return false
+			}
+		}
+	}
+	if ring := s.BucketRing1h(); ring != nil {
+		snap := ring.ReadSnapshot()
+		for _, b := range snap.Buckets {
+			if b.Requests > 0 {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // RestoreStatisticsFromStore reloads persisted usage statistics into the provided in-memory store

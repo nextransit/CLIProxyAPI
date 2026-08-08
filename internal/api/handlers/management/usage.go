@@ -99,6 +99,87 @@ func filterUsageSnapshotByWindow(snapshot usage.StatisticsSnapshot, start, end t
 		TokensByDay:    make(map[string]int64),
 		TokensByHour:   make(map[string]int64),
 	}
+	// Carry forward the lifetime counters when the requested window
+	// covers "everything" (Window = 0 / "all"). The detail-derived totals
+	// below replace these when the window is narrower than the lifetime
+	// history; that replacement keeps time-range queries honest at the
+	// cost of slightly undercounting the window when Details have been
+	// capped. The RequestsByDay map above is the canonical answer for
+	// the day-level view either way.
+	if start.IsZero() && end.IsZero() {
+		result.TotalRequests = snapshot.TotalRequests
+		result.TotalTokens = snapshot.TotalTokens
+		result.SuccessCount = snapshot.SuccessCount
+		result.FailureCount = snapshot.FailureCount
+	}
+	// Inherit the day/hour buckets from the source snapshot filtered to the
+	// window. This is the canonical path for time-range queries: when the
+	// per-model Details slice has been capped and does not retain every
+	// request, the persisted day/hour bucket map is still accurate (it is
+	// updated monotonically in Record() and survives restart via
+	// ApplyAggregateSnapshot). Without this, /usage?time_range=today
+	// returns totals that match only the retained Detail rows, which is
+	// strictly less than the real counter.
+	for k, v := range snapshot.RequestsByDay {
+		dayTime, err := time.ParseInLocation("2006-01-02", k, bucketLocation)
+		if err != nil {
+			continue
+		}
+		if !dayTime.Before(start) && !dayTime.After(end) {
+			result.RequestsByDay[k] = v
+		}
+	}
+	for k, v := range snapshot.TokensByDay {
+		dayTime, err := time.ParseInLocation("2006-01-02", k, bucketLocation)
+		if err != nil {
+			continue
+		}
+		if !dayTime.Before(start) && !dayTime.After(end) {
+			result.TokensByDay[k] = v
+		}
+	}
+	for k, v := range snapshot.RequestsByHour {
+		hourInt, err := strconv.Atoi(k)
+		if err != nil {
+			continue
+		}
+		if hourInt < 0 || hourInt > 23 {
+			continue
+		}
+		result.RequestsByHour[k] = v
+	}
+	for k, v := range snapshot.TokensByHour {
+		hourInt, err := strconv.Atoi(k)
+		if err != nil {
+			continue
+		}
+		if hourInt < 0 || hourInt > 23 {
+			continue
+		}
+		result.TokensByHour[k] = v
+	}
+	// Save the day-bucket-derived totals separately. The detail loop
+	// below also accumulates into result.TotalRequests/Tokens; at the
+	// end we take the max of the two, so when a snapshot carries both
+	// day buckets (canonical, monotonic from Record) and a capped
+	// Details slice, the day buckets win by being larger.
+	dayBucketRequests := int64(0)
+	dayBucketTokens := int64(0)
+	for _, v := range result.RequestsByDay {
+		dayBucketRequests += v
+	}
+	for _, v := range result.TokensByDay {
+		dayBucketTokens += v
+	}
+
+	// Detail-derived counters track what we compute from the per-request
+	// Details slice. Day-bucket-derived totals (from snapshot.RequestsByDay)
+	// are the canonical source when present; at the end we take the max
+	// of the two to avoid double-counting on restart (where both the day
+	// bucket maps and the capped Details slice cover the same requests).
+	var detailReqs, detailTokens, detailSuccess, detailFailure int64
+	detailReqsByDay := make(map[string]int64)
+	detailTokensByDay := make(map[string]int64)
 
 	for apiName, apiSnapshot := range snapshot.APIs {
 		apiCopy := usage.APISnapshot{
@@ -118,19 +199,19 @@ func filterUsageSnapshotByWindow(snapshot usage.StatisticsSnapshot, start, end t
 				modelCopy.TotalTokens += detail.Tokens.TotalTokens
 				apiCopy.TotalRequests++
 				apiCopy.TotalTokens += detail.Tokens.TotalTokens
-				result.TotalRequests++
-				result.TotalTokens += detail.Tokens.TotalTokens
+				detailReqs++
+				detailTokens += detail.Tokens.TotalTokens
 				if detail.Failed {
-					result.FailureCount++
+					detailFailure++
 				} else {
-					result.SuccessCount++
+					detailSuccess++
 				}
 				bucketTimestamp := timestamp.In(bucketLocation)
 				dayKey := bucketTimestamp.Format("2006-01-02")
 				hourKey := bucketTimestamp.Format("15")
-				result.RequestsByDay[dayKey]++
+				detailReqsByDay[dayKey]++
 				result.RequestsByHour[hourKey]++
-				result.TokensByDay[dayKey] += detail.Tokens.TotalTokens
+				detailTokensByDay[dayKey] += detail.Tokens.TotalTokens
 				result.TokensByHour[hourKey] += detail.Tokens.TotalTokens
 			}
 			if modelCopy.TotalRequests == 0 {
@@ -143,6 +224,33 @@ func filterUsageSnapshotByWindow(snapshot usage.StatisticsSnapshot, start, end t
 		}
 		result.APIs[apiName] = apiCopy
 	}
+
+	// Merge: day-bucket maps are canonical when present; detail-derived
+	// values fill in days the snapshot lacked.
+	for k, v := range detailReqsByDay {
+		if _, ok := result.RequestsByDay[k]; !ok {
+			result.RequestsByDay[k] = v
+		}
+	}
+	for k, v := range detailTokensByDay {
+		if _, ok := result.TokensByDay[k]; !ok {
+			result.TokensByDay[k] = v
+		}
+	}
+
+	// Totals: take the max of day-bucket-derived and detail-derived.
+	if dayBucketRequests > detailReqs {
+		result.TotalRequests = dayBucketRequests
+	} else {
+		result.TotalRequests = detailReqs
+	}
+	if dayBucketTokens > detailTokens {
+		result.TotalTokens = dayBucketTokens
+	} else {
+		result.TotalTokens = detailTokens
+	}
+	result.SuccessCount = detailSuccess
+	result.FailureCount = detailFailure
 
 	return result
 }
