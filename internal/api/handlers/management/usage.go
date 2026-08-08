@@ -125,7 +125,12 @@ func filterUsageSnapshotByWindow(snapshot usage.StatisticsSnapshot, start, end t
 		if err != nil {
 			continue
 		}
-		if !dayTime.Before(start) && !dayTime.After(end) {
+		// Include any day that overlaps the requested window. A day overlaps
+		// when its start (dayTime) is before the window end AND its end
+		// (dayTime+24h) is after the window start. This keeps partial-day
+		// windows (e.g. 24h spanning two days) from dropping an entire day
+		// when the window starts mid-day.
+		if !dayTime.Add(24*time.Hour).Before(start) && !dayTime.After(end) {
 			result.RequestsByDay[k] = v
 		}
 	}
@@ -134,7 +139,7 @@ func filterUsageSnapshotByWindow(snapshot usage.StatisticsSnapshot, start, end t
 		if err != nil {
 			continue
 		}
-		if !dayTime.Before(start) && !dayTime.After(end) {
+		if !dayTime.Add(24*time.Hour).Before(start) && !dayTime.After(end) {
 			result.TokensByDay[k] = v
 		}
 	}
