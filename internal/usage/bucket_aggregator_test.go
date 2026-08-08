@@ -1,9 +1,12 @@
 package usage
 
 import (
+	"context"
 	"sync"
 	"testing"
 	"time"
+
+	coreusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 )
 
 func TestBucketRing_BasicRecordAndRead(t *testing.T) {
@@ -99,5 +102,71 @@ func TestBucketRing_AdvanceForwardKeepsBucketsMonotonic(t *testing.T) {
 			t.Fatalf("buckets not monotonic: bucket[%d]=%v before bucket[%d]=%v", i-1, prev, i, b.StartTime)
 		}
 		prev = b.StartTime
+	}
+}
+
+func TestBucketRing_RestoreFromSeed(t *testing.T) {
+	origin := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	r := NewBucketRing(4, time.Minute, origin)
+	r.Record(origin.Add(30*time.Second), "model-a", "auth-1", 100, false, 50)
+	r.Record(origin.Add(2*time.Minute+30*time.Second), "model-b", "auth-2", 200, true, 100)
+
+	// Build a fresh ring and restore from the first one via seed.
+	r2 := NewBucketRing(4, time.Minute, origin.Add(10*time.Minute))
+	snap := r.ReadSnapshot()
+	r2.RestoreFromSeed(snap.Buckets[0].StartTime.UnixMilli(), 3 /* head */, []RingSeedBucket{
+		{StartTimeMs: snap.Buckets[0].StartTime.UnixMilli(), Requests: snap.Buckets[0].Requests, Tokens: snap.Buckets[0].Tokens, Failures: snap.Buckets[0].Failures, LatencySum: snap.Buckets[0].LatencySum, LatencyN: snap.Buckets[0].LatencyN},
+		{StartTimeMs: snap.Buckets[1].StartTime.UnixMilli(), Requests: snap.Buckets[1].Requests, Tokens: snap.Buckets[1].Tokens, Failures: snap.Buckets[1].Failures, LatencySum: snap.Buckets[1].LatencySum, LatencyN: snap.Buckets[1].LatencyN},
+		{StartTimeMs: snap.Buckets[2].StartTime.UnixMilli(), Requests: snap.Buckets[2].Requests, Tokens: snap.Buckets[2].Tokens, Failures: snap.Buckets[2].Failures, LatencySum: snap.Buckets[2].LatencySum, LatencyN: snap.Buckets[2].LatencyN},
+		{StartTimeMs: snap.Buckets[3].StartTime.UnixMilli(), Requests: snap.Buckets[3].Requests, Tokens: snap.Buckets[3].Tokens, Failures: snap.Buckets[3].Failures, LatencySum: snap.Buckets[3].LatencySum, LatencyN: snap.Buckets[3].LatencyN},
+	})
+	got := r2.ReadSnapshot()
+	if got.Buckets[3].Requests != snap.Buckets[3].Requests {
+		t.Fatalf("newest bucket requests = %d, want %d", got.Buckets[3].Requests, snap.Buckets[3].Requests)
+	}
+	if got.Buckets[0].Requests != snap.Buckets[0].Requests {
+		t.Fatalf("oldest bucket requests = %d, want %d", got.Buckets[0].Requests, snap.Buckets[0].Requests)
+	}
+}
+
+func TestRequestStatistics_AggregateRoundTripRestoresRingsAndModels(t *testing.T) {
+	// Use time.Now() so the record timestamps fall inside the live ring
+	// window of bucketRing5m (which is initialised from time.Now() in
+	// NewRequestStatistics).
+	now := time.Now()
+	s := NewRequestStatistics()
+	s.Record(context.Background(), coreusage.Record{
+		APIKey: "k", Model: "m",
+		Detail:      coreusage.Detail{TotalTokens: 100},
+		RequestedAt: now.Add(-30 * time.Second),
+	})
+	s.Record(context.Background(), coreusage.Record{
+		APIKey: "k", Model: "m2",
+		Detail:      coreusage.Detail{TotalTokens: 50},
+		RequestedAt: now.Add(-4 * time.Minute),
+	})
+	snap := s.AggregateSnapshot()
+	if snap.RingSeed5m == nil {
+		t.Fatalf("expected RingSeed5m to be populated")
+	}
+	if len(snap.ModelTotals) == 0 {
+		t.Fatalf("expected ModelTotals to be populated")
+	}
+	// Build a fresh stats and apply the snapshot.
+	s2 := NewRequestStatistics()
+	s2.ApplyAggregateSnapshot(snap)
+	if s2.TotalRequests() != s.TotalRequests() {
+		t.Fatalf("total_requests = %d, want %d", s2.TotalRequests(), s.TotalRequests())
+	}
+	if s2.TotalTokens() != s.TotalTokens() {
+		t.Fatalf("total_tokens = %d, want %d", s2.TotalTokens(), s.TotalTokens())
+	}
+	got := s2.BucketRing5m().ReadSnapshot()
+	var total int64
+	for _, b := range got.Buckets {
+		total += b.Requests
+	}
+	if total == 0 {
+		t.Fatalf("expected some buckets to have requests after restore, got %d", total)
 	}
 }

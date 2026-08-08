@@ -320,3 +320,57 @@ func (r *BucketRing) ReadSnapshot() RingSnapshot {
 	}
 	return out
 }
+
+// RestoreFromSeed replaces the live ring's state with a previously
+// serialised snapshot. It is safe to call concurrently with new ingest:
+// writes that arrive during the restore will land in the right bucket
+// because the invariant on r.startTime and the per-bucket startTimes is
+// preserved. head is set to the seed's value modulo len(buckets).
+//
+// The caller is responsible for ensuring seed.Buckets aligns with the
+// live ring's bucket count and bucket size. Mismatches are rejected by
+// the surrounding guard in (RequestStatistics).restoreRingFromSeed.
+func (r *BucketRing) RestoreFromSeed(startTimeMs int64, headIndex int, buckets []RingSeedBucket) {
+	if r == nil || len(buckets) != len(r.buckets) {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.startTime = time.UnixMilli(startTimeMs)
+	r.head = ((headIndex % len(r.buckets)) + len(r.buckets)) % len(r.buckets)
+	for i, sb := range buckets {
+		slot := &r.buckets[i]
+		slot.startTime = time.UnixMilli(sb.StartTimeMs)
+		slot.requests = sb.Requests
+		slot.tokens = sb.Tokens
+		slot.failures = sb.Failures
+		slot.latencySumMs = sb.LatencySum
+		slot.latencySamples = sb.LatencyN
+		if len(sb.ModelBreakdown) > 0 {
+			slot.modelBreakdown = make(map[string]*modelBucketAcc, len(sb.ModelBreakdown))
+			for k, m := range sb.ModelBreakdown {
+				slot.modelBreakdown[k] = &modelBucketAcc{
+					requests:       m.TotalRequests,
+					tokens:         m.TotalTokens,
+					failures:       0,
+					latencySumMs:   0,
+					latencySamples: 0,
+				}
+			}
+		} else {
+			slot.modelBreakdown = nil
+		}
+		if len(sb.AuthBreakdown) > 0 {
+			slot.authIdxBreakdown = make(map[string]*authBucketAcc, len(sb.AuthBreakdown))
+			for k, a := range sb.AuthBreakdown {
+				slot.authIdxBreakdown[k] = &authBucketAcc{
+					requests: a.Requests,
+					tokens:   a.Tokens,
+					failures: a.Failures,
+				}
+			}
+		} else {
+			slot.authIdxBreakdown = nil
+		}
+	}
+}

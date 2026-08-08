@@ -1,9 +1,12 @@
 package usage
 
 import (
+	"context"
 	"path/filepath"
 	"testing"
 	"time"
+
+	coreusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 )
 
 func TestNewFileStore_UsesNonJSONPersistenceFile(t *testing.T) {
@@ -112,4 +115,69 @@ func mustParseTestTime(t *testing.T, raw string) time.Time {
 		t.Fatalf("time.Parse(%q) error = %v", raw, err)
 	}
 	return ts
+}
+
+func TestAggregateFileStore_RoundTrip(t *testing.T) {
+	tmp := t.TempDir()
+	s := NewAggregateFileStore(tmp)
+	in := AggregateSnapshot{
+		Version:       1,
+		TotalRequests: 1234,
+		SuccessCount:  1200,
+		FailureCount:  34,
+		TotalTokens:   9_000_000,
+		RequestsByDay: map[string]int64{"2026-08-08": 1200, "2026-08-07": 34},
+		TokensByDay:   map[string]int64{"2026-08-08": 8_900_000, "2026-08-07": 100_000},
+		ExportedAt:    time.Now().UTC(),
+	}
+	if err := s.Save(in); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	out, err := s.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if out.TotalRequests != in.TotalRequests || out.TotalTokens != in.TotalTokens {
+		t.Fatalf("counters: got %+v want %+v", out, in)
+	}
+	if out.RequestsByDay["2026-08-08"] != 1200 {
+		t.Fatalf("day buckets: %+v", out.RequestsByDay)
+	}
+}
+
+func TestRecentEventsFileStore_RoundTrip(t *testing.T) {
+	tmp := t.TempDir()
+	s := NewRecentEventsFileStore(tmp)
+	in := RecentEventsSnapshot{
+		Version: 1,
+		Events: []UsageEvent{
+			{ID: 1, APIKey: "k", Model: "m", Tokens: TokenSummary{Input: 1, Output: 2, Total: 3}, RequestedAt: time.Now().UTC()},
+			{ID: 2, APIKey: "k", Model: "m2", Failed: true, Tokens: TokenSummary{Total: 5}, RequestedAt: time.Now().UTC()},
+		},
+	}
+	if err := s.Save(in); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	out, err := s.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(out.Events) != 2 || out.Events[0].Model != "m" || out.Events[1].Model != "m2" {
+		t.Fatalf("events: %+v", out.Events)
+	}
+}
+
+func TestRequestStatistics_DetailsAreCapped(t *testing.T) {
+	stats := NewRequestStatistics()
+	for i := 0; i < defaultModelDetailsCap+200; i++ {
+		stats.Record(context.Background(), coreusage.Record{
+			APIKey: "k", Model: "m",
+			Detail:      coreusage.Detail{TotalTokens: 1},
+			RequestedAt: time.Unix(int64(1700000000+i), 0),
+		})
+	}
+	snap := stats.Snapshot()
+	if got := len(snap.APIs["k"].Models["m"].Details); got != defaultModelDetailsCap {
+		t.Fatalf("details length = %d, want %d", got, defaultModelDetailsCap)
+	}
 }

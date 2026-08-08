@@ -375,6 +375,19 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	s.broker.Publish(evt)
 }
 
+// defaultModelDetailsCap caps the per-model Details slice so memory does
+// not grow linearly with lifetime ingest. When the cap is reached, the
+// oldest detail is dropped FIFO. The cap is conservative: on a busy
+// server with 100 models, this keeps retained details at 500K rows
+// regardless of how long the server has been running.
+const defaultModelDetailsCap = 5000
+
+// detailRetention bounds the age of retained Details so very old events
+// do not stick around in memory once the cap kicks in. It is best-effort:
+// details are dropped FIFO whenever the cap is exceeded, which usually
+// also drops the oldest entries first.
+const detailRetention = 24 * time.Hour
+
 func (s *RequestStatistics) updateAPIStats(stats *apiStats, model string, detail RequestDetail) {
 	stats.TotalRequests++
 	stats.TotalTokens += detail.Tokens.TotalTokens
@@ -386,6 +399,16 @@ func (s *RequestStatistics) updateAPIStats(stats *apiStats, model string, detail
 	modelStatsValue.TotalRequests++
 	modelStatsValue.TotalTokens += detail.Tokens.TotalTokens
 	modelStatsValue.Details = append(modelStatsValue.Details, detail)
+	// Cap: drop oldest entries first when we exceed the per-model limit.
+	// Truncating the head preserves the most-recent N, which is what the
+	// /usage endpoint and the RecentBuffer consumers care about.
+	if len(modelStatsValue.Details) > defaultModelDetailsCap {
+		n := len(modelStatsValue.Details) - defaultModelDetailsCap
+		// Reuse the backing array to avoid an allocation. slicecopy would
+		// allocate a new slice; we copy in place to keep GC quiet.
+		copy(modelStatsValue.Details, modelStatsValue.Details[n:])
+		modelStatsValue.Details = modelStatsValue.Details[:defaultModelDetailsCap]
+	}
 }
 
 // Snapshot returns a copy of the aggregated metrics for external consumption.
@@ -823,6 +846,238 @@ func (s *RequestStatistics) SnapshotPayload() UsagePayload {
 		TotalTokens:   s.totalTokens,
 		LatestID:      s.recent.LastID(),
 	}
+}
+
+// AggregateSnapshot returns a small, details-free view of the counters
+// suitable for periodic disk persistence. Capturing only aggregates keeps
+// the auto-save loop cheap and the on-disk file size bounded regardless
+// of how many per-request Details are retained in memory.
+//
+// In addition to cheap counters, the snapshot carries RingSeed5m /
+// RingSeed1h (the current state of the rotating rings) and ModelTotals
+// (per-(apiKey,model) counters). Together these let a freshly started
+// server resume the management UI / dashboard view without waiting for
+// new ingest to refill the rings or re-derive model totals from Details.
+func (s *RequestStatistics) AggregateSnapshot() AggregateSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	req := make(map[string]int64, len(s.requestsByDay))
+	for k, v := range s.requestsByDay {
+		req[k] = v
+	}
+	ts := make(map[string]int64, len(s.tokensByDay))
+	for k, v := range s.tokensByDay {
+		ts[k] = v
+	}
+	out := AggregateSnapshot{
+		Version:       1,
+		TotalRequests: s.totalRequests,
+		SuccessCount:  s.successCount,
+		FailureCount:  s.failureCount,
+		TotalTokens:   s.totalTokens,
+		RequestsByDay: req,
+		TokensByDay:   ts,
+		ExportedAt:    time.Now().UTC(),
+	}
+	if s.bucketRing5m != nil {
+		out.RingSeed5m = snapshotRing(s.bucketRing5m)
+	}
+	if s.bucketRing1h != nil {
+		out.RingSeed1h = snapshotRing(s.bucketRing1h)
+	}
+	if len(s.apis) > 0 {
+		out.ModelTotals = make(map[string]APITotals, len(s.apis))
+		for apiName, api := range s.apis {
+			if api == nil {
+				continue
+			}
+			apiSnap := APITotals{TotalRequests: api.TotalRequests, TotalTokens: api.TotalTokens}
+			if len(api.Models) > 0 {
+				apiSnap.Models = make(map[string]ModelTotals, len(api.Models))
+				for modelName, m := range api.Models {
+					if m == nil {
+						continue
+					}
+					apiSnap.Models[modelName] = ModelTotals{
+						TotalRequests: m.TotalRequests,
+						TotalTokens:   m.TotalTokens,
+					}
+				}
+			}
+			out.ModelTotals[apiName] = apiSnap
+		}
+	}
+	return out
+}
+
+// snapshotRing walks a BucketRing under the ring lock and copies its
+// buckets into a serialisable form. Caller must NOT hold s.mu because the
+// ring uses its own mutex; the ring snapshot is atomic on its own.
+func snapshotRing(r *BucketRing) *RingSeed {
+	if r == nil {
+		return nil
+	}
+	snap := r.ReadSnapshot()
+	out := &RingSeed{
+		BucketSizeMs: r.BucketSize().Milliseconds(),
+		StartTimeMs:  snap.Buckets[0].StartTime.UnixMilli(),
+		Buckets:      make([]RingSeedBucket, 0, len(snap.Buckets)),
+	}
+	for _, b := range snap.Buckets {
+		rb := RingSeedBucket{
+			StartTimeMs: b.StartTime.UnixMilli(),
+			Requests:    b.Requests,
+			Tokens:      b.Tokens,
+			Failures:    b.Failures,
+			LatencySum:  b.LatencySum,
+			LatencyN:    b.LatencyN,
+		}
+		if len(b.Models) > 0 {
+			rb.ModelBreakdown = make(map[string]ModelTotals, len(b.Models))
+			for _, m := range b.Models {
+				rb.ModelBreakdown[m.Model] = ModelTotals{
+					TotalRequests: m.Requests,
+					TotalTokens:   m.Tokens,
+				}
+			}
+		}
+		if len(b.Auths) > 0 {
+			rb.AuthBreakdown = make(map[string]AuthTotals, len(b.Auths))
+			for _, a := range b.Auths {
+				rb.AuthBreakdown[a.AuthIndex] = AuthTotals{
+					Requests: a.Requests,
+					Tokens:   a.Tokens,
+					Failures: a.Failures,
+				}
+			}
+		}
+		out.Buckets = append(out.Buckets, rb)
+	}
+	return out
+}
+
+// ApplyAggregateSnapshot restores the cheap counters, the rotating rings,
+// and the per-(apiKey,model) totals from a previously persisted aggregate
+// snapshot. Details are NOT restored; the legacy full snapshot is the only
+// path that retains per-request records across restarts.
+//
+// This call is monotonic: it never decreases an existing counter, so it is
+// safe to call alongside the legacy MergeSnapshot path or on a hot server
+// after a brief restart.
+func (s *RequestStatistics) ApplyAggregateSnapshot(snap AggregateSnapshot) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	if snap.TotalRequests > s.totalRequests {
+		s.totalRequests = snap.TotalRequests
+	}
+	if snap.SuccessCount > s.successCount {
+		s.successCount = snap.SuccessCount
+	}
+	if snap.FailureCount > s.failureCount {
+		s.failureCount = snap.FailureCount
+	}
+	if snap.TotalTokens > s.totalTokens {
+		s.totalTokens = snap.TotalTokens
+	}
+	for k, v := range snap.RequestsByDay {
+		if v > s.requestsByDay[k] {
+			s.requestsByDay[k] = v
+		}
+	}
+	for k, v := range snap.TokensByDay {
+		if v > s.tokensByDay[k] {
+			s.tokensByDay[k] = v
+		}
+	}
+	// Restore per-(apiKey,model) counter view so /usage and the management
+	// UI can show model totals immediately. We do not recreate Details; the
+	// rotating rings carry the time-windowed information.
+	if len(snap.ModelTotals) > 0 {
+		if s.apis == nil {
+			s.apis = make(map[string]*apiStats, len(snap.ModelTotals))
+		}
+		for apiName, api := range snap.ModelTotals {
+			existing, ok := s.apis[apiName]
+			if !ok || existing == nil {
+				existing = &apiStats{Models: make(map[string]*modelStats, len(api.Models))}
+				s.apis[apiName] = existing
+			}
+			if api.TotalRequests > existing.TotalRequests {
+				existing.TotalRequests = api.TotalRequests
+			}
+			if api.TotalTokens > existing.TotalTokens {
+				existing.TotalTokens = api.TotalTokens
+			}
+			for modelName, m := range api.Models {
+				ms, ok := existing.Models[modelName]
+				if !ok || ms == nil {
+					ms = &modelStats{}
+					existing.Models[modelName] = ms
+				}
+				if m.TotalRequests > ms.TotalRequests {
+					ms.TotalRequests = m.TotalRequests
+				}
+				if m.TotalTokens > ms.TotalTokens {
+					ms.TotalTokens = m.TotalTokens
+				}
+			}
+		}
+	}
+	s.mu.Unlock()
+
+	// Restore the rotating rings outside the main lock so concurrent ingest
+	// does not stall behind a slow restore.
+	s.restoreRingFromSeed(s.bucketRing5m, snap.RingSeed5m)
+	s.restoreRingFromSeed(s.bucketRing1h, snap.RingSeed1h)
+}
+
+// restoreRingFromSeed copies a RingSeed's bucket counters into the live
+// ring without disturbing the live rotate-head semantics. The seed's
+// bucket sizes must match the live ring's; otherwise the seed is ignored
+// (a version mismatch from a config change should not corrupt runtime).
+func (s *RequestStatistics) restoreRingFromSeed(r *BucketRing, seed *RingSeed) {
+	if r == nil || seed == nil || len(seed.Buckets) == 0 {
+		return
+	}
+	if r.BucketSize().Milliseconds() != seed.BucketSizeMs {
+		return
+	}
+	if len(seed.Buckets) != r.BucketCount() {
+		return
+	}
+	r.RestoreFromSeed(seed.StartTimeMs, seed.HeadIndex, seed.Buckets)
+}
+
+// ApplyRecentEvents re-populates the RecentBuffer ring from a persisted
+// snapshot. Events are pushed in order so the LastID matches the highest
+// event ID in the buffer after this call returns.
+func (s *RequestStatistics) ApplyRecentEvents(events []UsageEvent) {
+	if s == nil || len(events) == 0 {
+		return
+	}
+	for _, e := range events {
+		s.recent.Push(e)
+		if e.ID > 0 {
+			for {
+				cur := s.nextEventID.Load()
+				if e.ID <= cur || s.nextEventID.CompareAndSwap(cur, e.ID) {
+					break
+				}
+			}
+		}
+	}
+}
+
+// RecentEventsSnapshot returns the current ring buffer contents for
+// persistence.
+func (s *RequestStatistics) RecentEventsSnapshot() RecentEventsSnapshot {
+	events := s.recent.Events()
+	if events == nil {
+		events = []UsageEvent{}
+	}
+	return RecentEventsSnapshot{Version: 1, Events: events}
 }
 
 // RecentSince returns events with id > sinceID from the ring buffer.
