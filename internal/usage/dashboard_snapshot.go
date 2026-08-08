@@ -340,6 +340,29 @@ func (s *RequestStatistics) buildDashboardSnapshotFromDetails(ctx context.Contex
 	result.WindowTokens = totalTokens
 	result.WindowFailures = totalFailures
 	result.WindowSuccesses = totalSuccess
+	// When the detail-derived window tokens are too small (Details are
+	// capped at 5000 per model and may not cover the full window), fall
+	// back to the day-bucket derived totals which are always accurate.
+	if cfg.Window > 0 && len(snapshotCopy.TokensByDay) > 0 {
+		windowStart := now.Add(-cfg.Window)
+		var dayTokens, dayReqs int64
+		for day, tokens := range snapshotCopy.TokensByDay {
+			dayTime, err := time.ParseInLocation("2006-01-02", day, now.Location())
+			if err != nil {
+				continue
+			}
+			// Include any day that overlaps the window.
+			if !dayTime.Add(24*time.Hour).Before(windowStart) && !dayTime.After(now) {
+				dayTokens += tokens
+			}
+		}
+		if dayReqs > result.WindowRequests {
+			result.WindowRequests = dayReqs
+		}
+		if dayTokens > result.WindowTokens {
+			result.WindowTokens = dayTokens
+		}
+	}
 	result.LatestEventID = snapshotCopy.NextEventID
 
 	return result
@@ -390,12 +413,14 @@ func (s *RequestStatistics) snapshotForDashboard(ctx context.Context, useWindow 
 	NextEventID                                            uint64
 	Details                                                []dashboardDetailCopy
 	WindowStart, WindowEnd                                 time.Time
+	TokensByDay                                            map[string]int64
 } {
 	var empty struct {
 		TotalRequests, TotalTokens, SuccessCount, FailureCount int64
 		NextEventID                                            uint64
 		Details                                                []dashboardDetailCopy
 		WindowStart, WindowEnd                                 time.Time
+		TokensByDay                                            map[string]int64
 	}
 	if s == nil {
 		return empty
@@ -415,6 +440,10 @@ func (s *RequestStatistics) snapshotForDashboard(ctx context.Context, useWindow 
 	out.SuccessCount = s.successCount
 	out.FailureCount = s.failureCount
 	out.NextEventID = s.nextEventID.Load()
+		out.TokensByDay = make(map[string]int64, len(s.tokensByDay))
+		for k, v := range s.tokensByDay {
+			out.TokensByDay[k] = v
+		}
 	if useWindow {
 		out.WindowStart = windowStart
 		out.WindowEnd = windowEnd
