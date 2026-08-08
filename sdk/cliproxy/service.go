@@ -835,6 +835,10 @@ func (s *Service) initializeUsagePersistence(cfg *config.Config) {
 		log.WithError(err).Warn("failed to initialize usage statistics persistence")
 		return
 	}
+	if internalusage.GetRequestStatistics().TotalTokens() > 0 {
+		log.Debug("usage statistics already loaded from primary store, skipping fallback merge")
+		return
+	}
 	if restored, err := restoreUsagePersistenceFallbacks(dirs[1:]); err != nil {
 		log.WithError(err).Warn("failed to restore fallback usage statistics")
 	} else if restored {
