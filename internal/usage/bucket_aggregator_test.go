@@ -105,6 +105,40 @@ func TestBucketRing_AdvanceForwardKeepsBucketsMonotonic(t *testing.T) {
 	}
 }
 
+func TestBucketRing_IncrementalAdvanceKeepsDataInItsTimeBucket(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	r := NewBucketRing(4, time.Minute, now)
+	r.Record(now.Add(-2*time.Minute+10*time.Second), "old", "", 10, false, 20)
+	r.Record(now.Add(time.Minute+10*time.Second), "new", "", 20, true, 40)
+
+	snap := r.ReadSnapshot()
+	want := map[time.Time]struct {
+		requests int64
+		tokens   int64
+	}{
+		now.Add(-2 * time.Minute): {requests: 1, tokens: 10},
+		now.Add(time.Minute):      {requests: 1, tokens: 20},
+	}
+	for _, bucket := range snap.Buckets {
+		expected, ok := want[bucket.StartTime]
+		if !ok {
+			if bucket.Requests != 0 || bucket.Tokens != 0 {
+				t.Fatalf("unexpected data in bucket %v: %+v", bucket.StartTime, bucket)
+			}
+			continue
+		}
+		if bucket.Requests != expected.requests || bucket.Tokens != expected.tokens {
+			t.Fatalf("bucket %v = %d requests/%d tokens, want %d/%d",
+				bucket.StartTime,
+				bucket.Requests,
+				bucket.Tokens,
+				expected.requests,
+				expected.tokens,
+			)
+		}
+	}
+}
+
 func TestBucketRing_RestoreFromSeed(t *testing.T) {
 	origin := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
 	r := NewBucketRing(4, time.Minute, origin)
@@ -127,6 +161,9 @@ func TestBucketRing_RestoreFromSeed(t *testing.T) {
 	if got.Buckets[0].Requests != snap.Buckets[0].Requests {
 		t.Fatalf("oldest bucket requests = %d, want %d", got.Buckets[0].Requests, snap.Buckets[0].Requests)
 	}
+	if got.HeadIndex != len(got.Buckets)-1 {
+		t.Fatalf("head index = %d, want newest physical slot %d", got.HeadIndex, len(got.Buckets)-1)
+	}
 }
 
 func TestRequestStatistics_AggregateRoundTripRestoresRingsAndModels(t *testing.T) {
@@ -139,6 +176,8 @@ func TestRequestStatistics_AggregateRoundTripRestoresRingsAndModels(t *testing.T
 		APIKey: "k", Model: "m",
 		Detail:      coreusage.Detail{TotalTokens: 100},
 		RequestedAt: now.Add(-30 * time.Second),
+		Failed:      true,
+		Latency:     250 * time.Millisecond,
 	})
 	s.Record(context.Background(), coreusage.Record{
 		APIKey: "k", Model: "m2",
@@ -168,6 +207,50 @@ func TestRequestStatistics_AggregateRoundTripRestoresRingsAndModels(t *testing.T
 	}
 	if total == 0 {
 		t.Fatalf("expected some buckets to have requests after restore, got %d", total)
+	}
+	var restoredModel *RingModelAgg
+	for _, bucket := range got.Buckets {
+		for i := range bucket.Models {
+			if bucket.Models[i].Model == "m" {
+				model := bucket.Models[i]
+				restoredModel = &model
+			}
+		}
+	}
+	if restoredModel == nil {
+		t.Fatal("expected restored model breakdown")
+	}
+	if restoredModel.Failures != 1 || restoredModel.LatencySum != 250 || restoredModel.LatencyN != 1 {
+		t.Fatalf("restored model breakdown = %+v, want failure and latency fields", *restoredModel)
+	}
+}
+
+func TestRequestStatistics_Version1AggregateSeedIsIgnored(t *testing.T) {
+	now := time.Now()
+	s := NewRequestStatistics()
+	seed := AggregateSnapshot{
+		Version:       1,
+		TotalRequests: 1,
+		TotalTokens:   10,
+		RingSeed5m: &RingSeed{
+			BucketSizeMs: (5 * time.Minute).Milliseconds(),
+			HeadIndex:    0,
+			StartTimeMs:  now.Add(-55 * time.Minute).Truncate(5 * time.Minute).UnixMilli(),
+			Buckets:      make([]RingSeedBucket, 12),
+		},
+	}
+	for i := range seed.RingSeed5m.Buckets {
+		seed.RingSeed5m.Buckets[i].StartTimeMs = time.UnixMilli(seed.RingSeed5m.StartTimeMs).
+			Add(time.Duration(i) * 5 * time.Minute).
+			UnixMilli()
+		seed.RingSeed5m.Buckets[i].Requests = 99
+	}
+
+	s.ApplyAggregateSnapshot(seed)
+	for _, bucket := range s.BucketRing5m().ReadSnapshot().Buckets {
+		if bucket.Requests != 0 {
+			t.Fatalf("version 1 seed should be ignored, got bucket %+v", bucket)
+		}
 	}
 }
 

@@ -130,7 +130,7 @@ func filterUsageSnapshotByWindow(snapshot usage.StatisticsSnapshot, start, end t
 		// (dayTime+24h) is after the window start. This keeps partial-day
 		// windows (e.g. 24h spanning two days) from dropping an entire day
 		// when the window starts mid-day.
-		if !dayTime.Add(24*time.Hour).Before(start) && !dayTime.After(end) {
+		if dayTime.Add(24*time.Hour).After(start) && !dayTime.After(end) {
 			result.RequestsByDay[k] = v
 		}
 	}
@@ -139,29 +139,9 @@ func filterUsageSnapshotByWindow(snapshot usage.StatisticsSnapshot, start, end t
 		if err != nil {
 			continue
 		}
-		if !dayTime.Add(24*time.Hour).Before(start) && !dayTime.After(end) {
+		if dayTime.Add(24*time.Hour).After(start) && !dayTime.After(end) {
 			result.TokensByDay[k] = v
 		}
-	}
-	for k, v := range snapshot.RequestsByHour {
-		hourInt, err := strconv.Atoi(k)
-		if err != nil {
-			continue
-		}
-		if hourInt < 0 || hourInt > 23 {
-			continue
-		}
-		result.RequestsByHour[k] = v
-	}
-	for k, v := range snapshot.TokensByHour {
-		hourInt, err := strconv.Atoi(k)
-		if err != nil {
-			continue
-		}
-		if hourInt < 0 || hourInt > 23 {
-			continue
-		}
-		result.TokensByHour[k] = v
 	}
 	// Save the day-bucket-derived totals separately. The detail loop
 	// below also accumulates into result.TotalRequests/Tokens; at the
@@ -479,8 +459,8 @@ func (h *Handler) GetUsageDashboard(c *gin.Context) {
 
 // dashboardComputeETag derives a stable ETag from the cheap counters that
 // change on every request plus a coarse-grained timestamp. It deliberately
-// ignores LatestEventID (which is a 53-bit hash that changes per ingest and
-// would invalidate the tag on every single request) and the heavy fields
+// ignores LatestEventID (which changes per ingest and would invalidate the tag
+// on every single request) and the heavy fields
 // (flow_buckets, model_top). The 30s-aligned timestamp means the tag stays
 // stable for 30s while the cheap counters hold, giving the client a usable
 // 304 window without forcing it to refetch the full payload on every poll.

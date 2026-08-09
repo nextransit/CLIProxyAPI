@@ -155,17 +155,10 @@ func (s *RequestStatistics) buildDashboardSnapshotFromDetails(ctx context.Contex
 		}
 	}
 
-	// Record the window we're about to filter by so the locked phase can use
-	// it without re-reading cfg. Done before locking so the value is visible
-	// to the locked snapshot helper that follows.
-	if cfg.Window > 0 {
-		s.lastDashboardWindow = cfg.Window
-	}
-
 	// Locked phase: copy aggregates + per-detail slices under RLock. Avoid
 	// running any heavy compute while holding the lock — ingest (Record)
 	// blocks on the matching write Lock until we return.
-	snapshotCopy := s.snapshotForDashboard(ctx, cfg.Window > 0, now)
+	snapshotCopy := s.snapshotForDashboard(ctx, cfg.Window, now)
 	if ctx.Err() != nil {
 		return result // zero-valued LatestRequests; handler decides 503
 	}
@@ -343,9 +336,18 @@ func (s *RequestStatistics) buildDashboardSnapshotFromDetails(ctx context.Contex
 	// When the detail-derived window tokens are too small (Details are
 	// capped at 5000 per model and may not cover the full window), fall
 	// back to the day-bucket derived totals which are always accurate.
-	if cfg.Window > 0 && len(snapshotCopy.TokensByDay) > 0 {
+	if cfg.Window >= 24*time.Hour && len(snapshotCopy.TokensByDay) > 0 {
 		windowStart := now.Add(-cfg.Window)
 		var dayTokens, dayReqs int64
+		for day, requests := range snapshotCopy.RequestsByDay {
+			dayTime, err := time.ParseInLocation("2006-01-02", day, now.Location())
+			if err != nil {
+				continue
+			}
+			if !dayTime.Add(24*time.Hour).Before(windowStart) && !dayTime.After(now) {
+				dayReqs += requests
+			}
+		}
 		for day, tokens := range snapshotCopy.TokensByDay {
 			dayTime, err := time.ParseInLocation("2006-01-02", day, now.Location())
 			if err != nil {
@@ -368,11 +370,12 @@ func (s *RequestStatistics) buildDashboardSnapshotFromDetails(ctx context.Contex
 	return result
 }
 
-// detailEventID returns a stable per-request identifier used by the SSE
-// replay protocol. FNV-1a over request_id keeps things deterministic across
-// processes; falling back to the timestamp when request_id is missing still
-// yields a unique value because each detail carries a distinct timestamp.
+// detailEventID returns the persisted monotonic event ID when available.
+// Request ID and timestamp hashes are legacy fallbacks for older snapshots.
 func detailEventID(detail RequestDetail, apiName, modelName string) uint64 {
+	if detail.EventID > 0 {
+		return detail.EventID
+	}
 	if detail.RequestID != "" {
 		return fnvHash(detail.RequestID)
 	}
@@ -397,6 +400,8 @@ func fnvHash(s string) uint64 {
 type dashboardDetailCopy struct {
 	APIKey     string
 	Model      string
+	EventID    uint64
+	RequestID  string
 	Timestamp  time.Time
 	LatencyMs  int64
 	Failed     bool
@@ -408,11 +413,12 @@ type dashboardDetailCopy struct {
 // snapshotForDashboard returns a thread-safe point-in-time view of the data
 // the unlocked dashboard aggregation phase needs. RLock only; never call
 // ingest while holding the returned slice.
-func (s *RequestStatistics) snapshotForDashboard(ctx context.Context, useWindow bool, now time.Time) struct {
+func (s *RequestStatistics) snapshotForDashboard(ctx context.Context, window time.Duration, now time.Time) struct {
 	TotalRequests, TotalTokens, SuccessCount, FailureCount int64
 	NextEventID                                            uint64
 	Details                                                []dashboardDetailCopy
 	WindowStart, WindowEnd                                 time.Time
+	RequestsByDay                                          map[string]int64
 	TokensByDay                                            map[string]int64
 } {
 	var empty struct {
@@ -420,6 +426,7 @@ func (s *RequestStatistics) snapshotForDashboard(ctx context.Context, useWindow 
 		NextEventID                                            uint64
 		Details                                                []dashboardDetailCopy
 		WindowStart, WindowEnd                                 time.Time
+		RequestsByDay                                          map[string]int64
 		TokensByDay                                            map[string]int64
 	}
 	if s == nil {
@@ -429,9 +436,9 @@ func (s *RequestStatistics) snapshotForDashboard(ctx context.Context, useWindow 
 	defer s.mu.RUnlock()
 
 	var windowStart, windowEnd time.Time
-	if useWindow {
+	if window > 0 {
 		windowEnd = now
-		windowStart = now.Add(-s.lastDashboardWindow)
+		windowStart = now.Add(-window)
 	}
 
 	out := empty
@@ -440,11 +447,15 @@ func (s *RequestStatistics) snapshotForDashboard(ctx context.Context, useWindow 
 	out.SuccessCount = s.successCount
 	out.FailureCount = s.failureCount
 	out.NextEventID = s.nextEventID.Load()
-		out.TokensByDay = make(map[string]int64, len(s.tokensByDay))
-		for k, v := range s.tokensByDay {
-			out.TokensByDay[k] = v
-		}
-	if useWindow {
+	out.RequestsByDay = make(map[string]int64, len(s.requestsByDay))
+	for k, v := range s.requestsByDay {
+		out.RequestsByDay[k] = v
+	}
+	out.TokensByDay = make(map[string]int64, len(s.tokensByDay))
+	for k, v := range s.tokensByDay {
+		out.TokensByDay[k] = v
+	}
+	if window > 0 {
 		out.WindowStart = windowStart
 		out.WindowEnd = windowEnd
 	}
@@ -462,7 +473,7 @@ func (s *RequestStatistics) snapshotForDashboard(ctx context.Context, useWindow 
 				if d.Timestamp.IsZero() {
 					continue
 				}
-				if useWindow && (d.Timestamp.Before(windowStart) || d.Timestamp.After(windowEnd)) {
+				if window > 0 && (d.Timestamp.Before(windowStart) || d.Timestamp.After(windowEnd)) {
 					continue
 				}
 				if d.Timestamp.After(now) {
@@ -471,6 +482,8 @@ func (s *RequestStatistics) snapshotForDashboard(ctx context.Context, useWindow 
 				out.Details = append(out.Details, dashboardDetailCopy{
 					APIKey:     apiName,
 					Model:      modelName,
+					EventID:    d.EventID,
+					RequestID:  d.RequestID,
 					Timestamp:  d.Timestamp,
 					LatencyMs:  d.LatencyMs,
 					Failed:     d.Failed,
@@ -485,70 +498,85 @@ func (s *RequestStatistics) snapshotForDashboard(ctx context.Context, useWindow 
 }
 
 // detailEventIDFor is the lockless variant that runs against the trimmed
-// snapshot. Mirrors detailEventID's FNV-1a fallback behavior when RequestID is
-// missing — timestamps are unique per detail, so the hash stays deterministic.
+// snapshot. Mirrors detailEventID's legacy fallback behavior.
 func detailEventIDFor(d dashboardDetailCopy) uint64 {
+	if d.EventID > 0 {
+		return d.EventID
+	}
+	if d.RequestID != "" {
+		return fnvHash(d.RequestID)
+	}
 	return fnvHash(d.APIKey + "/" + d.Model + "/" + d.Timestamp.UTC().Format(time.RFC3339Nano))
 }
 
-// tryBuildDashboardFromRing returns (snapshot, true) when cfg matches one of
-// the pre-aggregated rotating rings (5min/1h with their default sizes). It
-// also returns true for a sub-window of those rings (smaller cfg.BucketCount)
-// when the requested window falls entirely inside the ring's coverage, which
-// is the common case. Otherwise it returns (zero, false) and the caller falls
-// back to the legacy detail walk.
+// tryBuildDashboardFromRing combines the configured flow ring with the
+// smallest aggregate ring that covers cfg.Window. The default dashboard uses
+// 5-minute flow buckets and the 1-hour ring for its 24-hour totals.
 func (s *RequestStatistics) tryBuildDashboardFromRing(ctx context.Context, cfg DashboardConfig) (DashboardSnapshot, bool) {
-	var ring *BucketRing
-	windowCoverage := cfg.BucketCount * int(cfg.BucketSize/time.Second)
+	var flowRing *BucketRing
 	switch {
 	case cfg.BucketSize == 5*time.Minute && cfg.BucketCount <= 12:
-		ring = s.bucketRing5m
+		flowRing = s.bucketRing5m
 	case cfg.BucketSize == time.Hour && cfg.BucketCount <= 24:
-		ring = s.bucketRing1h
+		flowRing = s.bucketRing1h
 	default:
 		return DashboardSnapshot{}, false
 	}
-	if ring == nil {
+	if flowRing == nil || cfg.Window <= 0 {
 		return DashboardSnapshot{}, false
 	}
 	if cfg.ModelTopN <= 0 || cfg.LatestCount <= 0 {
 		return DashboardSnapshot{}, false
 	}
-	// If the caller asked for a window larger than the ring coverage (or no
-	// window at all), the ring cannot answer; fall back to the detail walk.
-	ringWindow := ring.BucketSize() * time.Duration(ring.BucketCount())
-	if cfg.Window == 0 || cfg.Window > ringWindow {
+
+	var aggregateRing *BucketRing
+	switch {
+	case cfg.Window <= time.Hour:
+		aggregateRing = s.bucketRing5m
+	case cfg.Window <= 24*time.Hour:
+		aggregateRing = s.bucketRing1h
+	default:
 		return DashboardSnapshot{}, false
 	}
-	_ = windowCoverage
+	if aggregateRing == nil {
+		return DashboardSnapshot{}, false
+	}
 
 	now := time.Now()
-	snap := ring.ReadSnapshot()
+	flowSnapshot := flowRing.ReadSnapshot()
+	aggregateSnapshot := flowSnapshot
+	if aggregateRing != flowRing {
+		aggregateSnapshot = aggregateRing.ReadSnapshot()
+	}
 	if ctx.Err() != nil {
 		return DashboardSnapshot{}, false
 	}
-
-	// Pick the most recent cfg.BucketCount buckets from the ring.
-	if cfg.BucketCount > len(snap.Buckets) {
+	if cfg.BucketCount > len(flowSnapshot.Buckets) {
 		return DashboardSnapshot{}, false
 	}
-	startIdx := len(snap.Buckets) - cfg.BucketCount
-	selected := snap.Buckets[startIdx:]
+	flowStart := len(flowSnapshot.Buckets) - cfg.BucketCount
+	flowBuckets := flowSnapshot.Buckets[flowStart:]
+	windowStart := now.Add(-cfg.Window)
+	windowBuckets := make([]RingBucket, 0, len(aggregateSnapshot.Buckets))
+	for _, bucket := range aggregateSnapshot.Buckets {
+		if bucket.StartTime.Add(aggregateSnapshot.BucketSize).After(windowStart) &&
+			!bucket.StartTime.After(now) {
+			windowBuckets = append(windowBuckets, bucket)
+		}
+	}
 
 	result := DashboardSnapshot{
 		GeneratedAt:   now,
 		BucketCount:   cfg.BucketCount,
 		BucketSizeMs:  cfg.BucketSize.Milliseconds(),
-		BucketStartMs: selected[0].StartTime.UnixMilli(),
-	}
-	if cfg.Window > 0 {
-		result.WindowEnd = now
-		result.WindowStart = now.Add(-cfg.Window)
-		result.WindowHours = cfg.Window.Hours()
-		result.WindowSeconds = cfg.Window.Seconds()
+		BucketStartMs: flowBuckets[0].StartTime.UnixMilli(),
+		WindowEnd:     now,
+		WindowStart:   windowStart,
+		WindowHours:   cfg.Window.Hours(),
+		WindowSeconds: cfg.Window.Seconds(),
 	}
 	result.FlowBuckets = make([]DashboardFlowBucket, cfg.BucketCount)
-	for i, b := range selected {
+	for i, b := range flowBuckets {
 		result.FlowBuckets[i] = DashboardFlowBucket{
 			Index:        i,
 			StartMs:      b.StartTime.UnixMilli(),
@@ -564,13 +592,13 @@ func (s *RequestStatistics) tryBuildDashboardFromRing(ctx context.Context, cfg D
 		}
 	}
 
-	// Aggregate model breakdown across the selected buckets.
+	// Aggregate model breakdown across the requested window buckets.
 	type modelAgg struct {
 		requests, tokens, failures, latencySum, latencyN int64
 	}
 	modelMap := map[string]*modelAgg{}
 	var totalRequests, totalTokens, totalFailures, totalSuccess int64
-	for _, b := range selected {
+	for _, b := range windowBuckets {
 		totalRequests += b.Requests
 		totalTokens += b.Tokens
 		totalFailures += b.Failures
@@ -636,12 +664,14 @@ func (s *RequestStatistics) tryBuildDashboardFromRing(ctx context.Context, cfg D
 		}
 	}
 
-	// Latest N requests: still served from the RecentBuffer (already in
-	// memory, ring-driven). The ring aggregator does not retain individual
-	// events; pulling the latest 7 from RecentBuffer stays O(1) and avoids
-	// a second scan of details.
+	// Latest N requests come from the bounded recent-event journal.
 	latest := make([]DashboardLatestRequest, 0, cfg.LatestCount)
-	for _, e := range s.recent.Events() {
+	events := s.recent.Events()
+	for i := len(events) - 1; i >= 0; i-- {
+		e := events[i]
+		if e.RequestedAt.Before(windowStart) || e.RequestedAt.After(now) {
+			continue
+		}
 		if len(latest) >= cfg.LatestCount {
 			break
 		}
@@ -658,21 +688,14 @@ func (s *RequestStatistics) tryBuildDashboardFromRing(ctx context.Context, cfg D
 			TotalTokens:  e.Tokens.Total,
 		})
 	}
-	// Sort newest first.
-	for i := 1; i < len(latest); i++ {
-		for j := i; j > 0; j-- {
-			if latest[j].Timestamp.After(latest[j-1].Timestamp) {
-				latest[j-1], latest[j] = latest[j], latest[j-1]
-			}
-		}
-	}
 	result.LatestRequests = latest
 
-	// Total counters are always available from the cheap in-memory fields.
+	s.mu.RLock()
 	result.TotalRequests = s.totalRequests
 	result.TotalTokens = s.totalTokens
 	result.SuccessCount = s.successCount
 	result.FailureCount = s.failureCount
+	s.mu.RUnlock()
 	if result.TotalRequests > 0 {
 		result.FailureRate = float64(result.FailureCount) / float64(result.TotalRequests)
 	}

@@ -245,3 +245,55 @@ func TestBuildDashboardSnapshot_CtxCancelReturnsImmediately(t *testing.T) {
 		t.Fatalf("WindowRequests = %d after immediate cancel, want 0", snap.WindowRequests)
 	}
 }
+
+func TestBuildDashboardSnapshot_ConcurrentWindowsStayIndependent(t *testing.T) {
+	stats := NewRequestStatistics()
+	now := time.Now()
+	stats.Record(context.Background(), makeRecord(
+		"recent",
+		"auth",
+		"recent",
+		now.Add(-30*time.Minute),
+		10*time.Millisecond,
+		10,
+		false,
+	))
+	stats.Record(context.Background(), makeRecord(
+		"older",
+		"auth",
+		"older",
+		now.Add(-2*time.Hour),
+		10*time.Millisecond,
+		20,
+		false,
+	))
+
+	oneHour := DefaultDashboardConfig()
+	oneHour.BucketCount = 3
+	oneHour.BucketSize = 7 * time.Minute
+	oneHour.Window = time.Hour
+	fullDay := oneHour
+	fullDay.Window = 24 * time.Hour
+
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			snap := stats.BuildDashboardSnapshot(context.Background(), oneHour)
+			if snap.WindowRequests != 1 || snap.WindowTokens != 10 {
+				t.Errorf("1h snapshot = %d requests/%d tokens, want 1/10",
+					snap.WindowRequests, snap.WindowTokens)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			snap := stats.BuildDashboardSnapshot(context.Background(), fullDay)
+			if snap.WindowRequests != 2 || snap.WindowTokens != 30 {
+				t.Errorf("24h snapshot = %d requests/%d tokens, want 2/30",
+					snap.WindowRequests, snap.WindowTokens)
+			}
+		}()
+	}
+	wg.Wait()
+}

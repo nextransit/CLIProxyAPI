@@ -176,6 +176,8 @@ func TestGetUsageStatistics_RestoresSnapshotFromStoreWhenMemoryEmpty(t *testing.
 func TestFilterUsageSnapshotByTimeRange(t *testing.T) {
 	now := time.Date(2026, 5, 31, 12, 0, 0, 0, time.UTC)
 	snapshot := usage.StatisticsSnapshot{
+		RequestsByHour: map[string]int64{"10": 999},
+		TokensByHour:   map[string]int64{"10": 9999},
 		APIs: map[string]usage.APISnapshot{
 			"test-key": {
 				Models: map[string]usage.ModelSnapshot{
@@ -210,12 +212,26 @@ func TestFilterUsageSnapshotByTimeRange(t *testing.T) {
 	if filtered.FailureCount != 0 || filtered.SuccessCount != 1 {
 		t.Fatalf("success/failure = %d/%d, want 1/0", filtered.SuccessCount, filtered.FailureCount)
 	}
+	if got := filtered.RequestsByHour["10"]; got != 1 {
+		t.Fatalf("requests_by_hour[10] = %d, want filtered detail count 1", got)
+	}
+	if got := filtered.TokensByHour["10"]; got != 100 {
+		t.Fatalf("tokens_by_hour[10] = %d, want filtered detail tokens 100", got)
+	}
 }
 
 func TestFilterUsageSnapshotByTimeRangeTodayUsesLocalDay(t *testing.T) {
 	localZone := time.FixedZone("Asia/Shanghai", 8*60*60)
 	now := time.Date(2026, 6, 4, 10, 0, 0, 0, localZone)
 	snapshot := usage.StatisticsSnapshot{
+		RequestsByDay: map[string]int64{
+			"2026-06-03": 7,
+			"2026-06-04": 2,
+		},
+		TokensByDay: map[string]int64{
+			"2026-06-03": 900,
+			"2026-06-04": 300,
+		},
 		APIs: map[string]usage.APISnapshot{
 			"test-key": {
 				Models: map[string]usage.ModelSnapshot{
@@ -255,6 +271,12 @@ func TestFilterUsageSnapshotByTimeRangeTodayUsesLocalDay(t *testing.T) {
 	}
 	if got := filtered.TokensByDay["2026-06-04"]; got != 300 {
 		t.Fatalf("tokens_by_day[2026-06-04] = %d, want 300", got)
+	}
+	if _, ok := filtered.RequestsByDay["2026-06-03"]; ok {
+		t.Fatal("requests_by_day unexpectedly includes previous local day")
+	}
+	if _, ok := filtered.TokensByDay["2026-06-03"]; ok {
+		t.Fatal("tokens_by_day unexpectedly includes previous local day")
 	}
 }
 

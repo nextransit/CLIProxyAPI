@@ -4,9 +4,11 @@ package usage
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"time"
 
@@ -79,8 +81,7 @@ func (s *FileStore) Save(snapshot StatisticsSnapshot) error {
 		return fmt.Errorf("failed to write temporary file: %w", err)
 	}
 
-	// Atomic rename
-	if err := os.Rename(tmpFile, s.filePath); err != nil {
+	if err := replaceFile(tmpFile, s.filePath); err != nil {
 		os.Remove(tmpFile)
 		return fmt.Errorf("failed to rename file: %w", err)
 	}
@@ -119,18 +120,14 @@ func (s *FileStore) Path() string {
 
 // PersistentLoggerPlugin extends LoggerPlugin with persistence capabilities.
 //
-// Persistence is split into two on-disk files for cheap, bounded saves:
+// Persistence uses three on-disk files:
 //
 //   - aggregates store (usage_aggregates.json): the cheap counters plus
 //     day-bucketed aggregates, no per-request Details. KB-scale.
 //   - recent-events store (usage_recent_events.json): the small ring buffer
 //     that powers SSE replay on reconnect. Bounded by the buffer size.
-//
-// A legacy file-backed Store (FileStore, usage_statistics.snapshot) is
-// still supported for reads so existing installations keep working, but
-// new writes go through the aggregate path. Loading from the legacy
-// snapshot falls back to MergeSnapshot which scans Details and is slow on
-// large histories; new installations skip this path entirely.
+//   - full snapshot store (usage_statistics.snapshot): retained per-request
+//     Details used to restore the management table after a restart.
 type PersistentLoggerPlugin struct {
 	*LoggerPlugin
 	store          Store
@@ -149,8 +146,7 @@ func NewPersistentLoggerPlugin(store Store) *PersistentLoggerPlugin {
 }
 
 // AttachAggregateStores wires the lightweight aggregate + recent-events
-// stores. Both are optional; when set, Save/Load prefer them over the
-// legacy full snapshot path.
+// stores. Both are optional.
 func (p *PersistentLoggerPlugin) AttachAggregateStores(agg *AggregateFileStore, recent *RecentEventsFileStore) {
 	p.aggregateStore = agg
 	p.recentStore = recent
@@ -166,7 +162,7 @@ func (p *PersistentLoggerPlugin) StartAutoSave() {
 			select {
 			case <-ticker.C:
 				if err := p.Save(); err != nil {
-					log.WithError(err).Debug("failed to auto-save usage statistics")
+					log.WithError(err).Warn("failed to auto-save usage statistics")
 				}
 			case <-p.stopChan:
 				return
@@ -180,52 +176,48 @@ func (p *PersistentLoggerPlugin) Stop() {
 	close(p.stopChan)
 }
 
-// Save persists current statistics to storage using the cheapest available
-// path. When aggregate + recent-events stores are attached (the common
-// case), Save writes only the aggregate counters and the small recent-
-// events ring. The legacy full snapshot is still written as a best-effort
-// fallback when no aggregate store is attached.
+// Save persists aggregate counters, the recent-event journal, and the retained
+// per-request Details. The full snapshot is intentionally kept because the
+// management request table cannot be reconstructed from aggregate counters.
 func (p *PersistentLoggerPlugin) Save() error {
 	if p.stats == nil {
 		return nil
 	}
 
+	var saveErrors []error
 	if p.aggregateStore != nil {
 		agg := p.stats.AggregateSnapshot()
 		if err := p.aggregateStore.Save(agg); err != nil {
-			return fmt.Errorf("aggregate save: %w", err)
+			saveErrors = append(saveErrors, fmt.Errorf("aggregate save: %w", err))
 		}
 		if p.recentStore != nil {
 			evt := p.stats.RecentEventsSnapshot()
 			if err := p.recentStore.Save(evt); err != nil {
-				return fmt.Errorf("recent events save: %w", err)
+				saveErrors = append(saveErrors, fmt.Errorf("recent events save: %w", err))
 			}
 		}
 	}
-	// Also save the legacy full snapshot when a legacy store is attached.
-	// This keeps the existing ImportUsageStatistics test contract (which
-	// injects a stub store via SetUsageStore) and provides a recovery path
-	// for installations that still depend on the legacy file.
 	if p.store != nil {
 		snapshot := p.stats.Snapshot()
 		if err := p.store.Save(snapshot); err != nil {
-			return err
+			saveErrors = append(saveErrors, fmt.Errorf("retained details save: %w", err))
 		}
 	}
+	if len(saveErrors) > 0 {
+		return errors.Join(saveErrors...)
+	}
 	if p.aggregateStore != nil {
-		log.Debugf("usage statistics saved (aggregates + recent events) to %s", p.aggregateStore.Path())
+		log.Debugf("usage statistics saved (aggregates + recent events + retained details) to %s", p.aggregateStore.Path())
 	} else if p.store != nil {
 		log.Debugf("usage statistics saved to %s", p.store.Path())
 	}
 	return nil
 }
 
-// Load restores statistics from storage. Order of preference:
-//  1. AggregateFileStore (cheap counters + RingSeed + ModelTotals).
-//  2. RecentEventsFileStore (SSE replay ring).
-//  3. Legacy StatisticsSnapshot (apis/models/Details). Used both as a
-//     counter source and as the source of per-request timestamps that
-//     refill the rotating rings when no RingSeed is available.
+// Load restores statistics from storage. When aggregate data exists, it is
+// authoritative for counters and ring seeds; the legacy snapshot contributes
+// only per-request Details. This prevents stale or previously double-counted
+// legacy totals from replacing the bounded aggregate view.
 //
 // The legacy path is the safe default for installations upgrading from
 // before the aggregate file existed: it costs O(detailCount) at startup
@@ -236,56 +228,63 @@ func (p *PersistentLoggerPlugin) Load() error {
 		return nil
 	}
 
-	legacySnapshot, err := p.loadLegacySnapshot()
-	if err != nil {
-		return err
+	legacySnapshot, legacyErr := p.loadLegacySnapshot()
+	if legacyErr != nil {
+		log.WithError(legacyErr).Warn("failed to load retained usage details")
+		legacySnapshot = nil
 	}
+	legacyLoaded := legacySnapshot != nil &&
+		(legacySnapshot.TotalRequests > 0 || legacySnapshot.TotalTokens > 0 || len(legacySnapshot.APIs) > 0)
 
 	if p.aggregateStore != nil {
-		agg, err := p.aggregateStore.Load()
-		if err != nil {
-			return err
+		agg, aggregateErr := p.aggregateStore.Load()
+		if aggregateErr != nil {
+			log.WithError(aggregateErr).Warn("failed to load usage aggregates")
 		}
-		if agg.TotalRequests > 0 || agg.TotalTokens > 0 {
+		aggregateLoaded := aggregateErr == nil &&
+			(agg.TotalRequests > 0 || agg.TotalTokens > 0 || len(agg.ModelTotals) > 0)
+		if aggregateLoaded {
 			p.stats.ApplyAggregateSnapshot(agg)
-		}
-		// When the aggregate snapshot lacks RingSeed data (older files)
-		// or the rings end up empty after restore, fall back to the
-		// legacy details to repopulate the dashboard buckets.
-		if ringsEmpty(p.stats) {
-			if legacySnapshot != nil {
-				p.stats.RestoreFromLegacySnapshot(*legacySnapshot)
-				log.Infof("restored usage statistics from aggregates + legacy details: %d requests, %d tokens",
-					agg.TotalRequests, agg.TotalTokens)
-			} else {
-				log.Infof("restored usage statistics from aggregates (no ring data): %d requests, %d tokens",
-					agg.TotalRequests, agg.TotalTokens)
+			if legacyLoaded {
+				p.stats.RestoreDetailsFromLegacySnapshot(*legacySnapshot, ringsEmpty(p.stats))
 			}
+			log.Infof("restored usage statistics from aggregates + legacy details: %d requests, %d tokens",
+				p.stats.TotalRequests(), p.stats.TotalTokens())
+		} else if legacyLoaded {
+			p.stats.RestoreFromLegacySnapshot(*legacySnapshot)
+			log.Infof("restored usage statistics from legacy snapshot (rings rebuilt): %d requests, %d tokens",
+				p.stats.TotalRequests(), p.stats.TotalTokens())
 		} else {
-			log.Infof("restored usage statistics from aggregates (rings seeded): %d requests, %d tokens",
-				agg.TotalRequests, agg.TotalTokens)
+			if aggregateErr != nil {
+				return aggregateErr
+			}
+			if legacyErr != nil {
+				return legacyErr
+			}
+			log.Debug("no previous usage statistics found")
 		}
 		if p.recentStore != nil {
 			evt, err := p.recentStore.Load()
-			if err == nil && len(evt.Events) > 0 {
+			if err != nil {
+				log.WithError(err).Warn("failed to load recent usage events")
+			} else if len(evt.Events) > 0 {
 				p.stats.ApplyRecentEvents(evt.Events)
+				p.stats.RestoreDetailsFromRecentEvents(evt.Events)
 			}
 		}
 		return nil
 	}
 
-	if legacySnapshot == nil {
-		return nil
-	}
-	if legacySnapshot.TotalRequests == 0 && legacySnapshot.TotalTokens == 0 {
+	if !legacyLoaded {
+		if legacyErr != nil {
+			return legacyErr
+		}
 		log.Debug("no previous usage statistics found")
 		return nil
 	}
-	// No aggregate file: apply legacy snapshot directly. This rebuilds
-	// rings from the per-request details and also rehydrates apis/models.
 	p.stats.RestoreFromLegacySnapshot(*legacySnapshot)
 	log.Infof("restored usage statistics from legacy snapshot (rings rebuilt): %d requests, %d tokens",
-		legacySnapshot.TotalRequests, legacySnapshot.TotalTokens)
+		p.stats.TotalRequests(), p.stats.TotalTokens())
 	return nil
 }
 
@@ -303,24 +302,18 @@ func (p *PersistentLoggerPlugin) loadLegacySnapshot() (*StatisticsSnapshot, erro
 }
 
 // ringsEmpty reports whether both pre-aggregated rings currently carry no
-// traffic. It is used to decide whether the legacy details need to refill
-// the rings after the aggregate restore.
+// traffic. It is used to decide whether legacy details need to refill rings
+// when the aggregate snapshot predates ring seeds.
 func ringsEmpty(s *RequestStatistics) bool {
 	if s == nil {
 		return true
 	}
-	if ring := s.BucketRing5m(); ring != nil {
-		snap := ring.ReadSnapshot()
-		for _, b := range snap.Buckets {
-			if b.Requests > 0 {
-				return false
-			}
+	for _, ring := range []*BucketRing{s.BucketRing5m(), s.BucketRing1h()} {
+		if ring == nil {
+			continue
 		}
-	}
-	if ring := s.BucketRing1h(); ring != nil {
-		snap := ring.ReadSnapshot()
-		for _, b := range snap.Buckets {
-			if b.Requests > 0 {
+		for _, bucket := range ring.ReadSnapshot().Buckets {
+			if bucket.Requests > 0 {
 				return false
 			}
 		}
@@ -360,10 +353,7 @@ var (
 )
 
 // InitializePersistence sets up persistent storage for usage statistics.
-// It wires the cheap aggregate + recent-events stores so periodic saves do
-// not pay the cost of serializing per-request Details. The legacy
-// full-snapshot store is still constructed for backward-compatible reads
-// from older installations.
+// It wires aggregate, recent-event, and retained-detail stores.
 func InitializePersistence(baseDir string) error {
 	var initErr error
 	storeOnce.Do(func() {
@@ -439,10 +429,14 @@ type APITotals struct {
 	Models        map[string]ModelTotals `json:"models,omitempty"`
 }
 
-// ModelTotals is the per-(apiKey,model) counter view.
+// ModelTotals is the per-(apiKey,model) counter view. The optional window
+// fields are populated for ring-bucket persistence.
 type ModelTotals struct {
 	TotalRequests int64 `json:"total_requests"`
 	TotalTokens   int64 `json:"total_tokens"`
+	Failures      int64 `json:"failures,omitempty"`
+	LatencySum    int64 `json:"latency_sum,omitempty"`
+	LatencyN      int64 `json:"latency_n,omitempty"`
 }
 
 // RingSeed captures the rotating ring buckets at save time.
@@ -524,7 +518,7 @@ func (s *AggregateFileStore) Save(snap AggregateSnapshot) error {
 	if err := os.WriteFile(tmp, data, 0644); err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, s.filePath); err != nil {
+	if err := replaceFile(tmp, s.filePath); err != nil {
 		os.Remove(tmp)
 		return err
 	}
@@ -596,7 +590,7 @@ func (s *RecentEventsFileStore) Save(snap RecentEventsSnapshot) error {
 	if err := os.WriteFile(tmp, data, 0644); err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, s.filePath); err != nil {
+	if err := replaceFile(tmp, s.filePath); err != nil {
 		os.Remove(tmp)
 		return err
 	}
@@ -626,4 +620,16 @@ func (s *RecentEventsFileStore) Path() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.filePath
+}
+
+func replaceFile(tmpPath, targetPath string) error {
+	if err := os.Rename(tmpPath, targetPath); err == nil {
+		return nil
+	} else if runtime.GOOS != "windows" {
+		return err
+	}
+	if err := os.Remove(targetPath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return os.Rename(tmpPath, targetPath)
 }

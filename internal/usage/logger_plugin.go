@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,8 +23,12 @@ type UsageEvent struct {
 	ID          uint64       `json:"id"`
 	APIKey      string       `json:"api_key"`
 	Model       string       `json:"model"`
+	Source      string       `json:"source,omitempty"`
+	AuthIndex   string       `json:"auth_index,omitempty"`
+	RequestID   string       `json:"request_id,omitempty"`
 	Failed      bool         `json:"failed"`
 	Tokens      TokenSummary `json:"tokens"`
+	Thinking    *Thinking    `json:"thinking,omitempty"`
 	RequestedAt time.Time    `json:"requested_at"`
 	DurationMs  int64        `json:"duration_ms"`
 	StatusCode  int          `json:"status_code"`
@@ -31,9 +36,11 @@ type UsageEvent struct {
 
 // TokenSummary captures the token usage breakdown for a single usage event.
 type TokenSummary struct {
-	Input  int64 `json:"input"`
-	Output int64 `json:"output"`
-	Total  int64 `json:"total"`
+	Input     int64 `json:"input"`
+	Output    int64 `json:"output"`
+	Reasoning int64 `json:"reasoning,omitempty"`
+	Cached    int64 `json:"cached,omitempty"`
+	Total     int64 `json:"total"`
 }
 
 // UsagePayload is a minimal subset of the snapshot used for SSE push.
@@ -115,12 +122,6 @@ type RequestStatistics struct {
 	// keeping memory bounded regardless of ingest volume.
 	bucketRing5m *BucketRing
 	bucketRing1h *BucketRing
-
-	// lastDashboardWindow is the most recent window duration used by a
-	// dashboard snapshot request. Read under RLock by the locked phase to
-	// filter detail rows; written without the lock by the unlocked caller
-	// (single-writer, monotonic — last-write-wins is fine).
-	lastDashboardWindow time.Duration
 }
 
 // apiStats holds aggregated metrics for a single API key.
@@ -139,6 +140,7 @@ type modelStats struct {
 
 // RequestDetail stores the timestamp, latency, and token usage for a single request.
 type RequestDetail struct {
+	EventID    uint64     `json:"event_id,omitempty"`
 	Timestamp  time.Time  `json:"timestamp"`
 	LatencyMs  int64      `json:"latency_ms"`
 	Source     string     `json:"source"`
@@ -298,6 +300,9 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	}
 	detail := normaliseDetail(record.Detail)
 	totalTokens := detail.TotalTokens
+	latencyMs := normaliseLatency(record.Latency)
+	requestID := strings.TrimSpace(record.RequestID)
+	thinking := normaliseThinking(record.Detail.Thinking)
 	statsKey := record.APIKey
 	if statsKey == "" {
 		statsKey = resolveAPIIdentifier(ctx, record)
@@ -332,13 +337,14 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 		s.apis[statsKey] = stats
 	}
 	s.updateAPIStats(stats, modelName, RequestDetail{
+		EventID:    id,
 		Timestamp:  timestamp,
-		LatencyMs:  normaliseLatency(record.Latency),
+		LatencyMs:  latencyMs,
 		Source:     record.Source,
 		AuthIndex:  record.AuthIndex,
-		RequestID:  strings.TrimSpace(record.RequestID),
+		RequestID:  requestID,
 		StatusCode: statusCode,
-		Thinking:   normaliseThinking(record.Detail.Thinking),
+		Thinking:   thinking,
 		Tokens:     detail,
 		Failed:     failed,
 	})
@@ -352,24 +358,30 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	// answer dashboard / summary queries in O(bucketCount) instead of
 	// O(totalRequests). We always update both rings; each ring rotates
 	// its own head based on the request timestamp.
-	s.bucketRing5m.Record(timestamp, modelName, record.AuthIndex, totalTokens, failed, normaliseLatency(record.Latency))
-	s.bucketRing1h.Record(timestamp, modelName, record.AuthIndex, totalTokens, failed, normaliseLatency(record.Latency))
+	s.bucketRing5m.Record(timestamp, modelName, record.AuthIndex, totalTokens, failed, latencyMs)
+	s.bucketRing1h.Record(timestamp, modelName, record.AuthIndex, totalTokens, failed, latencyMs)
 
 	// Publish individual UsageEvent to broker for real-time fan-out.
 	// broker.Publish is non-blocking for slow consumers.
 	evt := UsageEvent{
-		ID:     id,
-		APIKey: statsKey,
-		Model:  modelName,
-		Failed: failed,
+		ID:        id,
+		APIKey:    statsKey,
+		Model:     modelName,
+		Source:    record.Source,
+		AuthIndex: record.AuthIndex,
+		RequestID: requestID,
+		Failed:    failed,
 		Tokens: TokenSummary{
-			Input:  detail.InputTokens,
-			Output: detail.OutputTokens,
-			Total:  detail.TotalTokens,
+			Input:     detail.InputTokens,
+			Output:    detail.OutputTokens,
+			Reasoning: detail.ReasoningTokens,
+			Cached:    detail.CachedTokens,
+			Total:     detail.TotalTokens,
 		},
 		RequestedAt: timestamp,
-		DurationMs:  normaliseLatency(record.Latency),
+		DurationMs:  latencyMs,
 		StatusCode:  statusCode,
+		Thinking:    thinking,
 	}
 	s.recent.Push(evt)
 	s.broker.Publish(evt)
@@ -523,25 +535,16 @@ func (s *RequestStatistics) MergeSnapshot(snapshot StatisticsSnapshot) MergeResu
 				modelStatsValue = &modelStats{}
 				stats.Models[modelName] = modelStatsValue
 			}
-			// If this model's current totals already cover the snapshot's
-			// totals, the snapshot's details are either already present or
-			// already represented by the aggregate counters. Skip the detail
-			// import to avoid double-counting when the same snapshot is
-			// merged more than once (the "seen" set is built from the capped
-			// Details slice and cannot catch every duplicate beyond the cap).
-			//
-			// Only apply this shortcut when the snapshot actually carries
-			// aggregate totals (both > 0); a snapshot that only carries
-			// Details (totals zero) must still be imported so the Details are
-			// populated.
-			if (modelSnapshot.TotalRequests > 0 || modelSnapshot.TotalTokens > 0) &&
-				modelStatsValue.TotalRequests >= modelSnapshot.TotalRequests &&
-				modelStatsValue.TotalTokens >= modelSnapshot.TotalTokens {
-				result.Skipped += int64(len(modelSnapshot.Details))
-				s.preserveModelAggregates(stats, modelStatsValue, modelSnapshot)
-				continue
+			details := modelSnapshot.Details
+			if len(details) > defaultModelDetailsCap {
+				result.Skipped += int64(len(details) - defaultModelDetailsCap)
+				details = details[len(details)-defaultModelDetailsCap:]
 			}
-			for _, detail := range modelSnapshot.Details {
+			aggregatesAlreadyCovered :=
+				(modelSnapshot.TotalRequests > 0 || modelSnapshot.TotalTokens > 0) &&
+					modelStatsValue.TotalRequests >= modelSnapshot.TotalRequests &&
+					modelStatsValue.TotalTokens >= modelSnapshot.TotalTokens
+			for _, detail := range details {
 				detail.Tokens = normaliseTokenStats(detail.Tokens)
 				detail.Thinking = normaliseThinkingValue(detail.Thinking)
 				detail.StatusCode = normaliseStatusCode(detail.StatusCode, detail.Failed)
@@ -557,7 +560,19 @@ func (s *RequestStatistics) MergeSnapshot(snapshot StatisticsSnapshot) MergeResu
 					continue
 				}
 				seen[key] = struct{}{}
-				s.recordImported(apiName, modelName, stats, detail)
+				if aggregatesAlreadyCovered {
+					s.appendImportedDetail(modelStatsValue, detail)
+					s.recordIntoRingsOnly(
+						detail.Timestamp,
+						modelName,
+						detail.AuthIndex,
+						detail.Tokens.TotalTokens,
+						detail.Failed,
+						detail.LatencyMs,
+					)
+				} else {
+					s.recordImported(apiName, modelName, stats, detail)
+				}
 				result.Added++
 			}
 			s.preserveModelAggregates(stats, modelStatsValue, modelSnapshot)
@@ -593,6 +608,17 @@ func (s *RequestStatistics) recordImported(apiName, modelName string, stats *api
 	s.requestsByHour[hourKey]++
 	s.tokensByDay[dayKey] += totalTokens
 	s.tokensByHour[hourKey] += totalTokens
+	s.recordIntoRingsOnly(detail.Timestamp, modelName, detail.AuthIndex, totalTokens, detail.Failed, detail.LatencyMs)
+}
+
+func (s *RequestStatistics) appendImportedDetail(model *modelStats, detail RequestDetail) {
+	if model == nil {
+		return
+	}
+	model.Details = append(model.Details, detail)
+	if len(model.Details) > defaultModelDetailsCap {
+		model.Details = model.Details[len(model.Details)-defaultModelDetailsCap:]
+	}
 }
 
 func (s *RequestStatistics) preserveModelAggregates(stats *apiStats, modelStatsValue *modelStats, snapshot ModelSnapshot) {
@@ -701,6 +727,12 @@ func parseHourKey(hour string) int {
 }
 
 func dedupKey(apiName, modelName string, detail RequestDetail) string {
+	if requestID := strings.TrimSpace(detail.RequestID); requestID != "" {
+		return fmt.Sprintf("request|%s|%s|%s", apiName, modelName, requestID)
+	}
+	if detail.EventID > 0 {
+		return fmt.Sprintf("event|%s|%s|%d", apiName, modelName, detail.EventID)
+	}
 	timestamp := detail.Timestamp.UTC().Format(time.RFC3339Nano)
 	tokens := normaliseTokenStats(detail.Tokens)
 	thinking := normaliseThinkingValue(detail.Thinking)
@@ -717,13 +749,14 @@ func dedupKey(apiName, modelName string, detail RequestDetail) string {
 		thinkingLevel = thinking.Level
 	}
 	return fmt.Sprintf(
-		"%s|%s|%s|%s|%s|%t|%d|%d|%d|%d|%d|%s|%s|%s|%d",
+		"%s|%s|%s|%s|%s|%t|%d|%d|%d|%d|%d|%d|%s|%s|%s|%d",
 		apiName,
 		modelName,
 		timestamp,
 		detail.Source,
 		detail.AuthIndex,
 		detail.Failed,
+		detail.StatusCode,
 		tokens.InputTokens,
 		tokens.OutputTokens,
 		tokens.ReasoningTokens,
@@ -888,7 +921,7 @@ func (s *RequestStatistics) AggregateSnapshot() AggregateSnapshot {
 		ts[k] = v
 	}
 	out := AggregateSnapshot{
-		Version:       1,
+		Version:       2,
 		TotalRequests: s.totalRequests,
 		SuccessCount:  s.successCount,
 		FailureCount:  s.failureCount,
@@ -939,7 +972,7 @@ func snapshotRing(r *BucketRing) *RingSeed {
 	out := &RingSeed{
 		BucketSizeMs: r.BucketSize().Milliseconds(),
 		StartTimeMs:  snap.Buckets[0].StartTime.UnixMilli(),
-		HeadIndex:    snap.HeadIndex,
+		HeadIndex:    len(snap.Buckets) - 1,
 		Buckets:      make([]RingSeedBucket, 0, len(snap.Buckets)),
 	}
 	for _, b := range snap.Buckets {
@@ -957,6 +990,9 @@ func snapshotRing(r *BucketRing) *RingSeed {
 				rb.ModelBreakdown[m.Model] = ModelTotals{
 					TotalRequests: m.Requests,
 					TotalTokens:   m.Tokens,
+					Failures:      m.Failures,
+					LatencySum:    m.LatencySum,
+					LatencyN:      m.LatencyN,
 				}
 			}
 		}
@@ -977,8 +1013,8 @@ func snapshotRing(r *BucketRing) *RingSeed {
 
 // ApplyAggregateSnapshot restores the cheap counters, the rotating rings,
 // and the per-(apiKey,model) totals from a previously persisted aggregate
-// snapshot. Details are NOT restored; the legacy full snapshot is the only
-// path that retains per-request records across restarts.
+// snapshot. Per-request Details are restored separately from the legacy full
+// snapshot and the recent-event journal by PersistentLoggerPlugin.Load.
 //
 // This call is monotonic: it never decreases an existing counter, so it is
 // safe to call alongside the legacy MergeSnapshot path or on a hot server
@@ -1046,10 +1082,13 @@ func (s *RequestStatistics) ApplyAggregateSnapshot(snap AggregateSnapshot) {
 	}
 	s.mu.Unlock()
 
-	// Restore the rotating rings outside the main lock so concurrent ingest
-	// does not stall behind a slow restore.
-	s.restoreRingFromSeed(s.bucketRing5m, snap.RingSeed5m)
-	s.restoreRingFromSeed(s.bucketRing1h, snap.RingSeed1h)
+	// Version 1 seeds were written by the mixed physical/logical head
+	// implementation and can contain mislabelled buckets. Rebuild those
+	// rings from retained Details instead.
+	if snap.Version >= 2 {
+		s.restoreRingFromSeed(s.bucketRing5m, snap.RingSeed5m)
+		s.restoreRingFromSeed(s.bucketRing1h, snap.RingSeed1h)
+	}
 }
 
 // restoreRingFromSeed copies a RingSeed's bucket counters into the live
@@ -1069,29 +1108,13 @@ func (s *RequestStatistics) restoreRingFromSeed(r *BucketRing, seed *RingSeed) {
 	r.RestoreFromSeed(seed.StartTimeMs, seed.HeadIndex, seed.Buckets)
 }
 
-// RestoreFromLegacySnapshot rebuilds the rotating rings, counters, and
-// per-(apiKey,model) totals from a legacy StatisticsSnapshot whose
-// apis[api].models[model].details[] entries carry the per-request
-// timestamps we need to place records back into the 5-minute and 1-hour
-// bucket rings.
-//
-// The call is intentionally monotonic: it never decreases an existing
-// counter, so applying a legacy snapshot on top of an already-restored
-// aggregate snapshot is safe.
-//
-// This is the recovery path for installations that have a legacy
-// usage_statistics.snapshot file on disk but no usage_aggregates.json (or
-// whose aggregate file predates the RingSeed field and therefore lacks
-// the bucket view). Without it the dashboard view of "today" comes back
-// empty until ingest refills the rings.
+// RestoreFromLegacySnapshot rebuilds counters, model totals, details, and
+// rotating rings when no aggregate snapshot is available.
 func (s *RequestStatistics) RestoreFromLegacySnapshot(snap StatisticsSnapshot) {
 	if s == nil {
 		return
 	}
 	s.mu.Lock()
-	// Restore aggregate counters from the legacy snapshot. We take the
-	// max(existing, loaded) so callers can compose it with a prior
-	// ApplyAggregateSnapshot.
 	if snap.TotalRequests > s.totalRequests {
 		s.totalRequests = snap.TotalRequests
 	}
@@ -1126,89 +1149,234 @@ func (s *RequestStatistics) RestoreFromLegacySnapshot(snap StatisticsSnapshot) {
 			s.tokensByHour[parsed] = v
 		}
 	}
-	// Restore per-(apiKey,model) counter view from the legacy models.
 	for apiName, apiSnap := range snap.APIs {
 		apiName = strings.TrimSpace(apiName)
 		if apiName == "" {
 			continue
 		}
-		existing, ok := s.apis[apiName]
-		if !ok || existing == nil {
-			existing = &apiStats{Models: make(map[string]*modelStats, len(apiSnap.Models))}
-			s.apis[apiName] = existing
+		api := s.apis[apiName]
+		if api == nil {
+			api = &apiStats{Models: make(map[string]*modelStats, len(apiSnap.Models))}
+			s.apis[apiName] = api
 		}
-		if apiSnap.TotalRequests > existing.TotalRequests {
-			existing.TotalRequests = apiSnap.TotalRequests
+		if apiSnap.TotalRequests > api.TotalRequests {
+			api.TotalRequests = apiSnap.TotalRequests
 		}
-		if apiSnap.TotalTokens > existing.TotalTokens {
-			existing.TotalTokens = apiSnap.TotalTokens
+		if apiSnap.TotalTokens > api.TotalTokens {
+			api.TotalTokens = apiSnap.TotalTokens
 		}
 		for modelName, modelSnap := range apiSnap.Models {
-			modelName = strings.TrimSpace(modelName)
-			if modelName == "" {
-				modelName = "unknown"
+			modelName = normalizeUsageModelName(modelName)
+			model := api.Models[modelName]
+			if model == nil {
+				model = &modelStats{}
+				api.Models[modelName] = model
 			}
-			ms, ok := existing.Models[modelName]
-			if !ok || ms == nil {
-				ms = &modelStats{}
-				existing.Models[modelName] = ms
+			if modelSnap.TotalRequests > model.TotalRequests {
+				model.TotalRequests = modelSnap.TotalRequests
 			}
-			if modelSnap.TotalRequests > ms.TotalRequests {
-				ms.TotalRequests = modelSnap.TotalRequests
-			}
-			if modelSnap.TotalTokens > ms.TotalTokens {
-				ms.TotalTokens = modelSnap.TotalTokens
-			}
-			// Restore the legacy Details slice so that /usage and
-			// /usage?time_range=today have data to serve after a restart.
-			// The Details are capped at defaultModelDetailsCap to bound
-			// memory, matching the FIFO cap in updateAPIStats.
-			if len(ms.Details) == 0 && len(modelSnap.Details) > 0 {
-				capped := modelSnap.Details
-				if len(capped) > defaultModelDetailsCap {
-					n := len(capped) - defaultModelDetailsCap
-					capped = capped[n:]
-				}
-				ms.Details = make([]RequestDetail, len(capped))
-				copy(ms.Details, capped)
+			if modelSnap.TotalTokens > model.TotalTokens {
+				model.TotalTokens = modelSnap.TotalTokens
 			}
 		}
 	}
-	// We must drop s.mu before calling the rings because the ring
-	// mutators take their own mutex and we do not want to nest locks.
-	// Snapshot the details so we can release the main lock quickly.
+	s.mu.Unlock()
+	s.RestoreDetailsFromLegacySnapshot(snap, true)
+}
+
+// RestoreDetailsFromLegacySnapshot restores per-request rows without changing
+// aggregate counters. When rebuildRings is true, the rows also seed rings for
+// legacy snapshots that predate aggregate ring data.
+func (s *RequestStatistics) RestoreDetailsFromLegacySnapshot(snap StatisticsSnapshot, rebuildRings bool) {
+	if s == nil {
+		return
+	}
 	type detailRow struct {
-		apiName, modelName, authIndex string
-		tokens                        int64
-		failed                        bool
-		latencyMs                     int64
-		timestamp                     time.Time
+		modelName, authIndex string
+		tokens               int64
+		failed               bool
+		latencyMs            int64
+		timestamp            time.Time
 	}
 	var rows []detailRow
+	var maxEventID uint64
+
+	s.mu.Lock()
 	for apiName, apiSnap := range snap.APIs {
+		apiName = strings.TrimSpace(apiName)
+		if apiName == "" {
+			continue
+		}
+		api := s.apis[apiName]
+		if api == nil {
+			api = &apiStats{Models: make(map[string]*modelStats, len(apiSnap.Models))}
+			s.apis[apiName] = api
+		}
 		for modelName, modelSnap := range apiSnap.Models {
-			for i := range modelSnap.Details {
-				d := modelSnap.Details[i]
-				if d.Timestamp.IsZero() {
+			modelName = normalizeUsageModelName(modelName)
+			model := api.Models[modelName]
+			if model == nil {
+				model = &modelStats{}
+				api.Models[modelName] = model
+			}
+			if len(model.Details) > 0 || len(modelSnap.Details) == 0 {
+				continue
+			}
+			capped := modelSnap.Details
+			if len(capped) > defaultModelDetailsCap {
+				capped = capped[len(capped)-defaultModelDetailsCap:]
+			}
+			model.Details = make([]RequestDetail, len(capped))
+			for i := range capped {
+				detail := capped[i]
+				detail.Tokens = normaliseTokenStats(detail.Tokens)
+				detail.Thinking = normaliseThinkingValue(detail.Thinking)
+				detail.StatusCode = normaliseStatusCode(detail.StatusCode, detail.Failed)
+				if detail.LatencyMs < 0 {
+					detail.LatencyMs = 0
+				}
+				if detail.EventID > maxEventID {
+					maxEventID = detail.EventID
+				}
+				model.Details[i] = detail
+			}
+			if !rebuildRings {
+				continue
+			}
+			for i := range model.Details {
+				detail := model.Details[i]
+				if detail.Timestamp.IsZero() {
 					continue
 				}
 				rows = append(rows, detailRow{
-					apiName:   apiName,
 					modelName: modelName,
-					authIndex: d.AuthIndex,
-					tokens:    d.Tokens.TotalTokens,
-					failed:    d.Failed,
-					latencyMs: d.LatencyMs,
-					timestamp: d.Timestamp,
+					authIndex: detail.AuthIndex,
+					tokens:    detail.Tokens.TotalTokens,
+					failed:    detail.Failed,
+					latencyMs: detail.LatencyMs,
+					timestamp: detail.Timestamp,
 				})
 			}
 		}
 	}
 	s.mu.Unlock()
+	s.advanceNextEventID(maxEventID)
 
-	for _, r := range rows {
-		s.recordIntoRingsOnly(r.timestamp, r.modelName, r.authIndex, r.tokens, r.failed, r.latencyMs)
+	if !rebuildRings {
+		return
 	}
+	for _, row := range rows {
+		s.recordIntoRingsOnly(row.timestamp, row.modelName, row.authIndex, row.tokens, row.failed, row.latencyMs)
+	}
+}
+
+// RestoreDetailsFromRecentEvents fills request-detail gaps from the bounded
+// recent-event store without changing aggregate counters or ring buckets.
+func (s *RequestStatistics) RestoreDetailsFromRecentEvents(events []UsageEvent) {
+	if s == nil || len(events) == 0 {
+		return
+	}
+
+	s.mu.Lock()
+	touched := make(map[*modelStats]struct{})
+	for _, event := range events {
+		if event.RequestedAt.IsZero() {
+			continue
+		}
+		apiName := strings.TrimSpace(event.APIKey)
+		if apiName == "" {
+			apiName = "unknown"
+		}
+		modelName := normalizeUsageModelName(event.Model)
+		api := s.apis[apiName]
+		if api == nil {
+			api = &apiStats{Models: make(map[string]*modelStats)}
+			s.apis[apiName] = api
+		}
+		model := api.Models[modelName]
+		if model == nil {
+			model = &modelStats{}
+			api.Models[modelName] = model
+		}
+		detail := RequestDetail{
+			EventID:    event.ID,
+			Timestamp:  event.RequestedAt,
+			LatencyMs:  event.DurationMs,
+			Source:     event.Source,
+			AuthIndex:  event.AuthIndex,
+			RequestID:  strings.TrimSpace(event.RequestID),
+			StatusCode: normaliseStatusCode(event.StatusCode, event.Failed),
+			Thinking:   normaliseThinkingValue(event.Thinking),
+			Tokens: TokenStats{
+				InputTokens:     event.Tokens.Input,
+				OutputTokens:    event.Tokens.Output,
+				ReasoningTokens: event.Tokens.Reasoning,
+				CachedTokens:    event.Tokens.Cached,
+				TotalTokens:     event.Tokens.Total,
+			},
+			Failed: event.Failed,
+		}
+		duplicate := false
+		for i := range model.Details {
+			if sameUsageEventDetail(model.Details[i], event) {
+				duplicate = true
+				break
+			}
+		}
+		if duplicate {
+			continue
+		}
+		model.Details = append(model.Details, detail)
+		touched[model] = struct{}{}
+	}
+	for model := range touched {
+		sort.Slice(model.Details, func(i, j int) bool {
+			return model.Details[i].Timestamp.Before(model.Details[j].Timestamp)
+		})
+		if len(model.Details) > defaultModelDetailsCap {
+			model.Details = model.Details[len(model.Details)-defaultModelDetailsCap:]
+		}
+	}
+	s.mu.Unlock()
+}
+
+func sameUsageEventDetail(detail RequestDetail, event UsageEvent) bool {
+	detailRequestID := strings.TrimSpace(detail.RequestID)
+	eventRequestID := strings.TrimSpace(event.RequestID)
+	if detailRequestID != "" && eventRequestID != "" {
+		return detailRequestID == eventRequestID
+	}
+	if detail.EventID > 0 && event.ID > 0 {
+		return detail.EventID == event.ID
+	}
+	if !detail.Timestamp.Equal(event.RequestedAt) ||
+		detail.StatusCode != normaliseStatusCode(event.StatusCode, event.Failed) ||
+		detail.Failed != event.Failed {
+		return false
+	}
+	tokens := normaliseTokenStats(detail.Tokens)
+	if tokens.InputTokens != event.Tokens.Input ||
+		tokens.OutputTokens != event.Tokens.Output ||
+		tokens.ReasoningTokens != event.Tokens.Reasoning ||
+		tokens.CachedTokens != event.Tokens.Cached ||
+		tokens.TotalTokens != event.Tokens.Total {
+		return false
+	}
+	if event.Source != "" && detail.Source != event.Source {
+		return false
+	}
+	if event.AuthIndex != "" && detail.AuthIndex != event.AuthIndex {
+		return false
+	}
+	return true
+}
+
+func normalizeUsageModelName(model string) string {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return "unknown"
+	}
+	return model
 }
 
 // recordIntoRingsOnly writes a single historical record into the rotating
@@ -1233,13 +1401,18 @@ func (s *RequestStatistics) ApplyRecentEvents(events []UsageEvent) {
 	}
 	for _, e := range events {
 		s.recent.Push(e)
-		if e.ID > 0 {
-			for {
-				cur := s.nextEventID.Load()
-				if e.ID <= cur || s.nextEventID.CompareAndSwap(cur, e.ID) {
-					break
-				}
-			}
+		s.advanceNextEventID(e.ID)
+	}
+}
+
+func (s *RequestStatistics) advanceNextEventID(id uint64) {
+	if s == nil || id == 0 {
+		return
+	}
+	for {
+		current := s.nextEventID.Load()
+		if id <= current || s.nextEventID.CompareAndSwap(current, id) {
+			return
 		}
 	}
 }
@@ -1251,7 +1424,7 @@ func (s *RequestStatistics) RecentEventsSnapshot() RecentEventsSnapshot {
 	if events == nil {
 		events = []UsageEvent{}
 	}
-	return RecentEventsSnapshot{Version: 1, Events: events}
+	return RecentEventsSnapshot{Version: 2, Events: events}
 }
 
 // RecentSince returns events with id > sinceID from the ring buffer.

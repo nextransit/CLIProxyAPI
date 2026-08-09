@@ -338,10 +338,14 @@ func TestRequestStatisticsMergeSnapshotIdempotentWithCappedDetails(t *testing.T)
 		TokensByDay:   map[string]int64{"2026-03-20": totalTokens},
 	}
 
-	// First merge: all details should be added.
+	// First merge retains only the newest capped detail set while preserving
+	// the snapshot's full aggregate counters.
 	result := stats.MergeSnapshot(snapshot)
-	if result.Added != int64(detailsCount) {
-		t.Fatalf("first merge: added=%d, want %d", result.Added, detailsCount)
+	if result.Added != defaultModelDetailsCap {
+		t.Fatalf("first merge: added=%d, want %d", result.Added, defaultModelDetailsCap)
+	}
+	if result.Skipped != int64(detailsCount-defaultModelDetailsCap) {
+		t.Fatalf("first merge: skipped=%d, want %d", result.Skipped, detailsCount-defaultModelDetailsCap)
 	}
 
 	got := stats.Snapshot()
@@ -359,6 +363,9 @@ func TestRequestStatisticsMergeSnapshotIdempotentWithCappedDetails(t *testing.T)
 	if result.Added != 0 {
 		t.Fatalf("second merge: added=%d, want 0 (no double-counting)", result.Added)
 	}
+	if result.Skipped != int64(detailsCount) {
+		t.Fatalf("second merge: skipped=%d, want %d", result.Skipped, detailsCount)
+	}
 
 	got = stats.Snapshot()
 	if got.TotalTokens != totalTokens {
@@ -366,6 +373,66 @@ func TestRequestStatisticsMergeSnapshotIdempotentWithCappedDetails(t *testing.T)
 	}
 	if got.TotalRequests != totalRequests {
 		t.Fatalf("after second merge: total_requests=%d, want %d (no change)", got.TotalRequests, totalRequests)
+	}
+}
+
+func TestRequestStatisticsMergeSnapshotRestoresMissingDetailsWithoutInflatingCoveredTotals(t *testing.T) {
+	stats := NewRequestStatistics()
+	stats.ApplyAggregateSnapshot(AggregateSnapshot{
+		Version:       2,
+		TotalRequests: 1,
+		SuccessCount:  1,
+		TotalTokens:   30,
+		ModelTotals: map[string]APITotals{
+			"test-key": {
+				TotalRequests: 1,
+				TotalTokens:   30,
+				Models: map[string]ModelTotals{
+					"gpt-5.4": {TotalRequests: 1, TotalTokens: 30},
+				},
+			},
+		},
+	})
+
+	snapshot := StatisticsSnapshot{
+		TotalRequests: 1,
+		SuccessCount:  1,
+		TotalTokens:   30,
+		APIs: map[string]APISnapshot{
+			"test-key": {
+				TotalRequests: 1,
+				TotalTokens:   30,
+				Models: map[string]ModelSnapshot{
+					"gpt-5.4": {
+						TotalRequests: 1,
+						TotalTokens:   30,
+						Details: []RequestDetail{{
+							RequestID:  "req-covered",
+							Timestamp:  time.Now().Add(-time.Minute),
+							StatusCode: http.StatusOK,
+							Tokens: TokenStats{
+								InputTokens:  10,
+								OutputTokens: 20,
+								TotalTokens:  30,
+							},
+						}},
+					},
+				},
+			},
+		},
+	}
+
+	result := stats.MergeSnapshot(snapshot)
+	if result.Added != 1 || result.Skipped != 0 {
+		t.Fatalf("merge result = %+v, want one restored detail", result)
+	}
+	got := stats.Snapshot()
+	if got.TotalRequests != 1 || got.TotalTokens != 30 {
+		t.Fatalf("totals = %d/%d, want 1/30", got.TotalRequests, got.TotalTokens)
+	}
+	details := got.APIs["test-key"].Models["gpt-5.4"].Details
+	if len(details) != 1 || details[0].RequestID != "req-covered" {
+		t.Fatalf("details = %+v, want restored covered request", details)
 	}
 }
 
@@ -434,5 +501,82 @@ func TestRequestStatistics_RecordMonotonicIDs(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Fatalf("only %d/50 events received", i)
 		}
+	}
+}
+
+func TestRestoreDetailsFromRecentEventsPreservesDistinctSameShapeRequests(t *testing.T) {
+	stats := NewRequestStatistics()
+	timestamp := time.Now().Add(-time.Minute).UTC()
+	stats.RestoreDetailsFromRecentEvents([]UsageEvent{
+		{
+			ID:          41,
+			APIKey:      "key",
+			Model:       "model",
+			RequestID:   "request-41",
+			Source:      "source-a",
+			AuthIndex:   "auth-a",
+			RequestedAt: timestamp,
+			StatusCode:  http.StatusOK,
+			Tokens:      TokenSummary{Input: 10, Output: 5, Reasoning: 2, Cached: 1, Total: 17},
+		},
+		{
+			ID:          42,
+			APIKey:      "key",
+			Model:       "model",
+			RequestID:   "request-42",
+			Source:      "source-b",
+			AuthIndex:   "auth-b",
+			RequestedAt: timestamp,
+			StatusCode:  http.StatusOK,
+			Tokens:      TokenSummary{Input: 10, Output: 5, Reasoning: 2, Cached: 1, Total: 17},
+		},
+	})
+
+	details := stats.Snapshot().APIs["key"].Models["model"].Details
+	if len(details) != 2 {
+		t.Fatalf("details length = %d, want 2 distinct requests", len(details))
+	}
+	if details[0].RequestID == details[1].RequestID {
+		t.Fatalf("request IDs collapsed: %+v", details)
+	}
+	if details[0].Tokens.ReasoningTokens != 2 || details[0].Tokens.CachedTokens != 1 {
+		t.Fatalf("token breakdown not restored: %+v", details[0].Tokens)
+	}
+}
+
+func TestRestoreDetailsFromRecentEventsDeduplicatesLegacyEventShape(t *testing.T) {
+	stats := NewRequestStatistics()
+	timestamp := time.Now().Add(-time.Minute).UTC()
+	stats.RestoreDetailsFromLegacySnapshot(StatisticsSnapshot{
+		APIs: map[string]APISnapshot{
+			"key": {
+				Models: map[string]ModelSnapshot{
+					"model": {
+						Details: []RequestDetail{{
+							Timestamp:  timestamp,
+							StatusCode: http.StatusOK,
+							Tokens: TokenStats{
+								InputTokens:  10,
+								OutputTokens: 5,
+								TotalTokens:  15,
+							},
+						}},
+					},
+				},
+			},
+		},
+	}, false)
+	stats.RestoreDetailsFromRecentEvents([]UsageEvent{{
+		ID:          99,
+		APIKey:      "key",
+		Model:       "model",
+		RequestedAt: timestamp,
+		StatusCode:  http.StatusOK,
+		Tokens:      TokenSummary{Input: 10, Output: 5, Total: 15},
+	}})
+
+	details := stats.Snapshot().APIs["key"].Models["model"].Details
+	if len(details) != 1 {
+		t.Fatalf("details length = %d, want legacy event deduplicated", len(details))
 	}
 }

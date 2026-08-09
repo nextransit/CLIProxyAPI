@@ -20,9 +20,9 @@ import (
 type BucketRing struct {
 	mu         sync.RWMutex
 	bucketSize time.Duration
-	buckets    []bucketSlot // ring buffer
-	head       int          // index of the newest bucket
-	startTime  time.Time    // time corresponding to buckets[head]
+	buckets    []bucketSlot // chronological, oldest first
+	head       int          // index of the newest bucket; always len(buckets)-1
+	startTime  time.Time    // start time of the oldest bucket
 
 	// modelBreakdown is keyed by (bucketIndex, modelName). We keep a
 	// map-of-map to avoid allocating one map per ingest at the top level.
@@ -103,13 +103,6 @@ func (b *bucketSlot) resetSlot() {
 	b.authIdxBreakdown = nil
 }
 
-// rotateLocked advances the head so that buckets[head] is the bucket
-// containing t, and resets any buckets that fall out of the ring window.
-// Caller must hold r.mu for writing.
-//
-// Invariant after this call: for every i in [0, len(buckets)),
-// buckets[i].startTime = origin + i*bucketSize, where origin is r.startTime.
-// After rotation, head = (index of bucket owning t) mod len(buckets).
 // locateBucket returns the index of the slot that owns t, or -1 if t falls
 // outside the ring window. Caller must hold r.mu. The window is
 // [r.startTime, r.startTime + N*bucketSize).
@@ -126,27 +119,19 @@ func (r *BucketRing) locateBucket(t time.Time) int {
 	return int(tBucket.Sub(r.startTime) / r.bucketSize)
 }
 
-// advanceLocked rotates the ring forward so that buckets[head] owns the
-// bucket containing now. Caller must hold r.mu. This is the only function
-// allowed to mutate r.head / r.startTime / slot startTimes. Records older
-// than the current ring window are handled by Record() (which uses
-// locateBucket directly without rotating head), so this function is only
-// concerned with forward time.
+// advanceLocked shifts the chronological window forward so the newest slot
+// owns the bucket containing now. Caller must hold r.mu.
 func (r *BucketRing) advanceLocked(now time.Time) {
 	if len(r.buckets) == 0 {
 		return
 	}
 	nowBucket := now.Truncate(r.bucketSize)
-	current := r.buckets[r.head].startTime
+	current := r.buckets[len(r.buckets)-1].startTime
 	if !nowBucket.After(current) {
-		// now falls inside the current bucket or before it (caller already
-		// handled the back-dated case via locateBucket).
 		return
 	}
 	delta := int(nowBucket.Sub(current) / r.bucketSize)
 	if delta >= len(r.buckets) {
-		// Far-future: clear every slot and re-anchor so buckets[head] owns
-		// nowBucket.
 		r.startTime = nowBucket.Add(-r.bucketSize * time.Duration(len(r.buckets)-1))
 		for i := range r.buckets {
 			r.buckets[i].startTime = r.startTime.Add(time.Duration(i) * r.bucketSize)
@@ -155,19 +140,15 @@ func (r *BucketRing) advanceLocked(now time.Time) {
 		r.head = len(r.buckets) - 1
 		return
 	}
-	for i := 0; i < delta; i++ {
-		r.head = (r.head + 1) % len(r.buckets)
-		r.buckets[r.head].resetSlot()
+
+	copy(r.buckets, r.buckets[delta:])
+	firstNew := len(r.buckets) - delta
+	for i := firstNew; i < len(r.buckets); i++ {
+		r.buckets[i].resetSlot()
+		r.buckets[i].startTime = current.Add(time.Duration(i-firstNew+1) * r.bucketSize)
 	}
-	// Re-anchor all bucket startTimes after incremental rotation. The
-	// incremental loop only resets the slots that the head swept over;
-	// the remaining slots retain their old startTimes, which would
-	// corrupt the ring invariant. Re-anchoring from the new window
-	// start keeps every bucket coherent.
-	r.startTime = nowBucket.Add(-r.bucketSize * time.Duration(len(r.buckets)-1))
-	for i := range r.buckets {
-		r.buckets[i].startTime = r.startTime.Add(time.Duration(i) * r.bucketSize)
-	}
+	r.startTime = r.buckets[0].startTime
+	r.head = len(r.buckets) - 1
 }
 
 // Record updates the bucket that owns timestamp with the given breakdown.
@@ -180,10 +161,6 @@ func (r *BucketRing) Record(t time.Time, model string, authIndex string, tokens 
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	// If t is far in the future relative to the ring, advance head to keep
-	// up. Back-dated records within the ring window are routed by their
-	// absolute slot index; anything older is dropped (the SSE broker still
-	// receives the event).
 	r.advanceLocked(t)
 	idx := r.locateBucket(t)
 	if idx < 0 {
@@ -287,12 +264,8 @@ func (r *BucketRing) ReadSnapshot() RingSnapshot {
 		BucketSize: r.bucketSize,
 		Buckets:    make([]RingBucket, len(r.buckets)),
 	}
-	// Walk from oldest to newest.
-	oldest := (r.head + 1) % len(r.buckets)
 	for i := 0; i < len(r.buckets); i++ {
-		idx := (oldest + i) % len(r.buckets)
-		_ = idx
-		slot := r.buckets[idx]
+		slot := r.buckets[i]
 		rb := RingBucket{
 			StartTime:  slot.startTime,
 			Requests:   slot.requests,
@@ -332,10 +305,8 @@ func (r *BucketRing) ReadSnapshot() RingSnapshot {
 }
 
 // RestoreFromSeed replaces the live ring's state with a previously
-// serialised snapshot. It is safe to call concurrently with new ingest:
-// writes that arrive during the restore will land in the right bucket
-// because the invariant on r.startTime and the per-bucket startTimes is
-// preserved. head is set to the seed's value modulo len(buckets).
+// serialised snapshot. Seed buckets are sorted chronologically so snapshots
+// written by the older rotating-head implementation remain readable.
 //
 // The caller is responsible for ensuring seed.Buckets aligns with the
 // live ring's bucket count and bucket size. Mismatches are rejected by
@@ -346,11 +317,19 @@ func (r *BucketRing) RestoreFromSeed(startTimeMs int64, headIndex int, buckets [
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.startTime = time.UnixMilli(startTimeMs)
-	r.head = ((headIndex % len(r.buckets)) + len(r.buckets)) % len(r.buckets)
-	for i, sb := range buckets {
+	ordered := append([]RingSeedBucket(nil), buckets...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		return ordered[i].StartTimeMs < ordered[j].StartTimeMs
+	})
+	if ordered[0].StartTimeMs == 0 {
+		ordered[0].StartTimeMs = startTimeMs
+	}
+	r.startTime = time.UnixMilli(ordered[0].StartTimeMs)
+	r.head = len(r.buckets) - 1
+	_ = headIndex
+	for i, sb := range ordered {
 		slot := &r.buckets[i]
-		slot.startTime = time.UnixMilli(sb.StartTimeMs)
+		slot.startTime = r.startTime.Add(time.Duration(i) * r.bucketSize)
 		slot.requests = sb.Requests
 		slot.tokens = sb.Tokens
 		slot.failures = sb.Failures
@@ -362,9 +341,9 @@ func (r *BucketRing) RestoreFromSeed(startTimeMs int64, headIndex int, buckets [
 				slot.modelBreakdown[k] = &modelBucketAcc{
 					requests:       m.TotalRequests,
 					tokens:         m.TotalTokens,
-					failures:       0,
-					latencySumMs:   0,
-					latencySamples: 0,
+					failures:       m.Failures,
+					latencySumMs:   m.LatencySum,
+					latencySamples: m.LatencyN,
 				}
 			}
 		} else {

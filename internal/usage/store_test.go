@@ -2,6 +2,7 @@ package usage
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -148,10 +149,27 @@ func TestAggregateFileStore_RoundTrip(t *testing.T) {
 func TestRecentEventsFileStore_RoundTrip(t *testing.T) {
 	tmp := t.TempDir()
 	s := NewRecentEventsFileStore(tmp)
+	budget := int64(8192)
 	in := RecentEventsSnapshot{
-		Version: 1,
+		Version: 2,
 		Events: []UsageEvent{
-			{ID: 1, APIKey: "k", Model: "m", Tokens: TokenSummary{Input: 1, Output: 2, Total: 3}, RequestedAt: time.Now().UTC()},
+			{
+				ID:        1,
+				APIKey:    "k",
+				Model:     "m",
+				Source:    "source-a",
+				AuthIndex: "auth-a",
+				RequestID: "request-a",
+				Tokens: TokenSummary{
+					Input:     1,
+					Output:    2,
+					Reasoning: 3,
+					Cached:    4,
+					Total:     10,
+				},
+				Thinking:    &Thinking{Mode: "budget", Budget: &budget},
+				RequestedAt: time.Now().UTC(),
+			},
 			{ID: 2, APIKey: "k", Model: "m2", Failed: true, Tokens: TokenSummary{Total: 5}, RequestedAt: time.Now().UTC()},
 		},
 	}
@@ -164,6 +182,192 @@ func TestRecentEventsFileStore_RoundTrip(t *testing.T) {
 	}
 	if len(out.Events) != 2 || out.Events[0].Model != "m" || out.Events[1].Model != "m2" {
 		t.Fatalf("events: %+v", out.Events)
+	}
+	event := out.Events[0]
+	if event.Source != "source-a" || event.AuthIndex != "auth-a" || event.RequestID != "request-a" {
+		t.Fatalf("event identity fields = %+v", event)
+	}
+	if event.Tokens.Reasoning != 3 || event.Tokens.Cached != 4 {
+		t.Fatalf("event token fields = %+v", event.Tokens)
+	}
+	if event.Thinking == nil || event.Thinking.Budget == nil || *event.Thinking.Budget != budget {
+		t.Fatalf("event thinking = %+v", event.Thinking)
+	}
+}
+
+func TestPersistentLoggerPluginLoadRestoresDetailsBeforeAggregateSnapshot(t *testing.T) {
+	tmp := t.TempDir()
+	now := time.Now().Add(-time.Minute)
+
+	source := NewRequestStatistics()
+	budget := int64(4096)
+	source.Record(context.Background(), coreusage.Record{
+		APIKey:    "key",
+		Model:     "model",
+		Source:    "source",
+		AuthIndex: "auth-index",
+		RequestID: "request-id",
+		Detail: coreusage.Detail{
+			InputTokens:     7,
+			OutputTokens:    5,
+			ReasoningTokens: 3,
+			CachedTokens:    2,
+			TotalTokens:     17,
+			Thinking:        &coreusage.Thinking{Mode: "budget", Budget: &budget},
+		},
+		RequestedAt: now,
+		StatusCode:  200,
+	})
+
+	legacyStore := NewFileStore(tmp)
+	legacy := source.Snapshot()
+	legacy.TotalRequests = 999
+	legacy.TotalTokens = 9999
+	legacy.SuccessCount = 900
+	legacy.FailureCount = 99
+	legacyAPI := legacy.APIs["key"]
+	legacyAPI.TotalRequests = 999
+	legacyAPI.TotalTokens = 9999
+	legacyModel := legacyAPI.Models["model"]
+	legacyModel.TotalRequests = 999
+	legacyModel.TotalTokens = 9999
+	legacyAPI.Models["model"] = legacyModel
+	legacy.APIs["key"] = legacyAPI
+	if err := legacyStore.Save(legacy); err != nil {
+		t.Fatalf("save legacy snapshot: %v", err)
+	}
+	aggregateStore := NewAggregateFileStore(tmp)
+	if err := aggregateStore.Save(source.AggregateSnapshot()); err != nil {
+		t.Fatalf("save aggregate snapshot: %v", err)
+	}
+	recentStore := NewRecentEventsFileStore(tmp)
+	if err := recentStore.Save(source.RecentEventsSnapshot()); err != nil {
+		t.Fatalf("save recent events: %v", err)
+	}
+
+	target := NewRequestStatistics()
+	plugin := NewPersistentLoggerPlugin(legacyStore)
+	plugin.LoggerPlugin = &LoggerPlugin{stats: target}
+	plugin.AttachAggregateStores(aggregateStore, recentStore)
+	if err := plugin.Load(); err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	snapshot := target.Snapshot()
+	model := snapshot.APIs["key"].Models["model"]
+	if got := len(model.Details); got != 1 {
+		t.Fatalf("details length = %d, want 1", got)
+	}
+	detail := model.Details[0]
+	if detail.Source != "source" || detail.AuthIndex != "auth-index" || detail.RequestID != "request-id" {
+		t.Fatalf("restored detail identity = %+v", detail)
+	}
+	if detail.EventID == 0 || detail.Tokens.ReasoningTokens != 3 || detail.Tokens.CachedTokens != 2 {
+		t.Fatalf("restored detail event/tokens = %+v", detail)
+	}
+	if detail.Thinking == nil || detail.Thinking.Budget == nil || *detail.Thinking.Budget != budget {
+		t.Fatalf("restored detail thinking = %+v", detail.Thinking)
+	}
+	if got := target.RecentSince(0); len(got) != 1 || got[0].Tokens.Total != 17 {
+		t.Fatalf("recent events = %+v, want one restored event", got)
+	}
+
+	ring := target.BucketRing5m().ReadSnapshot()
+	var ringRequests int64
+	for _, bucket := range ring.Buckets {
+		ringRequests += bucket.Requests
+	}
+	if ringRequests != 1 {
+		t.Fatalf("5m ring requests = %d, want 1", ringRequests)
+	}
+	if target.TotalRequests() != 1 || target.TotalTokens() != 17 {
+		t.Fatalf("totals = %d requests/%d tokens, want 1/17",
+			target.TotalRequests(), target.TotalTokens())
+	}
+}
+
+func TestPersistentLoggerPluginLoadRestoresLegacySnapshotWithoutAggregateStore(t *testing.T) {
+	tmp := t.TempDir()
+	source := NewRequestStatistics()
+	source.Record(context.Background(), coreusage.Record{
+		APIKey:      "key",
+		Model:       "model",
+		Detail:      coreusage.Detail{InputTokens: 7, OutputTokens: 5, TotalTokens: 12},
+		RequestedAt: time.Now().Add(-time.Minute),
+		StatusCode:  200,
+	})
+
+	legacyStore := NewFileStore(tmp)
+	if err := legacyStore.Save(source.Snapshot()); err != nil {
+		t.Fatalf("save legacy snapshot: %v", err)
+	}
+
+	target := NewRequestStatistics()
+	plugin := NewPersistentLoggerPlugin(legacyStore)
+	plugin.LoggerPlugin = &LoggerPlugin{stats: target}
+	if err := plugin.Load(); err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	snapshot := target.Snapshot()
+	if target.TotalRequests() != 1 || target.TotalTokens() != 12 {
+		t.Fatalf("totals = %d requests/%d tokens, want 1/12",
+			target.TotalRequests(), target.TotalTokens())
+	}
+	if got := len(snapshot.APIs["key"].Models["model"].Details); got != 1 {
+		t.Fatalf("details length = %d, want 1", got)
+	}
+
+	target.Record(context.Background(), coreusage.Record{
+		APIKey:      "key",
+		Model:       "model",
+		RequestID:   "request-after-restart",
+		Detail:      coreusage.Detail{TotalTokens: 1},
+		RequestedAt: time.Now(),
+		StatusCode:  200,
+	})
+	restoredDetails := target.Snapshot().APIs["key"].Models["model"].Details
+	if got := restoredDetails[len(restoredDetails)-1].EventID; got != 2 {
+		t.Fatalf("new event ID after full-snapshot restore = %d, want 2", got)
+	}
+}
+
+func TestPersistentLoggerPluginLoadFallsBackWhenAggregateFileIsCorrupt(t *testing.T) {
+	tmp := t.TempDir()
+	source := NewRequestStatistics()
+	source.Record(context.Background(), coreusage.Record{
+		APIKey:      "key",
+		Model:       "model",
+		RequestID:   "request",
+		Detail:      coreusage.Detail{InputTokens: 7, OutputTokens: 5, TotalTokens: 12},
+		RequestedAt: time.Now().Add(-time.Minute),
+		StatusCode:  200,
+	})
+
+	legacyStore := NewFileStore(tmp)
+	if err := legacyStore.Save(source.Snapshot()); err != nil {
+		t.Fatalf("save legacy snapshot: %v", err)
+	}
+	aggregateStore := NewAggregateFileStore(tmp)
+	if err := os.WriteFile(aggregateStore.Path(), []byte("{invalid"), 0o644); err != nil {
+		t.Fatalf("write corrupt aggregate: %v", err)
+	}
+
+	target := NewRequestStatistics()
+	plugin := NewPersistentLoggerPlugin(legacyStore)
+	plugin.LoggerPlugin = &LoggerPlugin{stats: target}
+	plugin.AttachAggregateStores(aggregateStore, nil)
+	if err := plugin.Load(); err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	snapshot := target.Snapshot()
+	if target.TotalRequests() != 1 || target.TotalTokens() != 12 {
+		t.Fatalf("totals = %d requests/%d tokens, want 1/12",
+			target.TotalRequests(), target.TotalTokens())
+	}
+	if got := snapshot.APIs["key"].Models["model"].Details; len(got) != 1 || got[0].RequestID != "request" {
+		t.Fatalf("details = %+v, want fallback snapshot detail", got)
 	}
 }
 
