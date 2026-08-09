@@ -25,6 +25,16 @@ func ConvertOpenAIRequestToOpenAI(modelName string, inputRawJSON []byte, _ bool)
 	}
 	out = sanitizeToolCalls(out)
 	out = sanitizeToolMessages(out)
+	// Strip OpenAI Responses API-only parameters that strict Chat Completions
+	// providers (e.g. Nvidia) reject. Some clients embed these even in a
+	// Chat Completions request.
+	for _, path := range []string{"system_instruction", "extra_body"} {
+		if gjson.GetBytes(out, path).Exists() {
+			if updated, errDelete := sjson.DeleteBytes(out, path); errDelete == nil {
+				out = updated
+			}
+		}
+	}
 	return out
 }
 
