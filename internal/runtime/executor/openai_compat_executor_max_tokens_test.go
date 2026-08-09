@@ -78,12 +78,42 @@ func TestClampOpenAICompatMaxTokens_DeepSeekV4RegistryCannotRaiseHardLimit(t *te
 	}
 }
 
-func TestClampOpenAICompatMaxTokens_DoesNotAddMissingField(t *testing.T) {
+func TestClampOpenAICompatMaxTokens_AddsDefaultForDeepSeekV4(t *testing.T) {
 	input := []byte(`{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}`)
 
 	out := clampOpenAICompatMaxTokens(input, "deepseek-v4-flash", "openai-compatible")
 
+	if got := gjson.GetBytes(out, "max_tokens").Int(); got != 16384 {
+		t.Fatalf("max_tokens = %d, want default 16384", got)
+	}
+}
+
+func TestClampOpenAICompatMaxTokens_AddsDefaultForMixedCaseDeepSeekV4Flash(t *testing.T) {
+	input := []byte(`{"model":"DeepSeek-V4-Flash","messages":[{"role":"user","content":"hi"}]}`)
+
+	out := clampOpenAICompatMaxTokens(input, "DeepSeek-V4-Flash", "openai-compatible")
+
+	if got := gjson.GetBytes(out, "max_tokens").Int(); got != 16384 {
+		t.Fatalf("max_tokens = %d, want default 16384 for DeepSeek-V4-Flash", got)
+	}
+}
+
+func TestClampOpenAICompatMaxTokens_CapsDefaultForDeepSeekV4(t *testing.T) {
+	input := []byte(`{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}`)
+
+	out := clampOpenAICompatMaxTokens(input, "deepseek-v4-flash", "openai-compatible")
+
+	if got := gjson.GetBytes(out, "max_tokens").Int(); got > 65536 {
+		t.Fatalf("default max_tokens = %d, must not exceed hard limit 65536", got)
+	}
+}
+
+func TestClampOpenAICompatMaxTokens_DoesNotAddMissingFieldForNonDeepSeek(t *testing.T) {
+	input := []byte(`{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`)
+
+	out := clampOpenAICompatMaxTokens(input, "gpt-4o", "openai-compatible")
+
 	if gjson.GetBytes(out, "max_tokens").Exists() {
-		t.Fatalf("max_tokens should remain unset, got %s", gjson.GetBytes(out, "max_tokens").Raw)
+		t.Fatalf("max_tokens should remain unset for non-deepseek model, got %s", gjson.GetBytes(out, "max_tokens").Raw)
 	}
 }
