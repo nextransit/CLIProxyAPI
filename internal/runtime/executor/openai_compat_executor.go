@@ -855,6 +855,15 @@ func clampOpenAICompatMaxTokens(payload []byte, modelID string, provider string)
 	}
 	maxTokens := gjson.GetBytes(payload, "max_tokens")
 	if !maxTokens.Exists() || maxTokens.Type != gjson.Number {
+		// Default max_tokens for DeepSeek V4 models to prevent early termination
+		// when the request does not specify max_output_tokens (e.g. Codex CLI).
+		if isDeepSeekV4Model(modelID) {
+			payload, _ = sjson.SetBytes(payload, "max_tokens", 16384)
+			value := int64(16384)
+			if limit := openAICompatMaxTokensLimit(modelID, provider); limit > 0 && value > int64(limit) {
+				payload, _ = sjson.SetBytes(payload, "max_tokens", limit)
+			}
+		}
 		return payload
 	}
 
@@ -946,14 +955,6 @@ func normalizeDeepSeekThinkingRequest(payload []byte, modelID, provider string) 
 			if updated, errDelete := sjson.DeleteBytes(out, "extra_body"); errDelete == nil {
 				out = updated
 			}
-		}
-	}
-	if thinkingType == "" && !reasoningEffortOnly {
-		thinkingType = "enabled"
-	}
-	if thinkingType != "" && !reasoningEffortOnly {
-		if updated, errSet := sjson.SetBytes(out, "extra_body.thinking.type", thinkingType); errSet == nil {
-			out = updated
 		}
 	}
 	return out
