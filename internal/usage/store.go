@@ -3,6 +3,7 @@
 package usage
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	coreusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -328,28 +330,28 @@ func RestoreStatisticsFromStore(stats *RequestStatistics, store Store) (bool, er
 		return false, nil
 	}
 
-	current := stats.Snapshot()
-	if current.TotalRequests > 0 || current.TotalTokens > 0 || len(current.APIs) > 0 {
-		return false, nil
-	}
+	if stats.IsEmpty() {
+		snapshot, err := store.Load()
+		if err != nil {
+			return false, err
+		}
+		if snapshot.TotalRequests == 0 && snapshot.TotalTokens == 0 && len(snapshot.APIs) == 0 {
+			return false, nil
+		}
 
-	snapshot, err := store.Load()
-	if err != nil {
-		return false, err
+		result := stats.MergeSnapshot(snapshot)
+		log.Infof("restored usage statistics on demand: %d requests, %d tokens loaded (%d added, %d skipped)",
+			snapshot.TotalRequests, snapshot.TotalTokens, result.Added, result.Skipped)
+		return true, nil
 	}
-	if snapshot.TotalRequests == 0 && snapshot.TotalTokens == 0 && len(snapshot.APIs) == 0 {
-		return false, nil
-	}
-
-	result := stats.MergeSnapshot(snapshot)
-	log.Infof("restored usage statistics on demand: %d requests, %d tokens loaded (%d added, %d skipped)",
-		snapshot.TotalRequests, snapshot.TotalTokens, result.Added, result.Skipped)
-	return true, nil
+	return false, nil
 }
 
 var (
 	persistentPlugin *PersistentLoggerPlugin
 	storeOnce        sync.Once
+	eventStoreMu     sync.RWMutex
+	usageEventStore  UsageEventStore
 )
 
 // InitializePersistence sets up persistent storage for usage statistics.
@@ -360,11 +362,23 @@ func InitializePersistence(baseDir string) error {
 		store := NewFileStore(baseDir)
 		aggStore := NewAggregateFileStore(baseDir)
 		recentStore := NewRecentEventsFileStore(baseDir)
+		if eventStore, err := NewSQLiteUsageEventStore(baseDir); err != nil {
+			log.WithError(err).Warn("failed to initialize usage event database")
+		} else {
+			setUsageEventStore(eventStore)
+		}
 		persistentPlugin = NewPersistentLoggerPlugin(store)
 		persistentPlugin.AttachAggregateStores(aggStore, recentStore)
 
 		if err := persistentPlugin.Load(); err != nil {
 			log.WithError(err).Warn("failed to load usage statistics from storage")
+		}
+		if eventStore := getUsageEventStore(); eventStore != nil {
+			if imported, err := eventStore.ImportSnapshot(context.Background(), persistentPlugin.stats.Snapshot()); err != nil {
+				log.WithError(err).Warn("failed to import retained usage details into event database")
+			} else if imported > 0 {
+				log.Infof("imported %d retained usage details into event database", imported)
+			}
 		}
 
 		persistentPlugin.StartAutoSave()
@@ -373,6 +387,28 @@ func InitializePersistence(baseDir string) error {
 			aggStore.Path(), recentStore.Path(), store.Path())
 	})
 	return initErr
+}
+
+func setUsageEventStore(store UsageEventStore) {
+	eventStoreMu.Lock()
+	defer eventStoreMu.Unlock()
+	usageEventStore = store
+}
+
+func getUsageEventStore() UsageEventStore {
+	eventStoreMu.RLock()
+	defer eventStoreMu.RUnlock()
+	return usageEventStore
+}
+
+func persistUsageEvent(ctx context.Context, record coreusage.Record, evt UsageEvent) {
+	store := getUsageEventStore()
+	if store == nil {
+		return
+	}
+	if err := store.InsertUsageEvent(ctx, record, evt); err != nil {
+		log.WithError(err).Warn("failed to persist usage event")
+	}
 }
 
 // GetPersistentPlugin returns the persistent plugin instance.

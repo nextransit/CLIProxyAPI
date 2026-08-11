@@ -1,6 +1,7 @@
 package management
 
 import (
+	"compress/gzip"
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
+	log "github.com/sirupsen/logrus"
 )
 
 type usageExportPayload struct {
@@ -32,18 +34,58 @@ type usageStatisticsResponse struct {
 	SourceDisplay map[string]string `json:"source_display"`
 }
 
+// gzipResponseWriter compresses the response body written through it.
+type gzipResponseWriter struct {
+	gin.ResponseWriter
+	gz *gzip.Writer
+}
+
+func (w *gzipResponseWriter) Write(b []byte) (int, error) {
+	return w.gz.Write(b)
+}
+
+// wrapGzipCompression swaps in a gzip response writer when the client
+// advertises gzip support. Used for the potentially large /usage payloads
+// (a full-history snapshot can reach tens of MB). SSE streams and other
+// endpoints are not wrapped. The returned writer must be closed by the
+// caller once the response body has been written.
+func wrapGzipCompression(c *gin.Context) *gzip.Writer {
+	if !strings.Contains(c.GetHeader("Accept-Encoding"), "gzip") {
+		return nil
+	}
+	gz := gzip.NewWriter(c.Writer)
+	c.Writer = &gzipResponseWriter{ResponseWriter: c.Writer, gz: gz}
+	c.Header("Content-Encoding", "gzip")
+	c.Header("Vary", "Accept-Encoding")
+	c.Writer.Header().Del("Content-Length")
+	return gz
+}
+
 // GetUsageStatistics returns the in-memory request statistics snapshot.
 func (h *Handler) GetUsageStatistics(c *gin.Context) {
+	gz := wrapGzipCompression(c)
+	if gz != nil {
+		defer func() {
+			if err := gz.Close(); err != nil {
+				log.Errorf("usage gzip response close error: %v", err)
+			}
+		}()
+	}
 	var snapshot usage.StatisticsSnapshot
 	if h != nil && h.usageStats != nil {
 		if _, err := usage.RestoreStatisticsIfEmpty(h.usageStats); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
-		snapshot = h.usageStats.Snapshot()
-	}
-	if filtered, ok := filterUsageSnapshotByTimeRange(snapshot, c.Query("time_range"), time.Now()); ok {
-		snapshot = filtered
+		start, end, ok := resolveUsageSnapshotWindow(c.Query("time_range"), time.Now())
+		if ok {
+			// SnapshotWindow filters inside the read lock so the full
+			// detail history is never deep-copied (that would stall usage
+			// recording on busy servers).
+			snapshot = h.usageStats.SnapshotWindow(start, end)
+		} else {
+			snapshot = h.usageStats.Snapshot()
+		}
 	}
 
 	// Build AuthIndex -> display name mapping
@@ -240,53 +282,30 @@ func filterUsageSnapshotByWindow(snapshot usage.StatisticsSnapshot, start, end t
 	return result
 }
 
-// transformUsageSnapshotWithDisplayNames replaces AuthIndex with formatted display names.
+// transformUsageSnapshotWithDisplayNames replaces AuthIndex with formatted
+// display names. The snapshot must be a private copy (as produced by
+// Snapshot/SnapshotWindow), so it is mutated in place to avoid a second
+// deep copy of every request detail.
 func (h *Handler) transformUsageSnapshotWithDisplayNames(snapshot *usage.StatisticsSnapshot, displayMap map[string]string) *usage.StatisticsSnapshot {
 	if snapshot == nil {
 		return nil
 	}
 
-	// Deep copy the snapshot to avoid modifying the original
-	result := &usage.StatisticsSnapshot{
-		TotalRequests:  snapshot.TotalRequests,
-		SuccessCount:   snapshot.SuccessCount,
-		FailureCount:   snapshot.FailureCount,
-		TotalTokens:    snapshot.TotalTokens,
-		RequestsByDay:  snapshot.RequestsByDay,
-		RequestsByHour: snapshot.RequestsByHour,
-		TokensByDay:    snapshot.TokensByDay,
-		TokensByHour:   snapshot.TokensByHour,
-		APIs:           make(map[string]usage.APISnapshot, len(snapshot.APIs)),
-	}
-
 	for apiKey, apiSnap := range snapshot.APIs {
-		apiCopy := usage.APISnapshot{
-			TotalRequests: apiSnap.TotalRequests,
-			TotalTokens:   apiSnap.TotalTokens,
-			Models:        make(map[string]usage.ModelSnapshot, len(apiSnap.Models)),
-		}
 		for modelName, modelSnap := range apiSnap.Models {
-			modelCopy := usage.ModelSnapshot{
-				TotalRequests: modelSnap.TotalRequests,
-				TotalTokens:   modelSnap.TotalTokens,
-				Details:       make([]usage.RequestDetail, len(modelSnap.Details)),
-			}
-			for i, detail := range modelSnap.Details {
-				detailCopy := detail
-				// Replace AuthIndex with formatted display name
-				if detailCopy.AuthIndex != "" {
-					if displayName, ok := displayMap[detailCopy.AuthIndex]; ok {
-						detailCopy.AuthIndex = displayName
+			for i := range modelSnap.Details {
+				if authIndex := modelSnap.Details[i].AuthIndex; authIndex != "" {
+					if displayName, ok := displayMap[authIndex]; ok {
+						modelSnap.Details[i].AuthIndex = displayName
 					}
 				}
-				modelCopy.Details[i] = detailCopy
 			}
-			apiCopy.Models[modelName] = modelCopy
+			apiSnap.Models[modelName] = modelSnap
 		}
-		result.APIs[apiKey] = apiCopy
+		snapshot.APIs[apiKey] = apiSnap
 	}
 
-	return result
+	return snapshot
 }
 
 // ExportUsageStatistics returns a complete usage snapshot for backup/migration.
@@ -394,20 +413,18 @@ func (h *Handler) GetUsageDashboard(c *gin.Context) {
 	}
 
 	var snap usage.DashboardSnapshot
-	var cheapTotals usage.StatisticsSnapshot
 	if h != nil && h.usageStats != nil {
 		if _, err := usage.RestoreStatisticsIfEmpty(h.usageStats); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
-		cheapTotals = h.usageStats.Snapshot()
 		if match := strings.TrimSpace(c.GetHeader("If-None-Match")); match != "" {
 			candidate := `"` + dashboardComputeETag(dashboardViewResponse{
 				Dashboard: usage.DashboardSnapshot{
-					TotalRequests: cheapTotals.TotalRequests,
-					TotalTokens:   cheapTotals.TotalTokens,
-					SuccessCount:  cheapTotals.SuccessCount,
-					FailureCount:  cheapTotals.FailureCount,
+					TotalRequests: h.usageStats.TotalRequests(),
+					TotalTokens:   h.usageStats.TotalTokens(),
+					SuccessCount:  h.usageStats.SuccessCount(),
+					FailureCount:  h.usageStats.FailureCount(),
 					BucketCount:   cfg.BucketCount,
 					BucketSizeMs:  cfg.BucketSize.Milliseconds(),
 				},

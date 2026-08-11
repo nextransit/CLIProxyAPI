@@ -1,8 +1,11 @@
 package management
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -102,6 +105,65 @@ func TestImportUsageStatistics_PersistsMergedSnapshot(t *testing.T) {
 	}
 	if added, ok := response["added"].(float64); !ok || added < 1 {
 		t.Fatalf("added response = %#v, want at least 1", response["added"])
+	}
+}
+
+func TestGetUsageStatistics_GzipCompression(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	handler := NewHandler(&config.Config{}, "", nil)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/usage", nil)
+	ctx.Request.Header.Set("Accept-Encoding", "gzip")
+
+	handler.GetUsageStatistics(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	if got := recorder.Header().Get("Content-Encoding"); got != "gzip" {
+		t.Fatalf("Content-Encoding = %q, want gzip", got)
+	}
+
+	gz, err := gzip.NewReader(bytes.NewReader(recorder.Body.Bytes()))
+	if err != nil {
+		t.Fatalf("gzip.NewReader() error = %v", err)
+	}
+	decoded, err := io.ReadAll(gz)
+	if err != nil {
+		t.Fatalf("ReadAll(decoded) error = %v", err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatalf("gzip close error = %v", err)
+	}
+
+	var response map[string]any
+	if err := json.Unmarshal(decoded, &response); err != nil {
+		t.Fatalf("Unmarshal(decoded) error = %v", err)
+	}
+	if _, ok := response["usage"]; !ok {
+		t.Fatalf("decoded response = %#v, want usage key", response)
+	}
+}
+
+func TestGetUsageStatistics_NoGzipWithoutAcceptEncoding(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	handler := NewHandler(&config.Config{}, "", nil)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/usage", nil)
+
+	handler.GetUsageStatistics(ctx)
+
+	if got := recorder.Header().Get("Content-Encoding"); got != "" {
+		t.Fatalf("Content-Encoding = %q, want empty (no gzip negotiation)", got)
+	}
+	if recorder.Body.Len() == 0 {
+		t.Fatal("expected uncompressed body")
 	}
 }
 
@@ -277,6 +339,54 @@ func TestFilterUsageSnapshotByTimeRangeTodayUsesLocalDay(t *testing.T) {
 	}
 	if _, ok := filtered.TokensByDay["2026-06-03"]; ok {
 		t.Fatal("tokens_by_day unexpectedly includes previous local day")
+	}
+}
+
+func TestSnapshotWindowMatchesLegacyFilter(t *testing.T) {
+	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	snapshot := usage.StatisticsSnapshot{
+		RequestsByDay:  map[string]int64{"2026-06-03": 7, "2026-06-04": 2},
+		TokensByDay:    map[string]int64{"2026-06-03": 900, "2026-06-04": 300},
+		RequestsByHour: map[string]int64{"10": 999},
+		TokensByHour:   map[string]int64{"10": 9999},
+		APIs: map[string]usage.APISnapshot{
+			"test-key": {
+				Models: map[string]usage.ModelSnapshot{
+					"gpt-5.5": {
+						Details: []usage.RequestDetail{
+							{Timestamp: now.Add(-2 * time.Hour), Failed: true, Tokens: usage.TokenStats{TotalTokens: 100}},
+							{Timestamp: now.Add(-48 * time.Hour), Tokens: usage.TokenStats{TotalTokens: 900}},
+							{Timestamp: now.Add(-50 * time.Hour), Tokens: usage.TokenStats{TotalTokens: 50}},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	// Import the snapshot into a live statistics store; MergeSnapshot keeps
+	// the day/hour buckets and per-model details in memory.
+	stats := usage.NewRequestStatistics()
+	stats.MergeSnapshot(snapshot)
+
+	start, end, ok := resolveUsageSnapshotWindow("24h", now)
+	if !ok {
+		t.Fatalf("resolveUsageSnapshotWindow(24h) ok = false, want true")
+	}
+
+	got := stats.SnapshotWindow(start, end)
+	want := filterUsageSnapshotByWindow(snapshot, start, end)
+
+	gotJSON, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("Marshal(got) error = %v", err)
+	}
+	wantJSON, err := json.Marshal(want)
+	if err != nil {
+		t.Fatalf("Marshal(want) error = %v", err)
+	}
+	if string(gotJSON) != string(wantJSON) {
+		t.Fatalf("SnapshotWindow != legacy filter\n got: %s\nwant: %s", gotJSON, wantJSON)
 	}
 }
 

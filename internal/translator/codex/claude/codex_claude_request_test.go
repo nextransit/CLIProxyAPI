@@ -88,6 +88,36 @@ func TestConvertClaudeRequestToCodex_SystemMessageScenarios(t *testing.T) {
 	}
 }
 
+func TestConvertClaudeRequestToCodex_MessagesSystemRoleBecomesDeveloper(t *testing.T) {
+	inputJSON := `{
+		"model": "gpt-5.5",
+		"messages": [
+			{"role": "user", "content": "hello"},
+			{"role": "system", "content": [{"type": "text", "text": "mid-conversation system prompt"}]}
+		]
+	}`
+
+	result := ConvertClaudeRequestToCodex("test-model", []byte(inputJSON), false)
+	resultJSON := gjson.ParseBytes(result)
+	inputs := resultJSON.Get("input").Array()
+	if len(inputs) != 2 {
+		t.Fatalf("got %d input items, want 2. Output: %s", len(inputs), resultJSON.Get("input").Raw)
+	}
+
+	for i, input := range inputs {
+		role := input.Get("role").String()
+		if role == "system" {
+			t.Fatalf("input[%d] role = %q, want no system role (must be developer). Output: %s", i, role, resultJSON.Get("input").Raw)
+		}
+		if role == "developer" {
+			content := input.Get("content").Array()
+			if len(content) != 1 || content[0].Get("text").String() != "mid-conversation system prompt" {
+				t.Fatalf("input[%d] developer content mismatch: %s", i, input.Raw)
+			}
+		}
+	}
+}
+
 func TestConvertClaudeRequestToCodex_ParallelToolCalls(t *testing.T) {
 	tests := []struct {
 		name                  string

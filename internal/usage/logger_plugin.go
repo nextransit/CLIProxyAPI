@@ -267,6 +267,17 @@ func (s *RequestStatistics) FailureCount() int64 {
 	return s.failureCount
 }
 
+// IsEmpty reports whether no usage statistics have been recorded yet. It is a
+// lightweight equivalent of Snapshot() that avoids copying per-request details.
+func (s *RequestStatistics) IsEmpty() bool {
+	if s == nil {
+		return true
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.totalRequests == 0 && s.totalTokens == 0 && len(s.apis) == 0
+}
+
 // BucketRing5m returns the 5-minute pre-aggregated rotating ring, or nil if
 // not initialized.
 func (s *RequestStatistics) BucketRing5m() *BucketRing {
@@ -286,12 +297,12 @@ func (s *RequestStatistics) BucketRing1h() *BucketRing {
 }
 
 // Record ingests a new usage record and updates the aggregates.
-func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record) {
+func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record) (UsageEvent, bool) {
 	if s == nil {
-		return
+		return UsageEvent{}, false
 	}
 	if !statisticsEnabled.Load() {
-		return
+		return UsageEvent{}, false
 	}
 	id := s.nextEventID.Add(1)
 	timestamp := record.RequestedAt
@@ -321,7 +332,6 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	hourKey := timestamp.Hour()
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	s.totalRequests++
 	if success {
@@ -385,6 +395,10 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	}
 	s.recent.Push(evt)
 	s.broker.Publish(evt)
+	s.mu.Unlock()
+
+	persistUsageEvent(ctx, record, evt)
+	return evt, true
 }
 
 // defaultModelDetailsCap caps the per-model Details slice so memory does
@@ -478,6 +492,133 @@ func (s *RequestStatistics) Snapshot() StatisticsSnapshot {
 		key := formatHour(hour)
 		result.TokensByHour[key] = v
 	}
+
+	return result
+}
+
+// SnapshotWindow returns a statistics snapshot restricted to request details
+// inside [start, end]. Unlike Snapshot()+filtering, the window filter runs
+// while the read lock is held, so the lock is released as soon as the smaller
+// windowed subset is copied instead of deep-copying the full detail history.
+// Totals follow the same semantics as the legacy window filter: day buckets
+// are authoritative when present, detail-derived counts fill the gaps, and
+// the max of the two is used for the overall totals.
+func (s *RequestStatistics) SnapshotWindow(start, end time.Time) StatisticsSnapshot {
+	result := StatisticsSnapshot{
+		APIs:           make(map[string]APISnapshot),
+		RequestsByDay:  make(map[string]int64),
+		RequestsByHour: make(map[string]int64),
+		TokensByDay:    make(map[string]int64),
+		TokensByHour:   make(map[string]int64),
+	}
+	if s == nil {
+		return result
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	bucketLocation := start.Location()
+
+	// Copy the day buckets that overlap the window; they are the canonical
+	// source for day-level totals (monotonic in Record(), unlike the capped
+	// Details slices).
+	for k, v := range s.requestsByDay {
+		dayTime, err := time.ParseInLocation("2006-01-02", k, bucketLocation)
+		if err != nil {
+			continue
+		}
+		if dayTime.Add(24*time.Hour).After(start) && !dayTime.After(end) {
+			result.RequestsByDay[k] = v
+		}
+	}
+	for k, v := range s.tokensByDay {
+		dayTime, err := time.ParseInLocation("2006-01-02", k, bucketLocation)
+		if err != nil {
+			continue
+		}
+		if dayTime.Add(24*time.Hour).After(start) && !dayTime.After(end) {
+			result.TokensByDay[k] = v
+		}
+	}
+
+	var dayBucketRequests, dayBucketTokens int64
+	for _, v := range result.RequestsByDay {
+		dayBucketRequests += v
+	}
+	for _, v := range result.TokensByDay {
+		dayBucketTokens += v
+	}
+
+	var detailReqs, detailTokens, detailSuccess, detailFailure int64
+	detailReqsByDay := make(map[string]int64)
+	detailTokensByDay := make(map[string]int64)
+
+	for apiName, stats := range s.apis {
+		apiSnapshot := APISnapshot{Models: make(map[string]ModelSnapshot)}
+		for modelName, modelStatsValue := range stats.Models {
+			modelSnapshot := ModelSnapshot{Details: make([]RequestDetail, 0)}
+			for _, detail := range modelStatsValue.Details {
+				if detail.Timestamp.IsZero() || detail.Timestamp.Before(start) || detail.Timestamp.After(end) {
+					continue
+				}
+				modelSnapshot.Details = append(modelSnapshot.Details, detail)
+				modelSnapshot.TotalRequests++
+				modelSnapshot.TotalTokens += detail.Tokens.TotalTokens
+				apiSnapshot.TotalRequests++
+				apiSnapshot.TotalTokens += detail.Tokens.TotalTokens
+				detailReqs++
+				detailTokens += detail.Tokens.TotalTokens
+				if detail.Failed {
+					detailFailure++
+				} else {
+					detailSuccess++
+				}
+				bucketTimestamp := detail.Timestamp.In(bucketLocation)
+				dayKey := bucketTimestamp.Format("2006-01-02")
+				hourKey := bucketTimestamp.Format("15")
+				detailReqsByDay[dayKey]++
+				result.RequestsByHour[hourKey]++
+				detailTokensByDay[dayKey] += detail.Tokens.TotalTokens
+				result.TokensByHour[hourKey] += detail.Tokens.TotalTokens
+			}
+			if modelSnapshot.TotalRequests == 0 {
+				continue
+			}
+			apiSnapshot.Models[modelName] = modelSnapshot
+		}
+		if apiSnapshot.TotalRequests == 0 {
+			continue
+		}
+		result.APIs[apiName] = apiSnapshot
+	}
+
+	// Fill days the day buckets lacked with detail-derived counts.
+	for k, v := range detailReqsByDay {
+		if _, ok := result.RequestsByDay[k]; !ok {
+			result.RequestsByDay[k] = v
+		}
+	}
+	for k, v := range detailTokensByDay {
+		if _, ok := result.TokensByDay[k]; !ok {
+			result.TokensByDay[k] = v
+		}
+	}
+
+	// Totals: the day buckets win when they cover more than the capped
+	// Details slices.
+	if dayBucketRequests > detailReqs {
+		result.TotalRequests = dayBucketRequests
+	} else {
+		result.TotalRequests = detailReqs
+	}
+	if dayBucketTokens > detailTokens {
+		result.TotalTokens = dayBucketTokens
+	} else {
+		result.TotalTokens = detailTokens
+	}
+	result.SuccessCount = detailSuccess
+	result.FailureCount = detailFailure
 
 	return result
 }

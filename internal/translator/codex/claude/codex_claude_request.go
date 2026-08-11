@@ -82,6 +82,12 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 		for i := 0; i < len(messageResults); i++ {
 			messageResult := messageResults[i]
 			messageRole := messageResult.Get("role").String()
+			// The Codex Responses API only accepts developer/assistant/user
+			// roles. Claude Code may send mid-conversation system messages
+			// (role=system inside messages); map them to developer.
+			if messageRole == "system" {
+				messageRole = "developer"
+			}
 
 			newMessage := func() []byte {
 				msg := []byte(`{"type":"message","role":"","content":[]}`)

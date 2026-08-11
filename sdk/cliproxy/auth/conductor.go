@@ -2059,8 +2059,45 @@ func (m *Manager) retryAllowed(attempt int, providers []string) bool {
 	return false
 }
 
+// authServiceUnavailableRetryBackoff defines fixed retry intervals for
+// 503 auth_unavailable / auth_not_found errors from the codex provider.
+// Pattern: 3, 5, 8, 10 seconds (4 attempts).
+var authServiceUnavailableRetryBackoff = []time.Duration{
+	3 * time.Second,
+	5 * time.Second,
+	8 * time.Second,
+	10 * time.Second,
+}
+
+// isAuthServiceUnavailableError checks if the error is a 503 Service Unavailable
+// with an auth_unavailable or auth_not_found message, indicating transient
+// auth unavailability that should be retried with fixed backoff.
+func isAuthServiceUnavailableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var se cliproxyexecutor.StatusError
+	if !errors.As(err, &se) || se == nil {
+		return false
+	}
+	if se.StatusCode() != http.StatusServiceUnavailable {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "auth_unavailable") || strings.Contains(msg, "auth_not_found") || strings.Contains(msg, "no auth available")
+}
+
 func (m *Manager) shouldRetryAfterError(err error, attempt int, providers []string, model string, maxWait time.Duration) (time.Duration, bool) {
 	if err == nil {
+		return 0, false
+	}
+	// Fixed retry backoff for 503 auth_unavailable/auth_not_found errors.
+	// This runs independently of maxWait to handle transient auth unavailability
+	// even when no retry interval is configured.
+	if isAuthServiceUnavailableError(err) {
+		if attempt < len(authServiceUnavailableRetryBackoff) {
+			return authServiceUnavailableRetryBackoff[attempt], true
+		}
 		return 0, false
 	}
 	if maxWait <= 0 {
@@ -2075,8 +2112,11 @@ func (m *Manager) shouldRetryAfterError(err error, attempt int, providers []stri
 	}
 	wait, found := m.closestCooldownWait(providers, model, attempt)
 	if found {
-		if wait > maxWait {
+		if wait > maxWait && status != http.StatusTooManyRequests {
 			return 0, false
+		}
+		if wait > maxWait {
+			wait = maxWait
 		}
 		return wait, true
 	}
