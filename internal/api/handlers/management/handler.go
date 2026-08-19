@@ -231,25 +231,36 @@ func (h *Handler) AuthenticateManagementKey(clientIP string, localClient bool, p
 	envSecret := h.envSecret
 
 	now := time.Now()
-	h.attemptsMu.Lock()
-	ai := h.failedAttempts[clientIP]
-	if ai != nil && !ai.blockedUntil.IsZero() {
-		if now.Before(ai.blockedUntil) {
-			remaining := ai.blockedUntil.Sub(now).Round(time.Second)
-			h.attemptsMu.Unlock()
-			return false, http.StatusForbidden, fmt.Sprintf("IP banned due to too many failed attempts. Try again in %s", remaining)
+	// Ban logic only applies to remote clients. Local clients (loopback) get
+	// unlimited attempts: the threat model is an off-host attacker probing a
+	// management key, not the operator sitting at the machine.
+	if !localClient {
+		h.attemptsMu.Lock()
+		ai := h.failedAttempts[clientIP]
+		if ai != nil && !ai.blockedUntil.IsZero() {
+			if now.Before(ai.blockedUntil) {
+				remaining := ai.blockedUntil.Sub(now).Round(time.Second)
+				h.attemptsMu.Unlock()
+				return false, http.StatusForbidden, fmt.Sprintf("IP banned due to too many failed attempts. Try again in %s", remaining)
+			}
+			// Ban expired, reset state
+			ai.blockedUntil = time.Time{}
+			ai.count = 0
 		}
-		// Ban expired, reset state
-		ai.blockedUntil = time.Time{}
-		ai.count = 0
+		h.attemptsMu.Unlock()
 	}
-	h.attemptsMu.Unlock()
 
 	if !localClient && !allowRemote {
 		return false, http.StatusForbidden, "remote management disabled"
 	}
 
+	// fail/reset are no-ops for local clients: we don't track their attempts
+	// at all (see the early return above for the ban check). This keeps the
+	// failedAttempts map bounded to remote IPs only.
 	fail := func() {
+		if localClient {
+			return
+		}
 		h.attemptsMu.Lock()
 		aip := h.failedAttempts[clientIP]
 		if aip == nil {
@@ -266,6 +277,9 @@ func (h *Handler) AuthenticateManagementKey(clientIP string, localClient bool, p
 	}
 
 	reset := func() {
+		if localClient {
+			return
+		}
 		h.attemptsMu.Lock()
 		if ai := h.failedAttempts[clientIP]; ai != nil {
 			ai.count = 0
