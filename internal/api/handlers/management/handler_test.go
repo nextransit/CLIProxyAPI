@@ -73,3 +73,51 @@ func TestAuthenticateManagementKey_RemoteIPBanBlocksCorrectKeyDuringBan(t *testi
 		t.Fatalf("unexpected banned message: %q", errMsg)
 	}
 }
+
+func TestIsLocalClientIP_AcceptsPrivateNetworks(t *testing.T) {
+	cases := map[string]bool{
+		"":             false,
+		"not-an-ip":    false,
+		"127.0.0.1":    true,
+		"::1":          true,
+		"10.0.0.5":     true,
+		"172.16.0.1":   true,
+		"172.31.255.1": true,
+		"192.168.1.1":  true,
+		"fd00::1":      true,
+		"8.8.8.8":      false,
+		"172.32.0.1":   false,
+		"203.0.113.5":  false,
+	}
+	for addr, want := range cases {
+		if got := isLocalClientIP(addr); got != want {
+			t.Errorf("isLocalClientIP(%q) = %v, want %v", addr, got, want)
+		}
+	}
+}
+
+// Docker bridge networking presents the host as 172.17.0.1 instead of
+// 127.0.0.1. The previous test set used a literal 127.0.0.1 which
+// matched a brittle string comparison. Make sure the realistic Docker
+// loopback still goes through the no-ban path.
+func TestAuthenticateManagementKey_DockerHostAddressIsNotBanned(t *testing.T) {
+	h := &Handler{
+		cfg:            &config.Config{},
+		failedAttempts: make(map[string]*attemptInfo),
+		envSecret:      "test-secret",
+	}
+	const dockerHost = "172.17.0.1"
+	for i := 0; i < 20; i++ {
+		allowed, statusCode, errMsg := h.AuthenticateManagementKey(dockerHost, true, "wrong-secret")
+		if allowed {
+			t.Fatalf("expected auth to be denied at attempt %d", i+1)
+		}
+		if statusCode != http.StatusUnauthorized || errMsg != "invalid management key" {
+			t.Fatalf("unexpected auth failure at attempt %d: status=%d msg=%q", i+1, statusCode, errMsg)
+		}
+	}
+	allowed, statusCode, _ := h.AuthenticateManagementKey(dockerHost, true, "test-secret")
+	if !allowed {
+		t.Fatalf("expected docker host address with the correct key to be allowed, got status=%d", statusCode)
+	}
+}

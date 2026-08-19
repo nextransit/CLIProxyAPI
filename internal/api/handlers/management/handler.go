@@ -5,6 +5,7 @@ package management
 import (
 	"crypto/subtle"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -27,6 +28,41 @@ type attemptInfo struct {
 	count        int
 	blockedUntil time.Time
 	lastActivity time.Time // track last activity for cleanup
+}
+
+// isLocalClientIP reports whether addr represents a loopback caller or
+// a caller on a private/RFC1918 network. Docker bridge networking (and
+// similar host-published setups) presents the host as 172.x or
+// 192.168.x rather than 127.0.0.1, but those callers are still local
+// to the operator's machine and the ban threat model does not apply
+// to them.
+func isLocalClientIP(addr string) bool {
+	if addr == "" {
+		return false
+	}
+	ip := net.ParseIP(addr)
+	if ip == nil {
+		return false
+	}
+	if ip.IsLoopback() {
+		return true
+	}
+	privateRanges := []string{
+		"10.0.0.0/8",
+		"172.16.0.0/12",
+		"192.168.0.0/16",
+		"fd00::/8",
+	}
+	for _, cidr := range privateRanges {
+		_, network, errParse := net.ParseCIDR(cidr)
+		if errParse != nil {
+			continue
+		}
+		if network.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 // attemptCleanupInterval controls how often stale IP entries are purged
@@ -181,7 +217,11 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 		c.Header("X-CPA-BUILD-DATE", buildinfo.BuildDate)
 
 		clientIP := c.ClientIP()
-		localClient := clientIP == "127.0.0.1" || clientIP == "::1"
+		// Treat loopback callers AND callers from private/RFC1918 ranges as
+		// local. Docker bridge networking presents the host as 172.x or
+		// 192.168.x rather than 127.0.0.1, but they are still local to the
+		// operator and the ban threat model does not apply.
+		localClient := isLocalClientIP(clientIP)
 
 		// Accept either Authorization: Bearer <key> or X-Management-Key
 		var provided string
