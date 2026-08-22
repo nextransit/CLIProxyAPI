@@ -2072,10 +2072,26 @@ var authServiceUnavailableRetryBackoff = []time.Duration{
 // isAuthServiceUnavailableError checks if the error is a 503 Service Unavailable
 // with an auth_unavailable or auth_not_found message, indicating transient
 // auth unavailability that should be retried with fixed backoff.
+// Also matches selector-level auth_unavailable/auth_not_found errors (HTTPStatus 0)
+// that are later converted to 503 by enrichAuthSelectionError.
 func isAuthServiceUnavailableError(err error) bool {
 	if err == nil {
 		return false
 	}
+	// Check for auth-level error codes (selector returns these with HTTPStatus 0).
+	// Only match when the status is 0 (selector) or 503 (upstream), so a 500
+	// wrapped auth error is not treated as transient auth unavailability.
+	var authErr *Error
+	if errors.As(err, &authErr) && authErr != nil {
+		code := strings.TrimSpace(authErr.Code)
+		if code == "auth_unavailable" || code == "auth_not_found" {
+			status := authErr.HTTPStatus
+			if status == 0 || status == http.StatusServiceUnavailable {
+				return true
+			}
+		}
+	}
+	// Check for executor-level StatusError (503 from upstream HTTP call).
 	var se cliproxyexecutor.StatusError
 	if !errors.As(err, &se) || se == nil {
 		return false

@@ -108,6 +108,136 @@ func TestManager_ShouldRetryAfterError_UsesOAuthModelAliasForCooldown(t *testing
 	}
 }
 
+// testStatusErr is a minimal StatusError implementation for testing
+// shouldRetryAfterError with HTTP-like status errors.
+type testStatusErr struct {
+	code int
+	msg  string
+}
+
+func (e testStatusErr) Error() string    { return e.msg }
+func (e testStatusErr) StatusCode() int  { return e.code }
+
+func TestAuthServiceUnavailableRetryBackoff(t *testing.T) {
+	expected := []time.Duration{3 * time.Second, 5 * time.Second, 8 * time.Second, 10 * time.Second}
+	if len(authServiceUnavailableRetryBackoff) != len(expected) {
+		t.Fatalf("backoff length = %d, want %d", len(authServiceUnavailableRetryBackoff), len(expected))
+	}
+	for i := range expected {
+		if authServiceUnavailableRetryBackoff[i] != expected[i] {
+			t.Fatalf("backoff[%d] = %v, want %v", i, authServiceUnavailableRetryBackoff[i], expected[i])
+		}
+	}
+}
+
+func TestIsAuthServiceUnavailableError(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "503 auth_unavailable",
+			err:  &Error{HTTPStatus: http.StatusServiceUnavailable, Code: "auth_unavailable", Message: "no auth available (providers=codex, model=gpt-5.5)"},
+			want: true,
+		},
+		{
+			name: "503 auth_not_found",
+			err:  &Error{HTTPStatus: http.StatusServiceUnavailable, Code: "auth_not_found", Message: "no auth candidates"},
+			want: true,
+		},
+		{
+			name: "503 generic body no auth",
+			err:  &Error{HTTPStatus: http.StatusServiceUnavailable, Message: "no auth available (providers=codex, model=gpt-5.5)"},
+			want: true,
+		},
+		{
+			name: "500 is not auth unavailable",
+			err:  &Error{HTTPStatus: http.StatusInternalServerError, Code: "auth_unavailable", Message: "boom"},
+			want: false,
+		},
+		{
+			name: "503 unrelated message",
+			err:  &Error{HTTPStatus: http.StatusServiceUnavailable, Message: "upstream down"},
+			want: false,
+		},
+		{
+			name: "nil",
+			err:  nil,
+			want: false,
+		},
+		// Selector-level errors (HTTPStatus=0) should also match, since
+		// enrichAuthSelectionError later converts them to 503.
+		{
+			name: "selector auth_unavailable",
+			err:  &Error{Code: "auth_unavailable", Message: "no auth available"},
+			want: true,
+		},
+		{
+			name: "selector auth_not_found",
+			err:  &Error{Code: "auth_not_found", Message: "no auth candidates"},
+			want: true,
+		},
+		{
+			name: "selector unrelated error",
+			err:  &Error{Code: "executor_not_found", Message: "executor not registered"},
+			want: false,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := isAuthServiceUnavailableError(c.err); got != c.want {
+				t.Fatalf("isAuthServiceUnavailableError() = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+func TestManager_ShouldRetryAfterError_AuthUnavailableFixedBackoff(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	// maxWait intentionally 0 to verify the fixed backoff is independent of maxRetryInterval.
+	m.SetRetryConfig(0, 0, 0)
+
+	backoffCases := []struct {
+		attempt int
+		want    time.Duration
+	}{
+		{0, 3 * time.Second},
+		{1, 5 * time.Second},
+		{2, 8 * time.Second},
+		{3, 10 * time.Second},
+		{4, 0}, // no more retries after 4 attempts
+	}
+
+	for _, c := range backoffCases {
+		errAuth := &Error{HTTPStatus: http.StatusServiceUnavailable, Code: "auth_unavailable", Message: "no auth available (providers=codex, model=gpt-5.5)"}
+		wait, shouldRetry := m.shouldRetryAfterError(errAuth, c.attempt, []string{"codex"}, "gpt-5.5", 0)
+		if c.want == 0 {
+			if shouldRetry {
+				t.Fatalf("attempt=%d: expected shouldRetry=false, got true (wait=%v)", c.attempt, wait)
+			}
+			continue
+		}
+		if !shouldRetry {
+			t.Fatalf("attempt=%d: expected shouldRetry=true, got false", c.attempt)
+		}
+		if wait != c.want {
+			t.Fatalf("attempt=%d: wait=%v, want %v", c.attempt, wait, c.want)
+		}
+	}
+
+	// Selector-level error (HTTPStatus=0, converted to 503 by enrichAuthSelectionError)
+	// must also get the fixed backoff.
+	selectorErr := &Error{Code: "auth_unavailable", Message: "no auth available"}
+	wait, shouldRetry := m.shouldRetryAfterError(selectorErr, 0, []string{"codex"}, "gpt-5.5", 0)
+	if !shouldRetry {
+		t.Fatalf("expected selector-level auth_unavailable to retry, got false")
+	}
+	if wait != 3*time.Second {
+		t.Fatalf("selector error wait = %v, want 3s", wait)
+	}
+}
+
 type credentialRetryLimitExecutor struct {
 	id string
 
