@@ -44,12 +44,17 @@ type TokenSummary struct {
 }
 
 // UsagePayload is a minimal subset of the snapshot used for SSE push.
+// RequestsByDay / TokensByDay mirror the daily aggregates exposed by the
+// full StatisticsSnapshot so the SSE summary can refresh the
+// "今日请求" / "今日 Token" cards without waiting on a heavy snapshot.
 type UsagePayload struct {
-	TotalRequests int64  `json:"total_requests"`
-	TotalTokens   int64  `json:"total_tokens"`
-	SuccessCount  int64  `json:"success_count"`
-	FailureCount  int64  `json:"failure_count"`
-	LatestID      uint64 `json:"latest_event_id"`
+	TotalRequests int64            `json:"total_requests"`
+	TotalTokens   int64            `json:"total_tokens"`
+	SuccessCount  int64            `json:"success_count"`
+	FailureCount  int64            `json:"failure_count"`
+	LatestID      uint64           `json:"latest_event_id"`
+	RequestsByDay map[string]int64 `json:"requests_by_day"`
+	TokensByDay   map[string]int64 `json:"tokens_by_day"`
 }
 
 var statisticsEnabled atomic.Bool
@@ -1032,15 +1037,29 @@ func formatHour(hour int) string {
 }
 
 // SnapshotPayload returns a lightweight snapshot of aggregate counters.
+// It now also returns the per-day request/token counts so the SSE summary
+// can refresh the "今日请求" / "今日 Token" cards without waiting on a
+// heavy StatisticsSnapshot reload. The map values are monotonically
+// increasing, so callers should take the per-day max on merge.
 func (s *RequestStatistics) SnapshotPayload() UsagePayload {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	req := make(map[string]int64, len(s.requestsByDay))
+	for k, v := range s.requestsByDay {
+		req[k] = v
+	}
+	tk := make(map[string]int64, len(s.tokensByDay))
+	for k, v := range s.tokensByDay {
+		tk[k] = v
+	}
 	return UsagePayload{
 		TotalRequests: s.totalRequests,
 		TotalTokens:   s.totalTokens,
 		SuccessCount:  s.successCount,
 		FailureCount:  s.failureCount,
 		LatestID:      s.recent.LastID(),
+		RequestsByDay: req,
+		TokensByDay:   tk,
 	}
 }
 
