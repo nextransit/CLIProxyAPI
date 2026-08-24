@@ -47,6 +47,8 @@ type TokenSummary struct {
 type UsagePayload struct {
 	TotalRequests int64  `json:"total_requests"`
 	TotalTokens   int64  `json:"total_tokens"`
+	SuccessCount  int64  `json:"success_count"`
+	FailureCount  int64  `json:"failure_count"`
 	LatestID      uint64 `json:"latest_event_id"`
 }
 
@@ -1036,6 +1038,8 @@ func (s *RequestStatistics) SnapshotPayload() UsagePayload {
 	return UsagePayload{
 		TotalRequests: s.totalRequests,
 		TotalTokens:   s.totalTokens,
+		SuccessCount:  s.successCount,
+		FailureCount:  s.failureCount,
 		LatestID:      s.recent.LastID(),
 	}
 }

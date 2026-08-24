@@ -89,6 +89,9 @@ func TestUsageEvents_SendsSummaryAndUsageEvent(t *testing.T) {
 	if !strings.Contains(body, "event: summary") {
 		t.Errorf("missing summary event, body:\n%s", body)
 	}
+	if !strings.Contains(body, `"success_count":0`) || !strings.Contains(body, `"failure_count":0`) {
+		t.Errorf("missing success/failure counters in summary, body:\n%s", body)
+	}
 	if !strings.Contains(body, "event: usage_event") {
 		t.Errorf("missing usage_event, body:\n%s", body)
 	}
