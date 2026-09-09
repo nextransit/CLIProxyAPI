@@ -16,6 +16,8 @@ STATS_FILE="${STATS_DIR}/.usage_backup.json"
 SECRET_FILE="${STATS_DIR}/.api_secret"
 WITH_USAGE=false
 RUN_MODE="source"
+BASE_BUILDER_IMAGE="docker.m.daocloud.io/library/golang:1.26-alpine"
+BASE_RUNTIME_IMAGE="docker.m.daocloud.io/library/alpine:3.22.0"
 
 get_port() {
   if [[ -f "config.yaml" ]]; then
@@ -108,6 +110,24 @@ wait_for_service() {
     sleep 1
   done
   sleep 2
+}
+
+# Fail fast against the same mirror-backed base images used by the Dockerfile.
+# In this network the Docker Hub auth path can be polluted or intercepted even
+# when Docker Desktop has explicit public DNS configured, so test the exact
+# pulls the build depends on through the daemon.
+preflight_base_images() {
+  local image
+  for image in "$BASE_BUILDER_IMAGE" "$BASE_RUNTIME_IMAGE"; do
+    if timeout 60 docker pull --quiet "$image" >/dev/null 2>&1; then
+      continue
+    fi
+    echo "Error: Docker daemon cannot pull base image: $image" >&2
+    echo "The current network path cannot reach the configured mirror or its auth flow." >&2
+    echo "Verify this exact pull manually, then re-run this script:" >&2
+    echo "  docker pull $image" >&2
+    exit 1
+  done
 }
 
 cleanup_build_cache() {
@@ -232,10 +252,17 @@ case "$RUN_MODE" in
     export CLI_PROXY_IMAGE="cli-proxy-api:local"
 
     echo "Building the Docker image..."
+    preflight_base_images
+    # Allow overriding the Go module proxy/checksum db used inside the build
+    # (the default network path cannot reach proxy.golang.org / sum.golang.org).
+    : "${GOPROXY:=https://goproxy.cn,direct}"
+    : "${GOSUMDB:=off}"
     docker compose build \
       --build-arg VERSION="${VERSION}" \
       --build-arg COMMIT="${COMMIT}" \
-      --build-arg BUILD_DATE="${BUILD_DATE}"
+      --build-arg BUILD_DATE="${BUILD_DATE}" \
+      --build-arg GOPROXY="${GOPROXY}" \
+      --build-arg GOSUMDB="${GOSUMDB}"
     cleanup_build_cache
 
     if [[ "${WITH_USAGE}" == "true" ]]; then

@@ -108,11 +108,13 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		}
 	}
 
+	reporter.SetThinkingFromPayload(req.Payload)
+
 	translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
 		return resp, err
 	}
-	reporter.SetThinkingFromPayload(translated)
+	reporter.SetThinkingFromPayloadIfMissing(translated)
 
 	translated, err = normalizeOpenAICompatToolMessages(translated)
 	if err != nil {
@@ -957,6 +959,12 @@ func normalizeDeepSeekThinkingRequest(payload []byte, modelID, provider string) 
 			}
 		}
 	}
+
+	if !reasoningEffortOnly && thinkingType != "" {
+		if updated, errSet := sjson.SetBytes(out, "extra_body.thinking.type", thinkingType); errSet == nil {
+			out = updated
+		}
+	}
 	return out
 }
 
@@ -1052,6 +1060,11 @@ func normalizeMiniMaxM3Request(payload []byte, model string) []byte {
 		if updated, errDelete := sjson.DeleteBytes(out, "reasoning_effort"); errDelete == nil {
 			out = updated
 		}
+		if thinkingType != "disabled" && !gjson.GetBytes(out, "reasoning_split").Exists() {
+			if updated, errSet := sjson.SetBytes(out, "reasoning_split", true); errSet == nil {
+				out = updated
+			}
+		}
 	}
 
 	thinking := gjson.GetBytes(out, "thinking")
@@ -1059,21 +1072,17 @@ func normalizeMiniMaxM3Request(payload []byte, model string) []byte {
 		return out
 	}
 	thinkingType := strings.ToLower(strings.TrimSpace(thinking.Get("type").String()))
-	if thinkingType == "" {
+	switch thinkingType {
+	case "", "enabled":
 		thinkingType = "adaptive"
-		if updated, errSet := sjson.SetBytes(out, "extra_body.thinking.type", thinkingType); errSet == nil {
-			out = updated
-		}
-	} else if thinkingType == "none" || thinkingType == "0" {
+	case "none", "0":
 		thinkingType = "disabled"
-		if updated, errSet := sjson.SetBytes(out, "extra_body.thinking.type", thinkingType); errSet == nil {
-			out = updated
-		}
-	} else if thinkingType != "disabled" && thinkingType != "adaptive" {
-		thinkingType = "adaptive"
-		if updated, errSet := sjson.SetBytes(out, "extra_body.thinking.type", thinkingType); errSet == nil {
-			out = updated
-		}
+	}
+	if updated, errSet := sjson.SetBytes(out, "thinking.type", thinkingType); errSet == nil {
+		out = updated
+	}
+	if updated, errSet := sjson.SetBytes(out, "extra_body.thinking.type", thinkingType); errSet == nil {
+		out = updated
 	}
 	if thinkingType != "disabled" {
 		if updated, errSet := sjson.SetBytes(out, "reasoning_split", true); errSet == nil {

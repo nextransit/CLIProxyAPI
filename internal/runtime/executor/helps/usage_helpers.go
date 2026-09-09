@@ -344,7 +344,7 @@ func parseClaudeThinkingPayload(payload []byte) *usage.Thinking {
 		return buildThinkingFromBudget(0)
 	case "adaptive":
 		if effort != "" {
-			return buildThinkingFromEffort(effort)
+			return &usage.Thinking{Intensity: effort, Mode: effort, Level: effort}
 		}
 		return buildThinkingFromEffort("auto")
 	case "enabled":

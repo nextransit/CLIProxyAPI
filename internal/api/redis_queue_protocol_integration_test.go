@@ -428,7 +428,7 @@ func TestRedisProtocol_AUTH_IPBan_BlocksCorrectPasswordDuringBan(t *testing.T) {
 	}
 }
 
-func TestRedisProtocol_LOCALHOST_AUTH_IPBan_BlocksCorrectPasswordDuringBan(t *testing.T) {
+func TestRedisProtocol_LOCALHOST_AUTH_NotBannedAfterRepeatedWrongPasswords(t *testing.T) {
 	const managementPassword = "test-management-password"
 
 	t.Setenv("MANAGEMENT_PASSWORD", managementPassword)
@@ -466,11 +466,9 @@ func TestRedisProtocol_LOCALHOST_AUTH_IPBan_BlocksCorrectPasswordDuringBan(t *te
 	if errWrite := writeTestRESPCommand(conn, "AUTH", managementPassword); errWrite != nil {
 		t.Fatalf("failed to write AUTH command with correct password: %v", errWrite)
 	}
-	msg, err := readTestRESPError(reader)
-	if err != nil {
-		t.Fatalf("failed to read AUTH banned error for correct password: %v", err)
-	}
-	if !strings.HasPrefix(msg, "ERR IP banned due to too many failed attempts. Try again in") {
-		t.Fatalf("unexpected AUTH banned error for correct password: %q", msg)
+	if msg, err := readTestRESPSimpleString(reader); err != nil {
+		t.Fatalf("localhost caller should not be banned after wrong passwords, got error: %v", err)
+	} else if msg != "OK" {
+		t.Fatalf("unexpected AUTH response for correct password from localhost: %q", msg)
 	}
 }

@@ -1,8 +1,16 @@
-FROM golang:1.26-alpine AS builder
+FROM docker.m.daocloud.io/library/golang:1.26-alpine AS builder
 
 WORKDIR /app
 
 COPY go.mod go.sum ./
+
+# The build container cannot reach the default Go module proxy
+# (proxy.golang.org) in this network, so point at a reachable mirror and
+# skip the unreachable checksum database. Override via build args if needed.
+ARG GOPROXY=https://goproxy.cn,direct
+ARG GOSUMDB=off
+ENV GOPROXY=${GOPROXY}
+ENV GOSUMDB=${GOSUMDB}
 
 RUN go mod download
 
@@ -18,7 +26,7 @@ RUN effective_version="${VERSION}"; \
     fi; \
     CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X 'main.Version=${effective_version}' -X 'main.Commit=${COMMIT}' -X 'main.BuildDate=${BUILD_DATE}'" -o ./CLIProxyAPI ./cmd/server/
 
-FROM alpine:3.22.0
+FROM docker.m.daocloud.io/library/alpine:3.22.0
 
 # Install CA certificates so the embedded HTTP client can verify TLS chains
 # against system roots without having to create per-request OpenSSL contexts

@@ -3,6 +3,7 @@ package management
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
 	"os"
@@ -17,9 +18,10 @@ import (
 )
 
 const (
-	defaultLogFileName      = "main.log"
-	logScannerInitialBuffer = 64 * 1024
-	logScannerMaxBuffer     = 8 * 1024 * 1024
+	defaultLogFileName     = "main.log"
+	logReaderBufferSize    = 64 * 1024
+	logMaxLineBytes        = 64 * 1024 * 1024
+	logLineTruncatedSuffix = " ... [truncated]"
 )
 
 var logSearchAliases = map[string][]string{
@@ -689,11 +691,8 @@ func summarizeRequestErrorLog(path string) (string, error) {
 		_ = file.Close()
 	}()
 
-	scanner := bufio.NewScanner(file)
-	buf := make([]byte, 0, logScannerInitialBuffer)
-	scanner.Buffer(buf, logScannerMaxBuffer)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
+	errScan := scanLogFile(file, func(raw string) {
+		line := strings.TrimSpace(raw)
 		switch {
 		case strings.HasPrefix(line, "URL:"):
 			if value := strings.TrimSpace(strings.TrimPrefix(line, "URL:")); value != "" {
@@ -716,8 +715,8 @@ func summarizeRequestErrorLog(path string) (string, error) {
 				summary.status = status
 			}
 		}
-	}
-	if errScan := scanner.Err(); errScan != nil {
+	})
+	if errScan != nil {
 		return "", errScan
 	}
 
@@ -820,16 +819,46 @@ func (acc *logAccumulator) consumeFile(path string) error {
 		_ = file.Close()
 	}()
 
-	scanner := bufio.NewScanner(file)
-	buf := make([]byte, 0, logScannerInitialBuffer)
-	scanner.Buffer(buf, logScannerMaxBuffer)
-	for scanner.Scan() {
-		acc.addLine(scanner.Text())
-	}
-	if errScan := scanner.Err(); errScan != nil {
+	errScan := scanLogFile(file, acc.addLine)
+	if errScan != nil {
 		return errScan
 	}
 	return nil
+}
+
+func scanLogFile(file *os.File, handle func(string)) error {
+	reader := bufio.NewReaderSize(file, logReaderBufferSize)
+	line := make([]byte, 0, logReaderBufferSize)
+	truncated := false
+
+	for {
+		fragment, isPrefix, errRead := reader.ReadLine()
+		if len(fragment) > 0 && !truncated {
+			remaining := logMaxLineBytes - len(line)
+			if len(fragment) > remaining {
+				line = append(line, fragment[:remaining]...)
+				truncated = true
+			} else {
+				line = append(line, fragment...)
+			}
+		}
+
+		if !isPrefix && (len(line) > 0 || len(fragment) > 0 || errRead != io.EOF) {
+			if truncated {
+				line = append(line, logLineTruncatedSuffix...)
+			}
+			handle(string(line))
+			line = line[:0]
+			truncated = false
+		}
+
+		if errRead == io.EOF {
+			return nil
+		}
+		if errRead != nil {
+			return errRead
+		}
+	}
 }
 
 func (acc *logAccumulator) addLine(raw string) {
