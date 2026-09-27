@@ -1068,7 +1068,7 @@ func normalizeMiniMaxM3Request(payload []byte, model string) []byte {
 	}
 
 	thinking := gjson.GetBytes(out, "thinking")
-	if !thinking.Exists() || !thinking.IsObject() || gjson.GetBytes(out, "reasoning_split").Exists() {
+	if !thinking.Exists() || !thinking.IsObject() {
 		return out
 	}
 	thinkingType := strings.ToLower(strings.TrimSpace(thinking.Get("type").String()))
@@ -1084,7 +1084,7 @@ func normalizeMiniMaxM3Request(payload []byte, model string) []byte {
 	if updated, errSet := sjson.SetBytes(out, "extra_body.thinking.type", thinkingType); errSet == nil {
 		out = updated
 	}
-	if thinkingType != "disabled" {
+	if thinkingType != "disabled" && !gjson.GetBytes(out, "reasoning_split").Exists() {
 		if updated, errSet := sjson.SetBytes(out, "reasoning_split", true); errSet == nil {
 			out = updated
 		}

@@ -359,3 +359,22 @@ func TestNormalizeMiniMaxM3RequestNoReasoningEffortEmptyThinkingDefaultsAdaptive
 		t.Fatalf("reasoning_split = %v, want true when thinking defaults to adaptive, body=%s", got, string(out))
 	}
 }
+
+func TestNormalizeMiniMaxM3RequestMapsClaudeEnabledThinkingWhenReasoningSplitExists(t *testing.T) {
+	input := []byte(`{"model":"MiniMax-M3","messages":[],"reasoning_split":true,"thinking":{"type":"enabled","budget_tokens":32768}}`)
+
+	out := normalizeMiniMaxM3Request(input, "MiniMax-M3")
+
+	if got := gjson.GetBytes(out, "thinking.type").String(); got != "adaptive" {
+		t.Fatalf("thinking.type = %q, want adaptive, body=%s", got, string(out))
+	}
+	if got := gjson.GetBytes(out, "extra_body.thinking.type").String(); got != "adaptive" {
+		t.Fatalf("extra_body.thinking.type = %q, want adaptive, body=%s", got, string(out))
+	}
+	if gjson.GetBytes(out, "thinking.budget_tokens").Exists() {
+		t.Fatalf("thinking.budget_tokens should be removed, body=%s", string(out))
+	}
+	if got := gjson.GetBytes(out, "reasoning_split").Bool(); !got {
+		t.Fatalf("reasoning_split = %v, want true, body=%s", got, string(out))
+	}
+}
