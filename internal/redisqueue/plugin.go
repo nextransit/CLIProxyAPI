@@ -66,18 +66,25 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 		tokens.TotalTokens = tokens.InputTokens + tokens.OutputTokens + tokens.ReasoningTokens + tokens.CachedTokens
 	}
 
+	// Match the central usage statistics rule: only an observed HTTP 200 is a
+	// success. Prefer the upstream status captured by executors, then the Gin
+	// response status; keep the explicit failure marker as the final fallback.
+	statusCode := resolveStatusCode(ctx, record.StatusCode)
 	failed := record.Failed
-	if !failed {
+	if statusCode > 0 {
+		failed = statusCode != http.StatusOK
+	} else if !failed {
 		failed = !resolveSuccess(ctx)
 	}
 
 	detail := internalusage.RequestDetail{
-		Timestamp: timestamp,
-		LatencyMs: record.Latency.Milliseconds(),
-		Source:    record.Source,
-		AuthIndex: record.AuthIndex,
-		Tokens:    tokens,
-		Failed:    failed,
+		Timestamp:  timestamp,
+		LatencyMs:  record.Latency.Milliseconds(),
+		Source:     record.Source,
+		AuthIndex:  record.AuthIndex,
+		StatusCode: statusCode,
+		Tokens:     tokens,
+		Failed:     failed,
 	}
 
 	payload, err := json.Marshal(queuedUsageDetail{
@@ -105,19 +112,31 @@ type queuedUsageDetail struct {
 	RequestID string `json:"request_id"`
 }
 
-func resolveSuccess(ctx context.Context) bool {
+// resolveStatusCode returns the best observed HTTP status for a queued usage
+// record: the upstream status captured by the executor when available,
+// otherwise the Gin response status.
+func resolveStatusCode(ctx context.Context, recordStatus int) int {
+	if recordStatus > 0 {
+		return recordStatus
+	}
 	if ctx == nil {
-		return true
+		return 0
 	}
 	ginCtx, ok := ctx.Value("gin").(*gin.Context)
-	if !ok || ginCtx == nil {
-		return true
+	if !ok || ginCtx == nil || ginCtx.Writer == nil {
+		return 0
 	}
-	status := ginCtx.Writer.Status()
+	return ginCtx.Writer.Status()
+}
+
+// resolveSuccess reports success only for an explicit HTTP 200 status.
+// A zero status is treated as legacy success when no failure marker exists.
+func resolveSuccess(ctx context.Context) bool {
+	status := resolveStatusCode(ctx, 0)
 	if status == 0 {
 		return true
 	}
-	return status < http.StatusBadRequest
+	return status == http.StatusOK
 }
 
 func resolveEndpoint(ctx context.Context) string {

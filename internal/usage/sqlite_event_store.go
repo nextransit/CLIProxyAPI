@@ -373,15 +373,28 @@ func upsertRollupsTx(ctx context.Context, tx *sql.Tx, record coreusage.Record, e
 	}
 	source := strings.TrimSpace(firstNonEmpty(record.Source, evt.Source))
 	authIndex := strings.TrimSpace(firstNonEmpty(record.AuthIndex, evt.AuthIndex))
+	// Non-200 / failed requests must not bump the requests or token rollups;
+	// the dedicated failures column still records them so dashboards can
+	// surface a failure rate without inflating headline totals.
+	var rollupRequests int64
+	var rollupInputTokens, rollupOutputTokens, rollupReasoningTokens, rollupCachedTokens, rollupTotalTokens int64
+	if !evt.Failed {
+		rollupRequests = 1
+		rollupInputTokens = evt.Tokens.Input
+		rollupOutputTokens = evt.Tokens.Output
+		rollupReasoningTokens = evt.Tokens.Reasoning
+		rollupCachedTokens = evt.Tokens.Cached
+		rollupTotalTokens = evt.Tokens.Total
+	}
 	for _, bucket := range usageRollupBuckets(evt.RequestedAt) {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO usage_rollups (
 			period, bucket_start_unix_ms, api_key_hash, api_key_mask, model, source,
 			auth_index, requests, failures, input_tokens, output_tokens, reasoning_tokens,
 			cached_tokens, total_tokens, latency_sum_ms, latency_count
-		) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(period, bucket_start_unix_ms, api_key_hash, model, source, auth_index)
 		DO UPDATE SET
-			requests = requests + 1,
+			requests = requests + excluded.requests,
 			failures = failures + excluded.failures,
 			input_tokens = input_tokens + excluded.input_tokens,
 			output_tokens = output_tokens + excluded.output_tokens,
@@ -397,12 +410,13 @@ func upsertRollupsTx(ctx context.Context, tx *sql.Tx, record coreusage.Record, e
 			model,
 			source,
 			authIndex,
+			rollupRequests,
 			boolInt(evt.Failed),
-			evt.Tokens.Input,
-			evt.Tokens.Output,
-			evt.Tokens.Reasoning,
-			evt.Tokens.Cached,
-			evt.Tokens.Total,
+			rollupInputTokens,
+			rollupOutputTokens,
+			rollupReasoningTokens,
+			rollupCachedTokens,
+			rollupTotalTokens,
 			positiveLatency(evt.DurationMs),
 			boolInt(evt.DurationMs > 0),
 		); err != nil {

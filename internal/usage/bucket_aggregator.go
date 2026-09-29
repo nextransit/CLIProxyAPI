@@ -167,14 +167,18 @@ func (r *BucketRing) Record(t time.Time, model string, authIndex string, tokens 
 		return
 	}
 	slot := &r.buckets[idx]
-	slot.requests++
-	slot.tokens += tokens
-	if failed {
+	// Non-200 / failed requests must not contribute to request or token counts.
+	// Only the dedicated failures counter is incremented so dashboards can still
+	// derive a failure rate from successes+failures.
+	if !failed {
+		slot.requests++
+		slot.tokens += tokens
+		if latencyMs > 0 {
+			slot.latencySumMs += latencyMs
+			slot.latencySamples++
+		}
+	} else {
 		slot.failures++
-	}
-	if latencyMs > 0 {
-		slot.latencySumMs += latencyMs
-		slot.latencySamples++
 	}
 	if model != "" {
 		mb, ok := slot.modelBreakdown[model]
@@ -185,14 +189,15 @@ func (r *BucketRing) Record(t time.Time, model string, authIndex string, tokens 
 			mb = &modelBucketAcc{}
 			slot.modelBreakdown[model] = mb
 		}
-		mb.requests++
-		mb.tokens += tokens
-		if failed {
+		if !failed {
+			mb.requests++
+			mb.tokens += tokens
+			if latencyMs > 0 {
+				mb.latencySumMs += latencyMs
+				mb.latencySamples++
+			}
+		} else {
 			mb.failures++
-		}
-		if latencyMs > 0 {
-			mb.latencySumMs += latencyMs
-			mb.latencySamples++
 		}
 	}
 	if authIndex != "" {
@@ -204,9 +209,10 @@ func (r *BucketRing) Record(t time.Time, model string, authIndex string, tokens 
 			ab = &authBucketAcc{}
 			slot.authIdxBreakdown[authIndex] = ab
 		}
-		ab.requests++
-		ab.tokens += tokens
-		if failed {
+		if !failed {
+			ab.requests++
+			ab.tokens += tokens
+		} else {
 			ab.failures++
 		}
 	}

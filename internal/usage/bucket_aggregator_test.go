@@ -15,18 +15,36 @@ func TestBucketRing_BasicRecordAndRead(t *testing.T) {
 	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
 	r := NewBucketRing(3, time.Minute, now)
 	r.Record(now.Add(15*time.Second), "model-a", "auth-1", 100, false, 50)
+	// Failed records must NOT contribute to request/token/latency totals —
+	// only to the dedicated failures counter — so dashboards never inflate
+	// headline counts with non-2xx responses.
 	r.Record(now.Add(30*time.Second), "model-b", "auth-2", 200, true, 100)
 	snap := r.ReadSnapshot()
 	if len(snap.Buckets) != 3 {
 		t.Fatalf("len(buckets) = %d, want 3", len(snap.Buckets))
 	}
 	totalReqs := int64(0)
+	totalFailures := int64(0)
+	totalTokens := int64(0)
+	totalLatencyN := int64(0)
 	for _, b := range snap.Buckets {
-		t.Logf("bucket start=%v reqs=%d", b.StartTime, b.Requests)
+		t.Logf("bucket start=%v reqs=%d failures=%d", b.StartTime, b.Requests, b.Failures)
 		totalReqs += b.Requests
+		totalFailures += b.Failures
+		totalTokens += b.Tokens
+		totalLatencyN += b.LatencyN
 	}
-	if totalReqs != 2 {
-		t.Fatalf("total requests = %d, want 2", totalReqs)
+	if totalReqs != 1 {
+		t.Fatalf("total requests = %d, want 1 (failed record excluded)", totalReqs)
+	}
+	if totalFailures != 1 {
+		t.Fatalf("total failures = %d, want 1", totalFailures)
+	}
+	if totalTokens != 100 {
+		t.Fatalf("total tokens = %d, want 100 (failed record's tokens excluded)", totalTokens)
+	}
+	if totalLatencyN != 1 {
+		t.Fatalf("total latency samples = %d, want 1 (failed record's latency excluded)", totalLatencyN)
 	}
 }
 
@@ -108,32 +126,38 @@ func TestBucketRing_AdvanceForwardKeepsBucketsMonotonic(t *testing.T) {
 func TestBucketRing_IncrementalAdvanceKeepsDataInItsTimeBucket(t *testing.T) {
 	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
 	r := NewBucketRing(4, time.Minute, now)
+	// Successful record populates requests/tokens/latency.
 	r.Record(now.Add(-2*time.Minute+10*time.Second), "old", "", 10, false, 20)
+	// Failed record must contribute only to the failures counter; it must
+	// not bump requests/tokens/latency in the same bucket.
 	r.Record(now.Add(time.Minute+10*time.Second), "new", "", 20, true, 40)
 
 	snap := r.ReadSnapshot()
 	want := map[time.Time]struct {
 		requests int64
 		tokens   int64
+		failures int64
 	}{
-		now.Add(-2 * time.Minute): {requests: 1, tokens: 10},
-		now.Add(time.Minute):      {requests: 1, tokens: 20},
+		now.Add(-2 * time.Minute): {requests: 1, tokens: 10, failures: 0},
+		now.Add(time.Minute):      {requests: 0, tokens: 0, failures: 1},
 	}
 	for _, bucket := range snap.Buckets {
 		expected, ok := want[bucket.StartTime]
 		if !ok {
-			if bucket.Requests != 0 || bucket.Tokens != 0 {
+			if bucket.Requests != 0 || bucket.Tokens != 0 || bucket.Failures != 0 {
 				t.Fatalf("unexpected data in bucket %v: %+v", bucket.StartTime, bucket)
 			}
 			continue
 		}
-		if bucket.Requests != expected.requests || bucket.Tokens != expected.tokens {
-			t.Fatalf("bucket %v = %d requests/%d tokens, want %d/%d",
+		if bucket.Requests != expected.requests || bucket.Tokens != expected.tokens || bucket.Failures != expected.failures {
+			t.Fatalf("bucket %v = %d requests/%d tokens/%d failures, want %d/%d/%d",
 				bucket.StartTime,
 				bucket.Requests,
 				bucket.Tokens,
+				bucket.Failures,
 				expected.requests,
 				expected.tokens,
+				expected.failures,
 			)
 		}
 	}
@@ -220,8 +244,11 @@ func TestRequestStatistics_AggregateRoundTripRestoresRingsAndModels(t *testing.T
 	if restoredModel == nil {
 		t.Fatal("expected restored model breakdown")
 	}
-	if restoredModel.Failures != 1 || restoredModel.LatencySum != 250 || restoredModel.LatencyN != 1 {
-		t.Fatalf("restored model breakdown = %+v, want failure and latency fields", *restoredModel)
+	// Failed records must contribute only the Failures counter; latency is
+	// dropped because non-2xx responses do not belong in the headline
+	// request/token totals.
+	if restoredModel.Failures != 1 || restoredModel.LatencySum != 0 || restoredModel.LatencyN != 0 {
+		t.Fatalf("restored model breakdown = %+v, want failures=1 and no latency (failed requests excluded)", *restoredModel)
 	}
 }
 
@@ -283,28 +310,34 @@ func TestRequestStatistics_RestoreFromLegacySnapshotRebuildsRings(t *testing.T) 
 			},
 		},
 	}
+	// Aggregate counters (TotalRequests/Tokens/...) are copied verbatim
+	// from the legacy snapshot so a previously running instance keeps its
+	// pre-fix totals untouched. The new "failed is not a request" rule is
+	// enforced only for fresh ingests and the per-bucket ring rebuild path
+	// (see RestoreDetailsFromLegacySnapshot), which replays individual
+	// legacy Details through BucketRing.Record.
 	s := NewRequestStatistics()
 	s.RestoreFromLegacySnapshot(legacy)
 	if got := s.TotalRequests(); got != 3 {
-		t.Fatalf("total_requests = %d, want 3", got)
+		t.Fatalf("total_requests = %d, want 3 (legacy totals copied verbatim)", got)
 	}
 	if got := s.TotalTokens(); got != 600 {
-		t.Fatalf("total_tokens = %d, want 600", got)
+		t.Fatalf("total_tokens = %d, want 600 (legacy totals copied verbatim)", got)
 	}
 	ring5 := s.BucketRing5m().ReadSnapshot()
 	var ring5Total int64
 	for _, b := range ring5.Buckets {
 		ring5Total += b.Requests
 	}
-	if ring5Total != 3 {
-		t.Fatalf("5m ring total = %d, want 3 (legacy details should refill the rings)", ring5Total)
+	if ring5Total != 2 {
+		t.Fatalf("5m ring total = %d, want 2 (failed legacy entry excluded from ring rebuild)", ring5Total)
 	}
 	ring1h := s.BucketRing1h().ReadSnapshot()
 	var ring1hTotal int64
 	for _, b := range ring1h.Buckets {
 		ring1hTotal += b.Requests
 	}
-	if ring1hTotal != 3 {
-		t.Fatalf("1h ring total = %d, want 3 (legacy details should refill the rings)", ring1hTotal)
+	if ring1hTotal != 2 {
+		t.Fatalf("1h ring total = %d, want 2 (failed legacy entry excluded from ring rebuild)", ring1hTotal)
 	}
 }

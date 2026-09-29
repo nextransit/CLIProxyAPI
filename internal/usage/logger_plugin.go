@@ -325,12 +325,19 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	if statsKey == "" {
 		statsKey = resolveAPIIdentifier(ctx, record)
 	}
+	// A request counts as successful only when the observed HTTP status is
+	// exactly 200. Prefer the real upstream status captured by executors;
+	// fall back to the Gin response status, then to the explicit failure
+	// marker (missing status + not marked failed keeps legacy compatibility).
+	statusCode := resolveStatusCode(ctx, record.StatusCode)
 	failed := record.Failed
-	if !failed {
+	if statusCode > 0 {
+		failed = statusCode != http.StatusOK
+	} else if !failed {
 		failed = !resolveSuccess(ctx)
 	}
 	success := !failed
-	statusCode := normaliseStatusCode(record.StatusCode, failed)
+	statusCode = normaliseStatusCode(statusCode, failed)
 	modelName := record.Model
 	if modelName == "" {
 		modelName = "unknown"
@@ -340,13 +347,18 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 
 	s.mu.Lock()
 
-	s.totalRequests++
 	if success {
 		s.successCount++
 	} else {
 		s.failureCount++
 	}
-	s.totalTokens += totalTokens
+	// Only count requests with HTTP status 200 toward request and token totals;
+	// anything else is still tracked via FailureCount and event Details, but
+	// must not inflate the headline request/token counts shown to operators.
+	if !failed {
+		s.totalRequests++
+		s.totalTokens += totalTokens
+	}
 
 	stats, ok := s.apis[statsKey]
 	if !ok {
@@ -366,10 +378,12 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 		Failed:     failed,
 	})
 
-	s.requestsByDay[dayKey]++
-	s.requestsByHour[hourKey]++
-	s.tokensByDay[dayKey] += totalTokens
-	s.tokensByHour[hourKey] += totalTokens
+	if !failed {
+		s.requestsByDay[dayKey]++
+		s.requestsByHour[hourKey]++
+		s.tokensByDay[dayKey] += totalTokens
+		s.tokensByHour[hourKey] += totalTokens
+	}
 
 	// Update pre-aggregated rotating rings. These let the read path
 	// answer dashboard / summary queries in O(bucketCount) instead of
@@ -422,15 +436,23 @@ const defaultModelDetailsCap = 5000
 const detailRetention = 24 * time.Hour
 
 func (s *RequestStatistics) updateAPIStats(stats *apiStats, model string, detail RequestDetail) {
-	stats.TotalRequests++
-	stats.TotalTokens += detail.Tokens.TotalTokens
+	// Mirror the top-level guard: non-200 / failed requests must not bump
+	// per-API or per-model request/token totals. The Details slice still
+	// keeps the entry so the latest-requests view and dashboards can show
+	// the failure event.
+	if !detail.Failed {
+		stats.TotalRequests++
+		stats.TotalTokens += detail.Tokens.TotalTokens
+	}
 	modelStatsValue, ok := stats.Models[model]
 	if !ok {
 		modelStatsValue = &modelStats{}
 		stats.Models[model] = modelStatsValue
 	}
-	modelStatsValue.TotalRequests++
-	modelStatsValue.TotalTokens += detail.Tokens.TotalTokens
+	if !detail.Failed {
+		modelStatsValue.TotalRequests++
+		modelStatsValue.TotalTokens += detail.Tokens.TotalTokens
+	}
 	modelStatsValue.Details = append(modelStatsValue.Details, detail)
 	// Cap: drop oldest entries first when we exceed the per-model limit.
 	// Truncating the head preserves the most-recent N, which is what the
@@ -942,22 +964,32 @@ func resolveAPIIdentifier(ctx context.Context, record coreusage.Record) string {
 	return "unknown"
 }
 
-func resolveSuccess(ctx context.Context) bool {
+// resolveStatusCode returns the best observed HTTP status for a usage
+// record: the upstream status captured by the executor when available,
+// otherwise the Gin response status.
+func resolveStatusCode(ctx context.Context, recordStatus int) int {
+	if recordStatus > 0 {
+		return recordStatus
+	}
 	if ctx == nil {
-		return true
+		return 0
 	}
 	ginCtx, ok := ctx.Value("gin").(*gin.Context)
-	if !ok || ginCtx == nil {
-		return true
+	if !ok || ginCtx == nil || ginCtx.Writer == nil {
+		return 0
 	}
-	status := ginCtx.Writer.Status()
+	return ginCtx.Writer.Status()
+}
+
+// resolveSuccess reports success only for an explicit HTTP 200 status.
+// A zero status is treated as legacy success when no failure marker exists.
+func resolveSuccess(ctx context.Context) bool {
+	status := resolveStatusCode(ctx, 0)
 	if status == 0 {
 		return true
 	}
-	return status < httpStatusBadRequest
+	return status == http.StatusOK
 }
-
-const httpStatusBadRequest = 400
 
 func normaliseDetail(detail coreusage.Detail) TokenStats {
 	tokens := TokenStats{

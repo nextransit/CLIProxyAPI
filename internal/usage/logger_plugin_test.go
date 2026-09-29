@@ -580,3 +580,140 @@ func TestRestoreDetailsFromRecentEventsDeduplicatesLegacyEventShape(t *testing.T
 		t.Fatalf("details length = %d, want legacy event deduplicated", len(details))
 	}
 }
+
+func TestRequestStatisticsRecordExcludesFailedFromRequestAndTokenCounts(t *testing.T) {
+	stats := NewRequestStatistics()
+
+	// One successful request: must count toward totals.
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "gpt-5.4",
+		RequestedAt: time.Now().Add(-1 * time.Minute),
+		Detail:      coreusage.Detail{InputTokens: 10, OutputTokens: 5, TotalTokens: 15},
+		Failed:      false,
+	})
+	// One failed request carrying the same payload shape: must NOT count.
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "gpt-5.4",
+		RequestedAt: time.Now(),
+		StatusCode:  502,
+		Detail:      coreusage.Detail{InputTokens: 10, OutputTokens: 5, TotalTokens: 15},
+		Failed:      true,
+	})
+
+	if got := stats.TotalRequests(); got != 1 {
+		t.Fatalf("TotalRequests() = %d, want 1 (failed request must be excluded)", got)
+	}
+	if got := stats.TotalTokens(); got != 15 {
+		t.Fatalf("TotalTokens() = %d, want 15 (failed request tokens must be excluded)", got)
+	}
+	// FailureCount is preserved so dashboards still derive a failure rate.
+	if got := stats.FailureCount(); got != 1 {
+		t.Fatalf("FailureCount() = %d, want 1", got)
+	}
+
+	apiStats := stats.Snapshot().APIs["test-key"]
+	if apiStats.TotalRequests != 1 {
+		t.Fatalf("apiStats.TotalRequests = %d, want 1", apiStats.TotalRequests)
+	}
+	if apiStats.TotalTokens != 15 {
+		t.Fatalf("apiStats.TotalTokens = %d, want 15", apiStats.TotalTokens)
+	}
+	modelStats := apiStats.Models["gpt-5.4"]
+	if modelStats.TotalRequests != 1 {
+		t.Fatalf("modelStats.TotalRequests = %d, want 1", modelStats.TotalRequests)
+	}
+	if modelStats.TotalTokens != 15 {
+		t.Fatalf("modelStats.TotalTokens = %d, want 15", modelStats.TotalTokens)
+	}
+	// Details slice keeps both events so latest-requests/dashboards still show
+	// the failure with its own status code.
+	if len(modelStats.Details) != 2 {
+		t.Fatalf("modelStats.Details len = %d, want 2 (failed entry preserved in details)", len(modelStats.Details))
+	}
+
+	// Per-day / per-hour rolling counters must also exclude failed records.
+	snap := stats.Snapshot()
+	dayKey := time.Now().UTC().Format("2006-01-02")
+	if got := snap.RequestsByDay[dayKey]; got != 1 {
+		t.Fatalf("RequestsByDay[%s] = %d, want 1", dayKey, got)
+	}
+	if got := snap.TokensByDay[dayKey]; got != 15 {
+		t.Fatalf("TokensByDay[%s] = %d, want 15", dayKey, got)
+	}
+
+	// Bucket rings must reflect the same exclusion.
+	var bucketReqs, bucketTokens int64
+	for _, b := range stats.BucketRing5m().ReadSnapshot().Buckets {
+		bucketReqs += b.Requests
+		bucketTokens += b.Tokens
+	}
+	if bucketReqs != 1 {
+		t.Fatalf("5m ring requests = %d, want 1", bucketReqs)
+	}
+	if bucketTokens != 15 {
+		t.Fatalf("5m ring tokens = %d, want 15", bucketTokens)
+	}
+}
+
+func TestRequestStatisticsRecordCountsOnlyExactHTTP200(t *testing.T) {
+	stats := NewRequestStatistics()
+
+	// HTTP 200 with no explicit failure marker: must count.
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "gpt-5.4",
+		RequestedAt: time.Now().Add(-2 * time.Minute),
+		StatusCode:  http.StatusOK,
+		Detail:      coreusage.Detail{InputTokens: 10, OutputTokens: 5, TotalTokens: 15},
+	})
+	// Non-200 status with no explicit failure marker: must NOT count and must
+	// be classified as a failure even when the caller did not set Failed.
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "gpt-5.4",
+		RequestedAt: time.Now().Add(-1 * time.Minute),
+		StatusCode:  http.StatusBadGateway,
+		Detail:      coreusage.Detail{InputTokens: 10, OutputTokens: 5, TotalTokens: 15},
+	})
+	// 3xx is also not HTTP 200 and must be treated as a failure.
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "gpt-5.4",
+		RequestedAt: time.Now(),
+		StatusCode:  http.StatusFound,
+		Detail:      coreusage.Detail{InputTokens: 1, OutputTokens: 1, TotalTokens: 2},
+	})
+
+	if got := stats.TotalRequests(); got != 1 {
+		t.Fatalf("TotalRequests() = %d, want 1 (only HTTP 200 must be counted)", got)
+	}
+	if got := stats.TotalTokens(); got != 15 {
+		t.Fatalf("TotalTokens() = %d, want 15 (non-200 tokens must be excluded)", got)
+	}
+	if got := stats.SuccessCount(); got != 1 {
+		t.Fatalf("SuccessCount() = %d, want 1", got)
+	}
+	if got := stats.FailureCount(); got != 2 {
+		t.Fatalf("FailureCount() = %d, want 2 (502 and 302 must be failures)", got)
+	}
+
+	snap := stats.Snapshot()
+	modelStats := snap.APIs["test-key"].Models["gpt-5.4"]
+	if modelStats.TotalRequests != 1 {
+		t.Fatalf("modelStats.TotalRequests = %d, want 1", modelStats.TotalRequests)
+	}
+	if modelStats.TotalTokens != 15 {
+		t.Fatalf("modelStats.TotalTokens = %d, want 15", modelStats.TotalTokens)
+	}
+	// Details keep all three events with their real status codes.
+	if len(modelStats.Details) != 3 {
+		t.Fatalf("modelStats.Details len = %d, want 3", len(modelStats.Details))
+	}
+	for _, d := range modelStats.Details {
+		if d.StatusCode == 0 {
+			t.Fatalf("detail status_code = 0, want real status preserved: %+v", d)
+		}
+	}
+}

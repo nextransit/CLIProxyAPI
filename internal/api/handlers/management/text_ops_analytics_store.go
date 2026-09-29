@@ -279,9 +279,12 @@ func (s *textOpsPGAnalyticsStore) insertUsageRecord(ctx context.Context, record 
 		totalTokens = promptTokens + completionTokens + cachedTokens
 	}
 	cacheStatus := inferTextOpsCacheStatus(promptTokens, cachedTokens)
-	statusCode := 200
-	if record.Failed {
-		statusCode = 500
+	statusCode := record.StatusCode
+	if statusCode <= 0 {
+		statusCode = 200
+		if record.Failed {
+			statusCode = 500
+		}
 	}
 	requestID := buildTextOpsRecordID(record, ts)
 
@@ -370,8 +373,8 @@ func (s *textOpsPGAnalyticsStore) RefreshDailyRollup(ctx context.Context, start,
 			source,
 			cache_status,
 			COUNT(*) AS total_requests,
-			COUNT(*) FILTER (WHERE status_code < 400) AS success_requests,
-			COUNT(*) FILTER (WHERE status_code >= 400) AS failed_requests,
+			COUNT(*) FILTER (WHERE status_code = 200) AS success_requests,
+			COUNT(*) FILTER (WHERE status_code <> 200) AS failed_requests,
 			COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
 			COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
 			COALESCE(SUM(total_tokens), 0) AS total_tokens,
@@ -809,7 +812,7 @@ func (s *textOpsPGAnalyticsStore) queryNetworkSummary(
 		return summary, fmt.Errorf("text_ops analytics: query network total failed: %w", err)
 	}
 	var failedCount int64
-	failedSQL := fmt.Sprintf("SELECT COUNT(*) FROM %s %s AND status_code >= 400", baseTable, whereClause)
+	failedSQL := fmt.Sprintf("SELECT COUNT(*) FROM %s %s AND status_code <> 200", baseTable, whereClause)
 	if err := s.db.QueryRowContext(ctx, failedSQL, args...).Scan(&failedCount); err != nil {
 		return summary, fmt.Errorf("text_ops analytics: query network failed count failed: %w", err)
 	}
@@ -818,7 +821,7 @@ func (s *textOpsPGAnalyticsStore) queryNetworkSummary(
 	failedBySourceSQL := fmt.Sprintf(`
 		SELECT COALESCE(NULLIF(TRIM(source), ''), 'unknown') AS source_key, COUNT(*)
 		FROM %s
-		%s AND status_code >= 400
+		%s AND status_code <> 200
 		GROUP BY source_key
 		ORDER BY COUNT(*) DESC, source_key ASC
 		LIMIT %d
@@ -844,7 +847,7 @@ func (s *textOpsPGAnalyticsStore) queryNetworkSummary(
 	failedByModelSQL := fmt.Sprintf(`
 		SELECT model_name, COUNT(*)
 		FROM %s
-		%s AND status_code >= 400
+		%s AND status_code <> 200
 		GROUP BY model_name
 		ORDER BY COUNT(*) DESC, model_name ASC
 		LIMIT %d
@@ -870,7 +873,7 @@ func (s *textOpsPGAnalyticsStore) queryNetworkSummary(
 	failureSampleSQL := fmt.Sprintf(`
 		SELECT created_at, model_name, source, user_id
 		FROM %s
-		%s AND status_code >= 400
+		%s AND status_code <> 200
 		ORDER BY created_at DESC
 		LIMIT %d
 	`, baseTable, whereClause, aiOpsDefaultFailureSampleLimit)

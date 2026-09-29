@@ -181,3 +181,62 @@ func TestRequestStatisticsRecordPersistsUsageEventStore(t *testing.T) {
 		t.Fatalf("minute rollup = (%d,%d,%d), want (1,10,0)", requests, tokens, failures)
 	}
 }
+
+func TestSQLiteUsageEventStoreRollupExcludesFailedFromRequestsAndTokens(t *testing.T) {
+	store, err := NewSQLiteUsageEventStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewSQLiteUsageEventStore() error = %v", err)
+	}
+	defer store.Close()
+
+	ts := time.Date(2026, 8, 9, 10, 15, 30, 0, time.UTC)
+	success := coreusage.Record{
+		Provider: "openai", Model: "gpt-test",
+		APIKey: "sk-success", AuthIndex: "auth-1", AuthType: "api-key",
+		Source: "openai-compatible", RequestID: "req-ok",
+		RequestedAt: ts, Latency: 800 * time.Millisecond,
+		Detail: coreusage.Detail{InputTokens: 4, OutputTokens: 2, TotalTokens: 6},
+	}
+	failed := coreusage.Record{
+		Provider: "openai", Model: "gpt-test",
+		APIKey: "sk-failure", AuthIndex: "auth-1", AuthType: "api-key",
+		Source: "openai-compatible", RequestID: "req-fail",
+		RequestedAt: ts, Latency: 200 * time.Millisecond,
+		Detail: coreusage.Detail{InputTokens: 99, OutputTokens: 99, TotalTokens: 198},
+	}
+	if err := store.InsertUsageEvent(context.Background(), success, UsageEvent{
+		ID: 1, APIKey: success.APIKey, Model: success.Model, AuthIndex: success.AuthIndex,
+		RequestID: success.RequestID, Tokens: TokenSummary{Input: 4, Output: 2, Total: 6},
+		RequestedAt: ts, DurationMs: 800, StatusCode: 200,
+	}); err != nil {
+		t.Fatalf("insert success: %v", err)
+	}
+	if err := store.InsertUsageEvent(context.Background(), failed, UsageEvent{
+		ID: 2, APIKey: failed.APIKey, Model: failed.Model, AuthIndex: failed.AuthIndex,
+		RequestID: failed.RequestID, Tokens: TokenSummary{Input: 99, Output: 99, Total: 198},
+		RequestedAt: ts, DurationMs: 200, StatusCode: 502, Failed: true,
+	}); err != nil {
+		t.Fatalf("insert failed: %v", err)
+	}
+
+	requests, tokens, failures, err := store.QueryRollupTotals(
+		context.Background(),
+		"day",
+		time.Date(2026, 8, 9, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 8, 10, 0, 0, 0, 0, time.UTC),
+	)
+	if err != nil {
+		t.Fatalf("QueryRollupTotals() error = %v", err)
+	}
+	// Only the successful event should bump requests and tokens; the
+	// failed event must contribute to the failures count only.
+	if requests != 1 {
+		t.Fatalf("requests = %d, want 1 (failed event excluded)", requests)
+	}
+	if tokens != 6 {
+		t.Fatalf("tokens = %d, want 6 (failed event tokens excluded)", tokens)
+	}
+	if failures != 1 {
+		t.Fatalf("failures = %d, want 1", failures)
+	}
+}
