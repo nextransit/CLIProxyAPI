@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -93,8 +94,18 @@ func (r *UsageReporter) EnsurePublishedWithDetail(ctx context.Context, detail us
 		return
 	}
 	detail = normalizeUsageDetail(detail)
+	detail = r.applyUsageEstimate(detail, false)
+	// An HTTP 200 response with zero tokens and no best-effort prompt estimate
+	// indicates the upstream closed the stream without emitting a usage block
+	// (or never reported one for a non-tokenizing model). Treat the fallback
+	// publish as an anomaly rather than a successful request so the usage
+	// dashboard does not count it toward request/token totals.
+	failed := false
+	if r.statusCode == http.StatusOK && isZeroUsageDetail(detail) && isZeroUsageDetail(r.estimate) {
+		failed = true
+	}
 	r.once.Do(func() {
-		usage.PublishRecord(ctx, r.buildRecord(ctx, detail, false))
+		usage.PublishRecord(ctx, r.buildRecord(ctx, detail, failed))
 	})
 }
 

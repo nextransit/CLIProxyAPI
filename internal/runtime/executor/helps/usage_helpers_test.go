@@ -2,11 +2,14 @@ package helps
 
 import (
 	"context"
+	"net/http"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 )
 
 func TestParseOpenAIUsageChatCompletions(t *testing.T) {
@@ -340,5 +343,130 @@ func TestParseOpenAIStreamUsage_DeepSeekCustomCache(t *testing.T) {
 	}
 	if detail.CachedTokens != 800 {
 		t.Fatalf("cached tokens = %d, want 800", detail.CachedTokens)
+	}
+}
+
+// captureUsagePlugin collects usage records published on the global manager.
+type captureUsagePlugin struct {
+	mu      sync.Mutex
+	records []coreusage.Record
+	cond    *sync.Cond
+}
+
+func newCaptureUsagePlugin() *captureUsagePlugin {
+	p := &captureUsagePlugin{}
+	p.cond = sync.NewCond(&p.mu)
+	return p
+}
+
+func (p *captureUsagePlugin) HandleUsage(_ context.Context, record coreusage.Record) {
+	p.mu.Lock()
+	p.records = append(p.records, record)
+	p.mu.Unlock()
+	p.cond.Broadcast()
+}
+
+func (p *captureUsagePlugin) WaitFor(t *testing.T, n int) []coreusage.Record {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		p.mu.Lock()
+		if len(p.records) >= n {
+			out := append([]coreusage.Record(nil), p.records[:n]...)
+			p.mu.Unlock()
+			return out
+		}
+		p.mu.Unlock()
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %d usage record(s), got %d", n, len(p.records))
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestUsageReporterPublishWithZeroUsageStaysSuccess(t *testing.T) {
+	plugin := newCaptureUsagePlugin()
+	coreusage.RegisterPlugin(plugin)
+
+	// When Publish is called directly with a zero-token detail, the upstream
+	// may have intentionally reported a zero-usage response. We must not flag
+	// that as a failure so legitimate "model returned 0 usage" answers still
+	// count toward successful requests.
+	reporter := NewUsageReporter(context.Background(), "gemini", "gemini-2.5-flash", nil)
+	reporter.SetStatusCode(http.StatusOK)
+	reporter.Publish(context.Background(), usage.Detail{})
+
+	records := plugin.WaitFor(t, 1)
+	if records[0].Failed {
+		t.Fatalf("Publish with zero tokens must remain successful, got Failed=true detail=%+v", records[0].Detail)
+	}
+}
+
+func TestUsageReporterEnsurePublishedWithDetailUsesEstimateWhenStatusOK(t *testing.T) {
+	plugin := newCaptureUsagePlugin()
+	coreusage.RegisterPlugin(plugin)
+
+	// If a best-effort prompt-token estimate is available, the fallback must
+	// keep the request successful so the dashboard reflects the prompt side.
+	reporter := NewUsageReporter(context.Background(), "openai-compat", "deepseek-v4-flash", nil)
+	reporter.SetStatusCode(http.StatusOK)
+	reporter.SetUsageEstimateFromPayload([]byte(`{"messages":[{"role":"user","content":"hello world"}]}`))
+	reporter.EnsurePublishedWithDetail(context.Background(), usage.Detail{})
+
+	records := plugin.WaitFor(t, 1)
+	if records[0].Failed {
+		t.Fatalf("EnsurePublishedWithDetail with prompt-token estimate must remain successful, got Failed=true detail=%+v", records[0].Detail)
+	}
+	if records[0].Detail.TotalTokens == 0 {
+		t.Fatalf("expected estimated prompt tokens to fill detail, got %+v", records[0].Detail)
+	}
+}
+
+func TestUsageReporterEnsurePublishedWithDetailMarksZeroTokenAnomaly(t *testing.T) {
+	plugin := newCaptureUsagePlugin()
+	coreusage.RegisterPlugin(plugin)
+
+	reporter := NewUsageReporter(context.Background(), "openai-compat", "deepseek-v4-flash", nil)
+	reporter.SetStatusCode(http.StatusOK)
+
+	reporter.EnsurePublishedWithDetail(context.Background(), usage.Detail{})
+
+	records := plugin.WaitFor(t, 1)
+	if len(records) != 1 {
+		t.Fatalf("records = %d, want 1", len(records))
+	}
+	if !records[0].Failed {
+		t.Fatalf("EnsurePublishedWithDetail with zero tokens and HTTP 200 must report failed, got Failed=false")
+	}
+}
+
+func TestUsageReporterPublishFailureLeavesFailedTrue(t *testing.T) {
+	plugin := newCaptureUsagePlugin()
+	coreusage.RegisterPlugin(plugin)
+
+	reporter := NewUsageReporter(context.Background(), "openai-compat", "deepseek-v4-flash", nil)
+	// Even without a status code, an explicit failure path stays failed.
+	reporter.PublishFailure(context.Background())
+
+	records := plugin.WaitFor(t, 1)
+	if !records[0].Failed {
+		t.Fatalf("PublishFailure must produce a failed record, got Failed=false")
+	}
+}
+
+func TestUsageReporterPublishWithRealUsageKeepsSuccess(t *testing.T) {
+	plugin := newCaptureUsagePlugin()
+	coreusage.RegisterPlugin(plugin)
+
+	reporter := NewUsageReporter(context.Background(), "openai-compat", "deepseek-v4-flash", nil)
+	reporter.SetStatusCode(http.StatusOK)
+	reporter.Publish(context.Background(), usage.Detail{InputTokens: 10, OutputTokens: 5, TotalTokens: 15})
+
+	records := plugin.WaitFor(t, 1)
+	if records[0].Failed {
+		t.Fatalf("record with non-zero usage must remain successful, got Failed=true detail=%+v", records[0].Detail)
+	}
+	if records[0].Detail.TotalTokens != 15 {
+		t.Fatalf("total tokens = %d, want 15", records[0].Detail.TotalTokens)
 	}
 }
