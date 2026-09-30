@@ -48,13 +48,16 @@ type TokenSummary struct {
 // full StatisticsSnapshot so the SSE summary can refresh the
 // "今日请求" / "今日 Token" cards without waiting on a heavy snapshot.
 type UsagePayload struct {
-	TotalRequests int64            `json:"total_requests"`
-	TotalTokens   int64            `json:"total_tokens"`
-	SuccessCount  int64            `json:"success_count"`
-	FailureCount  int64            `json:"failure_count"`
-	LatestID      uint64           `json:"latest_event_id"`
-	RequestsByDay map[string]int64 `json:"requests_by_day"`
-	TokensByDay   map[string]int64 `json:"tokens_by_day"`
+	TotalRequests      int64            `json:"total_requests"`
+	TotalTokens        int64            `json:"total_tokens"`
+	SuccessCount       int64            `json:"success_count"`
+	FailureCount       int64            `json:"failure_count"`
+	LatestID           uint64           `json:"latest_event_id"`
+	RequestsByDay      map[string]int64 `json:"requests_by_day"`
+	TokensByDay        map[string]int64 `json:"tokens_by_day"`
+	SuccessCountByDay  map[string]int64 `json:"success_count_by_day"`
+	FailureCountByDay  map[string]int64 `json:"failure_count_by_day"`
+	TotalRequestsByDay map[string]int64 `json:"total_requests_by_day"`
 }
 
 var statisticsEnabled atomic.Bool
@@ -113,6 +116,8 @@ type RequestStatistics struct {
 	requestsByHour map[int]int64
 	tokensByDay    map[string]int64
 	tokensByHour   map[int]int64
+	successByDay   map[string]int64
+	failureByDay   map[string]int64
 
 	broker      *Broker
 	nextEventID atomic.Uint64
@@ -185,10 +190,13 @@ type StatisticsSnapshot struct {
 
 	APIs map[string]APISnapshot `json:"apis"`
 
-	RequestsByDay  map[string]int64 `json:"requests_by_day"`
-	RequestsByHour map[string]int64 `json:"requests_by_hour"`
-	TokensByDay    map[string]int64 `json:"tokens_by_day"`
-	TokensByHour   map[string]int64 `json:"tokens_by_hour"`
+	RequestsByDay      map[string]int64 `json:"requests_by_day"`
+	RequestsByHour     map[string]int64 `json:"requests_by_hour"`
+	TokensByDay        map[string]int64 `json:"tokens_by_day"`
+	TokensByHour       map[string]int64 `json:"tokens_by_hour"`
+	SuccessCountByDay  map[string]int64 `json:"success_count_by_day"`
+	FailureCountByDay  map[string]int64 `json:"failure_count_by_day"`
+	TotalRequestsByDay map[string]int64 `json:"total_requests_by_day"`
 }
 
 // APISnapshot summarises metrics for a single API key.
@@ -219,6 +227,8 @@ func NewRequestStatistics() *RequestStatistics {
 		requestsByHour: make(map[int]int64),
 		tokensByDay:    make(map[string]int64),
 		tokensByHour:   make(map[int]int64),
+		successByDay:   make(map[string]int64),
+		failureByDay:   make(map[string]int64),
 		broker:         NewBroker(),
 		bucketRing5m:   NewBucketRing(12, 5*time.Minute, now),
 		bucketRing1h:   NewBucketRing(24, time.Hour, now),
@@ -358,8 +368,10 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 
 	if success {
 		s.successCount++
+		s.successByDay[dayKey]++
 	} else {
 		s.failureCount++
+		s.failureByDay[dayKey]++
 	}
 	// Only count requests with HTTP status 200 toward request and token totals;
 	// anything else is still tracked via FailureCount and event Details, but
@@ -531,6 +543,19 @@ func (s *RequestStatistics) Snapshot() StatisticsSnapshot {
 		result.TokensByHour[key] = v
 	}
 
+	result.SuccessCountByDay = make(map[string]int64, len(s.successByDay))
+	for k, v := range s.successByDay {
+		result.SuccessCountByDay[k] = v
+	}
+	result.FailureCountByDay = make(map[string]int64, len(s.failureByDay))
+	for k, v := range s.failureByDay {
+		result.FailureCountByDay[k] = v
+	}
+	result.TotalRequestsByDay = make(map[string]int64, len(s.requestsByDay))
+	for k, v := range s.requestsByDay {
+		result.TotalRequestsByDay[k] = v + s.failureByDay[k]
+	}
+
 	return result
 }
 
@@ -543,11 +568,14 @@ func (s *RequestStatistics) Snapshot() StatisticsSnapshot {
 // the max of the two is used for the overall totals.
 func (s *RequestStatistics) SnapshotWindow(start, end time.Time) StatisticsSnapshot {
 	result := StatisticsSnapshot{
-		APIs:           make(map[string]APISnapshot),
-		RequestsByDay:  make(map[string]int64),
-		RequestsByHour: make(map[string]int64),
-		TokensByDay:    make(map[string]int64),
-		TokensByHour:   make(map[string]int64),
+		APIs:               make(map[string]APISnapshot),
+		RequestsByDay:      make(map[string]int64),
+		RequestsByHour:     make(map[string]int64),
+		TokensByDay:        make(map[string]int64),
+		TokensByHour:       make(map[string]int64),
+		SuccessCountByDay:  make(map[string]int64),
+		FailureCountByDay:  make(map[string]int64),
+		TotalRequestsByDay: make(map[string]int64),
 	}
 	if s == nil {
 		return result
@@ -579,6 +607,24 @@ func (s *RequestStatistics) SnapshotWindow(start, end time.Time) StatisticsSnaps
 			result.TokensByDay[k] = v
 		}
 	}
+	for k, v := range s.successByDay {
+		dayTime, err := time.ParseInLocation("2006-01-02", k, bucketLocation)
+		if err != nil {
+			continue
+		}
+		if dayTime.Add(24*time.Hour).After(start) && !dayTime.After(end) {
+			result.SuccessCountByDay[k] = v
+		}
+	}
+	for k, v := range s.failureByDay {
+		dayTime, err := time.ParseInLocation("2006-01-02", k, bucketLocation)
+		if err != nil {
+			continue
+		}
+		if dayTime.Add(24*time.Hour).After(start) && !dayTime.After(end) {
+			result.FailureCountByDay[k] = v
+		}
+	}
 
 	var dayBucketRequests, dayBucketTokens int64
 	for _, v := range result.RequestsByDay {
@@ -591,6 +637,8 @@ func (s *RequestStatistics) SnapshotWindow(start, end time.Time) StatisticsSnaps
 	var detailReqs, detailTokens, detailSuccess, detailFailure int64
 	detailReqsByDay := make(map[string]int64)
 	detailTokensByDay := make(map[string]int64)
+	detailSuccessByDay := make(map[string]int64)
+	detailFailureByDay := make(map[string]int64)
 
 	for apiName, stats := range s.apis {
 		apiSnapshot := APISnapshot{Models: make(map[string]ModelSnapshot)}
@@ -619,6 +667,11 @@ func (s *RequestStatistics) SnapshotWindow(start, end time.Time) StatisticsSnaps
 				result.RequestsByHour[hourKey]++
 				detailTokensByDay[dayKey] += detail.Tokens.TotalTokens
 				result.TokensByHour[hourKey] += detail.Tokens.TotalTokens
+				if detail.Failed {
+					detailFailureByDay[dayKey]++
+				} else {
+					detailSuccessByDay[dayKey]++
+				}
 			}
 			if modelSnapshot.TotalRequests == 0 {
 				continue
@@ -641,6 +694,19 @@ func (s *RequestStatistics) SnapshotWindow(start, end time.Time) StatisticsSnaps
 		if _, ok := result.TokensByDay[k]; !ok {
 			result.TokensByDay[k] = v
 		}
+	}
+	for k, v := range detailSuccessByDay {
+		if _, ok := result.SuccessCountByDay[k]; !ok {
+			result.SuccessCountByDay[k] = v
+		}
+	}
+	for k, v := range detailFailureByDay {
+		if _, ok := result.FailureCountByDay[k]; !ok {
+			result.FailureCountByDay[k] = v
+		}
+	}
+	for k := range result.SuccessCountByDay {
+		result.TotalRequestsByDay[k] = result.SuccessCountByDay[k] + result.FailureCountByDay[k]
 	}
 
 	// Totals: the day buckets win when they cover more than the capped
@@ -1102,14 +1168,29 @@ func (s *RequestStatistics) SnapshotPayload() UsagePayload {
 	for k, v := range s.tokensByDay {
 		tk[k] = v
 	}
+	okByDay := make(map[string]int64, len(s.successByDay))
+	for k, v := range s.successByDay {
+		okByDay[k] = v
+	}
+	badByDay := make(map[string]int64, len(s.failureByDay))
+	for k, v := range s.failureByDay {
+		badByDay[k] = v
+	}
+	totalByDay := make(map[string]int64, len(s.requestsByDay))
+	for k, v := range s.requestsByDay {
+		totalByDay[k] = v + s.failureByDay[k]
+	}
 	return UsagePayload{
-		TotalRequests: s.totalRequests,
-		TotalTokens:   s.totalTokens,
-		SuccessCount:  s.successCount,
-		FailureCount:  s.failureCount,
-		LatestID:      s.recent.LastID(),
-		RequestsByDay: req,
-		TokensByDay:   tk,
+		TotalRequests:      s.totalRequests,
+		TotalTokens:        s.totalTokens,
+		SuccessCount:       s.successCount,
+		FailureCount:       s.failureCount,
+		LatestID:           s.recent.LastID(),
+		RequestsByDay:      req,
+		TokensByDay:        tk,
+		SuccessCountByDay:  okByDay,
+		FailureCountByDay:  badByDay,
+		TotalRequestsByDay: totalByDay,
 	}
 }
 
@@ -1134,15 +1215,30 @@ func (s *RequestStatistics) AggregateSnapshot() AggregateSnapshot {
 	for k, v := range s.tokensByDay {
 		ts[k] = v
 	}
+	okByDay := make(map[string]int64, len(s.successByDay))
+	for k, v := range s.successByDay {
+		okByDay[k] = v
+	}
+	badByDay := make(map[string]int64, len(s.failureByDay))
+	for k, v := range s.failureByDay {
+		badByDay[k] = v
+	}
+	totalByDay := make(map[string]int64, len(s.requestsByDay))
+	for k, v := range s.requestsByDay {
+		totalByDay[k] = v + s.failureByDay[k]
+	}
 	out := AggregateSnapshot{
-		Version:       2,
-		TotalRequests: s.totalRequests,
-		SuccessCount:  s.successCount,
-		FailureCount:  s.failureCount,
-		TotalTokens:   s.totalTokens,
-		RequestsByDay: req,
-		TokensByDay:   ts,
-		ExportedAt:    time.Now().UTC(),
+		Version:            2,
+		TotalRequests:      s.totalRequests,
+		SuccessCount:       s.successCount,
+		FailureCount:       s.failureCount,
+		TotalTokens:        s.totalTokens,
+		RequestsByDay:      req,
+		TokensByDay:        ts,
+		SuccessCountByDay:  okByDay,
+		FailureCountByDay:  badByDay,
+		TotalRequestsByDay: totalByDay,
+		ExportedAt:         time.Now().UTC(),
 	}
 	if s.bucketRing5m != nil {
 		out.RingSeed5m = snapshotRing(s.bucketRing5m)
@@ -1258,6 +1354,16 @@ func (s *RequestStatistics) ApplyAggregateSnapshot(snap AggregateSnapshot) {
 	for k, v := range snap.TokensByDay {
 		if v > s.tokensByDay[k] {
 			s.tokensByDay[k] = v
+		}
+	}
+	for k, v := range snap.SuccessCountByDay {
+		if v > s.successByDay[k] {
+			s.successByDay[k] = v
+		}
+	}
+	for k, v := range snap.FailureCountByDay {
+		if v > s.failureByDay[k] {
+			s.failureByDay[k] = v
 		}
 	}
 	// Restore per-(apiKey,model) counter view so /usage and the management

@@ -444,17 +444,20 @@ func SetUsageStore(store Store) {
 // Details slice, which keeps the on-disk file KB-scale regardless of how
 // long the server has been running.
 type AggregateSnapshot struct {
-	Version       int                  `json:"version"`
-	TotalRequests int64                `json:"total_requests"`
-	SuccessCount  int64                `json:"success_count"`
-	FailureCount  int64                `json:"failure_count"`
-	TotalTokens   int64                `json:"total_tokens"`
-	RequestsByDay map[string]int64     `json:"requests_by_day"`
-	TokensByDay   map[string]int64     `json:"tokens_by_day"`
-	ExportedAt    time.Time            `json:"exported_at"`
-	RingSeed5m    *RingSeed            `json:"ring_seed_5m,omitempty"`
-	RingSeed1h    *RingSeed            `json:"ring_seed_1h,omitempty"`
-	ModelTotals   map[string]APITotals `json:"model_totals,omitempty"`
+	Version            int                  `json:"version"`
+	TotalRequests      int64                `json:"total_requests"`
+	SuccessCount       int64                `json:"success_count"`
+	FailureCount       int64                `json:"failure_count"`
+	TotalTokens        int64                `json:"total_tokens"`
+	RequestsByDay      map[string]int64     `json:"requests_by_day"`
+	TokensByDay        map[string]int64     `json:"tokens_by_day"`
+	SuccessCountByDay  map[string]int64     `json:"success_count_by_day"`
+	FailureCountByDay  map[string]int64     `json:"failure_count_by_day"`
+	TotalRequestsByDay map[string]int64     `json:"total_requests_by_day"`
+	ExportedAt         time.Time            `json:"exported_at"`
+	RingSeed5m         *RingSeed            `json:"ring_seed_5m,omitempty"`
+	RingSeed1h         *RingSeed            `json:"ring_seed_1h,omitempty"`
+	ModelTotals        map[string]APITotals `json:"model_totals,omitempty"`
 }
 
 // APITotals is the per-API counter view used to restore the management UI

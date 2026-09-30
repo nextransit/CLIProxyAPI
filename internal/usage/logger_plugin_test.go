@@ -642,6 +642,22 @@ func TestRequestStatisticsRecordExcludesFailedFromRequestAndTokenCounts(t *testi
 	if got := snap.TokensByDay[dayKey]; got != 15 {
 		t.Fatalf("TokensByDay[%s] = %d, want 15", dayKey, got)
 	}
+	// Daily outcome breakdown must preserve the failure even though the
+	// failure is excluded from request/token totals.
+	if got := snap.SuccessCountByDay[dayKey]; got != 1 {
+		t.Fatalf("SuccessCountByDay[%s] = %d, want 1", dayKey, got)
+	}
+	if got := snap.FailureCountByDay[dayKey]; got != 1 {
+		t.Fatalf("FailureCountByDay[%s] = %d, want 1", dayKey, got)
+	}
+	if got := snap.TotalRequestsByDay[dayKey]; got != 2 {
+		t.Fatalf("TotalRequestsByDay[%s] = %d, want 2", dayKey, got)
+	}
+	// UsagePayload used by the SSE summary exposes the same outcome split.
+	payload := stats.SnapshotPayload()
+	if got := payload.FailureCountByDay[dayKey]; got != 1 {
+		t.Fatalf("payload FailureCountByDay[%s] = %d, want 1", dayKey, got)
+	}
 
 	// Bucket rings must reflect the same exclusion.
 	var bucketReqs, bucketTokens int64
