@@ -186,27 +186,35 @@ func (s *RequestStatistics) buildDashboardSnapshotFromDetails(ctx context.Contex
 	}
 
 	// Aggregation phase runs OUTSIDE the RLock so ingest isn't starved.
+	// Only successful (HTTP 200) requests contribute to request/token totals,
+	// flow buckets, model breakdowns, and the success rate. Failures still
+	// surface via result.FailureCount/WindowFailures, per-bucket Failures,
+	// acc.failures, and the LatestRequests list, but never inflate the
+	// headline "successful request" counters.
 	for _, d := range snapshotCopy.Details {
 		if ctx.Err() != nil {
 			return result
 		}
-		totalRequests++
-		totalTokens += d.Tokens.TotalTokens
 		if d.Failed {
 			totalFailures++
 		} else {
+			totalRequests++
 			totalSuccess++
+			totalTokens += d.Tokens.TotalTokens
 		}
 
 		// Bucket assignment; walk in reverse so the most recent
 		// buckets match first.
+		var hitSuccessBucket bool
 		for bi := cfg.BucketCount - 1; bi >= 0; bi-- {
 			w := windows[bi]
 			if !d.Timestamp.Before(w.start) && d.Timestamp.Before(w.end) {
 				bucket := &result.FlowBuckets[bi]
-				bucket.Requests++
-				bucket.Tokens += d.Tokens.TotalTokens
-				if d.Failed {
+				if !d.Failed {
+					bucket.Requests++
+					bucket.Tokens += d.Tokens.TotalTokens
+					hitSuccessBucket = true
+				} else {
 					bucket.Failures++
 				}
 				if d.LatencyMs > 0 {
@@ -215,20 +223,22 @@ func (s *RequestStatistics) buildDashboardSnapshotFromDetails(ctx context.Contex
 				break
 			}
 		}
+		_ = hitSuccessBucket
 
 		acc, ok := modelByName[d.Model]
 		if !ok {
 			acc = &modelAccum{}
 			modelByName[d.Model] = acc
 		}
-		acc.requests++
-		acc.tokens += d.Tokens.TotalTokens
-		if d.Failed {
+		if !d.Failed {
+			acc.requests++
+			acc.tokens += d.Tokens.TotalTokens
+			if d.LatencyMs > 0 {
+				acc.latencyTotal += d.LatencyMs
+				acc.latencySamples++
+			}
+		} else {
 			acc.failures++
-		}
-		if d.LatencyMs > 0 {
-			acc.latencyTotal += d.LatencyMs
-			acc.latencySamples++
 		}
 
 		evt := DashboardLatestRequest{

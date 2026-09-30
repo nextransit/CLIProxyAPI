@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"math"
+	"net/http"
 	"sort"
 	"sync"
 	"testing"
@@ -296,4 +297,82 @@ func TestBuildDashboardSnapshot_ConcurrentWindowsStayIndependent(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+// TestBuildDashboardSnapshotExcludesFailedFromRequestTokenTotals verifies that
+// the details-walk fallback (triggered when the dashboard config does not
+// match a pre-aggregated ring) still excludes non-200 records from request
+// and token totals so the operator-facing summary matches the success-only
+// semantic of the snapshot's TotalRequests/SuccessCount fields.
+func TestBuildDashboardSnapshotExcludesFailedFromRequestTokenTotals(t *testing.T) {
+	stats := NewRequestStatistics()
+	now := time.Now()
+
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "gpt-5.4",
+		RequestedAt: now.Add(-2 * time.Minute),
+		StatusCode:  http.StatusOK,
+		Detail:      coreusage.Detail{InputTokens: 10, OutputTokens: 5, TotalTokens: 15},
+	})
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "gpt-5.4",
+		RequestedAt: now.Add(-1 * time.Minute),
+		StatusCode:  http.StatusBadGateway,
+		Detail:      coreusage.Detail{InputTokens: 99, OutputTokens: 99, TotalTokens: 198},
+	})
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "gpt-5.4",
+		RequestedAt: time.Now(),
+		StatusCode:  http.StatusFound,
+		Detail:      coreusage.Detail{InputTokens: 7, OutputTokens: 3, TotalTokens: 10},
+	})
+
+	// Use a config that does NOT match the pre-aggregated rings so the
+	// implementation falls back to the details-walk path under test.
+	cfg := DashboardConfig{
+		BucketCount: 6,
+		BucketSize:  15 * time.Minute,
+		ModelTopN:   5,
+		LatestCount: 5,
+		Window:      24 * time.Hour,
+	}
+	snap := stats.BuildDashboardSnapshot(context.Background(), cfg)
+
+	// Only the single successful (HTTP 200) record must count toward totals.
+	if snap.WindowRequests != 1 {
+		t.Fatalf("WindowRequests = %d, want 1 (failed entries must be excluded)", snap.WindowRequests)
+	}
+	if snap.WindowTokens != 15 {
+		t.Fatalf("WindowTokens = %d, want 15 (failed tokens must be excluded)", snap.WindowTokens)
+	}
+	if snap.WindowFailures != 2 {
+		t.Fatalf("WindowFailures = %d, want 2 (502 and 302)", snap.WindowFailures)
+	}
+	if snap.WindowSuccesses != 1 {
+		t.Fatalf("WindowSuccesses = %d, want 1", snap.WindowSuccesses)
+	}
+
+	// FlowBuckets[5] should reflect only the successful record.
+	// Sum every flow bucket: only successful requests contribute to
+	// Requests/Tokens, while Failures still surface failed entries.
+	totalReq := int64(0)
+	totalTokens := int64(0)
+	totalFailures := int64(0)
+	for _, b := range snap.FlowBuckets {
+		totalReq += b.Requests
+		totalTokens += b.Tokens
+		totalFailures += b.Failures
+	}
+	if totalReq != 1 {
+		t.Fatalf("flow bucket total requests = %d, want 1", totalReq)
+	}
+	if totalTokens != 15 {
+		t.Fatalf("flow bucket total tokens = %d, want 15", totalTokens)
+	}
+	if totalFailures != 2 {
+		t.Fatalf("flow bucket total failures = %d, want 2", totalFailures)
+	}
 }
