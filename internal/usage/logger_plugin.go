@@ -345,6 +345,15 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	dayKey := timestamp.Format("2006-01-02")
 	hourKey := timestamp.Hour()
 
+	// Drop zero-token HTTP 200 records entirely. The upstream closed without
+	// reporting any usage (or never gave usage for the path), and the request
+	// carries no real billing signal, so it must not appear in the usage
+	// statistics series at all — not as a success, not as a failure, not as
+	// a broker event.
+	if !failed && statusCode == http.StatusOK && isZeroUsageDetail(detail) {
+		return UsageEvent{}, false
+	}
+
 	s.mu.Lock()
 
 	if success {
@@ -873,6 +882,15 @@ func positiveInt64(value int64) int64 {
 		return 0
 	}
 	return value
+}
+
+// isZeroUsageDetail reports whether the token stats are all zero.
+func isZeroUsageDetail(detail TokenStats) bool {
+	return detail.InputTokens == 0 &&
+		detail.OutputTokens == 0 &&
+		detail.ReasoningTokens == 0 &&
+		detail.CachedTokens == 0 &&
+		detail.TotalTokens == 0
 }
 
 func normaliseStatusCode(statusCode int, failed bool) int {

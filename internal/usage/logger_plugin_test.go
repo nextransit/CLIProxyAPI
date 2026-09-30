@@ -717,3 +717,77 @@ func TestRequestStatisticsRecordCountsOnlyExactHTTP200(t *testing.T) {
 		}
 	}
 }
+
+func TestRequestStatisticsRecordDropsZeroTokenHTTP200(t *testing.T) {
+	stats := NewRequestStatistics()
+	subs, cancel := stats.Broker().Subscribe()
+	defer cancel()
+
+	// Upstream returned HTTP 200 with no usage data. The record must be
+	// dropped entirely: it must not contribute to counters, must not be
+	// persisted, and must not be published on the broker.
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "deepseek-v4-flash",
+		RequestedAt: time.Now(),
+		StatusCode:  http.StatusOK,
+	})
+
+	if got := stats.TotalRequests(); got != 0 {
+		t.Fatalf("TotalRequests() = %d, want 0 (zero-token HTTP 200 must be dropped)", got)
+	}
+	if got := stats.TotalTokens(); got != 0 {
+		t.Fatalf("TotalTokens() = %d, want 0", got)
+	}
+	if got := stats.SuccessCount(); got != 0 {
+		t.Fatalf("SuccessCount() = %d, want 0", got)
+	}
+	if got := stats.FailureCount(); got != 0 {
+		t.Fatalf("FailureCount() = %d, want 0 (the record is dropped, not classified as failure)", got)
+	}
+	// Bucket rings must remain empty for both horizons.
+	for _, b := range stats.BucketRing5m().ReadSnapshot().Buckets {
+		if b.Requests != 0 || b.Tokens != 0 || b.Failures != 0 {
+			t.Fatalf("5m ring should be empty, got bucket=%+v", b)
+		}
+	}
+	for _, b := range stats.BucketRing1h().ReadSnapshot().Buckets {
+		if b.Requests != 0 || b.Tokens != 0 || b.Failures != 0 {
+			t.Fatalf("1h ring should be empty, got bucket=%+v", b)
+		}
+	}
+	// No event should reach the broker.
+	select {
+	case evt := <-subs:
+		t.Fatalf("broker received unexpected event: %+v", evt)
+	case <-time.After(50 * time.Millisecond):
+		// expected: no event published.
+	}
+	// No per-model detail should be stored.
+	snap := stats.Snapshot()
+	if apiSnap, ok := snap.APIs["test-key"]; ok {
+		if m, ok := apiSnap.Models["deepseek-v4-flash"]; ok && len(m.Details) != 0 {
+			t.Fatalf("details slice should be empty, got %+v", m.Details)
+		}
+	}
+}
+
+func TestRequestStatisticsRecordKeepsZeroTokenFailure(t *testing.T) {
+	stats := NewRequestStatistics()
+
+	// Non-200 status with zero tokens is still a real failure that needs to
+	// surface in the failure counters; the drop guard only matches success.
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "deepseek-v4-flash",
+		RequestedAt: time.Now(),
+		StatusCode:  http.StatusBadGateway,
+	})
+
+	if got := stats.FailureCount(); got != 1 {
+		t.Fatalf("FailureCount() = %d, want 1", got)
+	}
+	if got := stats.SuccessCount(); got != 0 {
+		t.Fatalf("SuccessCount() = %d, want 0", got)
+	}
+}

@@ -16,7 +16,7 @@ import (
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 )
 
-func TestGeminiExecutorRecordsSuccessfulZeroUsageInStatistics(t *testing.T) {
+func TestGeminiExecutorDropsZeroTokenSuccessAnomaly(t *testing.T) {
 	model := fmt.Sprintf("gemini-2.5-flash-zero-usage-%d", time.Now().UnixNano())
 	source := fmt.Sprintf("zero-usage-%d@example.com", time.Now().UnixNano())
 
@@ -26,6 +26,9 @@ func TestGeminiExecutorRecordsSuccessfulZeroUsageInStatistics(t *testing.T) {
 			t.Fatalf("path = %q, want %q", r.URL.Path, wantPath)
 		}
 		w.Header().Set("Content-Type", "application/json")
+		// HTTP 200 with all-zero usage: the proxy must drop this record so it
+		// never enters the statistics series. Zero-token responses from an
+		// upstream are treated as anomaly noise.
 		_, _ = w.Write([]byte(`{"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":0,"candidatesTokenCount":0,"totalTokenCount":0}}`))
 	}))
 	defer server.Close()
@@ -59,13 +62,39 @@ func TestGeminiExecutorRecordsSuccessfulZeroUsageInStatistics(t *testing.T) {
 		t.Fatalf("Execute error: %v", err)
 	}
 
-	detail := waitForStatisticsDetail(t, "gemini", model, source)
-	if detail.Failed {
-		t.Fatalf("detail failed = true, want false")
+	// The record must be ignored entirely: it should not appear in stats.
+	if detail := tryFindStatisticsDetail(t, "gemini", model, source); detail != nil {
+		t.Fatalf("zero-token HTTP 200 must be dropped, found detail = %+v", detail)
 	}
-	if detail.Tokens.TotalTokens != 0 {
-		t.Fatalf("total tokens = %d, want 0", detail.Tokens.TotalTokens)
+	if got := internalusage.GetRequestStatistics().TotalRequests(); got != 0 {
+		t.Fatalf("TotalRequests() = %d, want 0 (zero-token success must not count)", got)
 	}
+}
+
+func tryFindStatisticsDetail(t *testing.T, apiName, model, source string) *internalusage.RequestDetail {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		snapshot := internalusage.GetRequestStatistics().Snapshot()
+		apiSnapshot, ok := snapshot.APIs[apiName]
+		if !ok {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		modelSnapshot, ok := apiSnapshot.Models[model]
+		if !ok {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		for i := range modelSnapshot.Details {
+			if modelSnapshot.Details[i].Source == source {
+				return &modelSnapshot.Details[i]
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return nil
 }
 
 func waitForStatisticsDetail(t *testing.T, apiName, model, source string) internalusage.RequestDetail {
