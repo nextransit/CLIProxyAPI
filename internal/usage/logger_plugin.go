@@ -487,6 +487,25 @@ func (s *RequestStatistics) updateAPIStats(stats *apiStats, model string, detail
 	}
 }
 
+// mergeSuccessByDay returns the authoritative daily success count. The
+// success-specific bucket is only written by builds that also expose
+// success_count_by_day; older persisted aggregates only carry
+// requests_by_day, which historically counts exactly the HTTP 200
+// successes. Taking the max on every read keeps "今日成功请求" equal to the
+// successful request total even right after an upgrade.
+func mergeSuccessByDay(success, requests map[string]int64) map[string]int64 {
+	out := make(map[string]int64, len(success)+len(requests))
+	for k, v := range success {
+		out[k] = v
+	}
+	for k, v := range requests {
+		if v > out[k] {
+			out[k] = v
+		}
+	}
+	return out
+}
+
 // Snapshot returns a copy of the aggregated metrics for external consumption.
 func (s *RequestStatistics) Snapshot() StatisticsSnapshot {
 	result := StatisticsSnapshot{}
@@ -543,17 +562,14 @@ func (s *RequestStatistics) Snapshot() StatisticsSnapshot {
 		result.TokensByHour[key] = v
 	}
 
-	result.SuccessCountByDay = make(map[string]int64, len(s.successByDay))
-	for k, v := range s.successByDay {
-		result.SuccessCountByDay[k] = v
-	}
+	result.SuccessCountByDay = mergeSuccessByDay(s.successByDay, s.requestsByDay)
 	result.FailureCountByDay = make(map[string]int64, len(s.failureByDay))
 	for k, v := range s.failureByDay {
 		result.FailureCountByDay[k] = v
 	}
-	result.TotalRequestsByDay = make(map[string]int64, len(s.requestsByDay))
-	for k, v := range s.requestsByDay {
-		result.TotalRequestsByDay[k] = v + s.failureByDay[k]
+	result.TotalRequestsByDay = make(map[string]int64, len(result.SuccessCountByDay))
+	for k, v := range result.SuccessCountByDay {
+		result.TotalRequestsByDay[k] = v + result.FailureCountByDay[k]
 	}
 
 	return result
@@ -613,7 +629,13 @@ func (s *RequestStatistics) SnapshotWindow(start, end time.Time) StatisticsSnaps
 			continue
 		}
 		if dayTime.Add(24*time.Hour).After(start) && !dayTime.After(end) {
-			result.SuccessCountByDay[k] = v
+			// Old aggregates may lack successByDay; requests_by_day is the
+			// legacy authoritative HTTP 200 daily counter, so keep the max.
+			if rv := result.RequestsByDay[k]; rv > v {
+				result.SuccessCountByDay[k] = rv
+			} else {
+				result.SuccessCountByDay[k] = v
+			}
 		}
 	}
 	for k, v := range s.failureByDay {
@@ -697,6 +719,11 @@ func (s *RequestStatistics) SnapshotWindow(start, end time.Time) StatisticsSnaps
 	}
 	for k, v := range detailSuccessByDay {
 		if _, ok := result.SuccessCountByDay[k]; !ok {
+			result.SuccessCountByDay[k] = v
+		}
+	}
+	for k, v := range result.RequestsByDay {
+		if v > result.SuccessCountByDay[k] {
 			result.SuccessCountByDay[k] = v
 		}
 	}
@@ -1168,17 +1195,14 @@ func (s *RequestStatistics) SnapshotPayload() UsagePayload {
 	for k, v := range s.tokensByDay {
 		tk[k] = v
 	}
-	okByDay := make(map[string]int64, len(s.successByDay))
-	for k, v := range s.successByDay {
-		okByDay[k] = v
-	}
+	okByDay := mergeSuccessByDay(s.successByDay, s.requestsByDay)
 	badByDay := make(map[string]int64, len(s.failureByDay))
 	for k, v := range s.failureByDay {
 		badByDay[k] = v
 	}
-	totalByDay := make(map[string]int64, len(s.requestsByDay))
-	for k, v := range s.requestsByDay {
-		totalByDay[k] = v + s.failureByDay[k]
+	totalByDay := make(map[string]int64, len(okByDay))
+	for k, v := range okByDay {
+		totalByDay[k] = v + badByDay[k]
 	}
 	return UsagePayload{
 		TotalRequests:      s.totalRequests,
@@ -1215,17 +1239,14 @@ func (s *RequestStatistics) AggregateSnapshot() AggregateSnapshot {
 	for k, v := range s.tokensByDay {
 		ts[k] = v
 	}
-	okByDay := make(map[string]int64, len(s.successByDay))
-	for k, v := range s.successByDay {
-		okByDay[k] = v
-	}
+	okByDay := mergeSuccessByDay(s.successByDay, s.requestsByDay)
 	badByDay := make(map[string]int64, len(s.failureByDay))
 	for k, v := range s.failureByDay {
 		badByDay[k] = v
 	}
-	totalByDay := make(map[string]int64, len(s.requestsByDay))
-	for k, v := range s.requestsByDay {
-		totalByDay[k] = v + s.failureByDay[k]
+	totalByDay := make(map[string]int64, len(okByDay))
+	for k, v := range okByDay {
+		totalByDay[k] = v + badByDay[k]
 	}
 	out := AggregateSnapshot{
 		Version:            2,
@@ -1357,6 +1378,11 @@ func (s *RequestStatistics) ApplyAggregateSnapshot(snap AggregateSnapshot) {
 		}
 	}
 	for k, v := range snap.SuccessCountByDay {
+		if v > s.successByDay[k] {
+			s.successByDay[k] = v
+		}
+	}
+	for k, v := range snap.RequestsByDay {
 		if v > s.successByDay[k] {
 			s.successByDay[k] = v
 		}

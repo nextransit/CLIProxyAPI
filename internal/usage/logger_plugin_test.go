@@ -807,3 +807,63 @@ func TestRequestStatisticsRecordKeepsZeroTokenFailure(t *testing.T) {
 		t.Fatalf("SuccessCount() = %d, want 0", got)
 	}
 }
+
+func TestApplyAggregateSnapshotBackfillsLegacySuccessByDayFromRequestsByDay(t *testing.T) {
+	stats := NewRequestStatistics()
+	stats.ApplyAggregateSnapshot(AggregateSnapshot{
+		Version:       2,
+		TotalRequests: 5106,
+		SuccessCount:  5106,
+		FailureCount:  150,
+		TotalTokens:   1000,
+		RequestsByDay: map[string]int64{
+			"2026-09-30": 5106,
+		},
+		TokensByDay: map[string]int64{
+			"2026-09-30": 1000,
+		},
+		FailureCountByDay: map[string]int64{
+			"2026-09-30": 150,
+		},
+		// SuccessCountByDay intentionally absent: this simulates an
+		// aggregate written by a build that only shipped the failure split.
+		// The legacy requests_by_day counter historically counts exactly the
+		// HTTP 200 successes, so it must backfill the success map.
+	})
+	// Record one new success + one new failure after the restore.
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "gpt-5.4",
+		RequestedAt: time.Now(),
+		Detail:      coreusage.Detail{InputTokens: 1, OutputTokens: 1, TotalTokens: 2},
+	})
+	stats.Record(context.Background(), coreusage.Record{
+		APIKey:      "test-key",
+		Model:       "gpt-5.4",
+		RequestedAt: time.Now(),
+		StatusCode:  http.StatusBadGateway,
+	})
+
+	snap := stats.Snapshot()
+	dayKey := time.Now().UTC().Format("2006-01-02")
+	if got := snap.SuccessCountByDay[dayKey]; got != 5107 {
+		t.Fatalf("SuccessCountByDay[%s] = %d, want 5107 (5106 legacy + 1 new)", dayKey, got)
+	}
+	if got := snap.FailureCountByDay[dayKey]; got != 151 {
+		t.Fatalf("FailureCountByDay[%s] = %d, want 151 (150 legacy + 1 new)", dayKey, got)
+	}
+	if got := snap.TotalRequestsByDay[dayKey]; got != 5258 {
+		t.Fatalf("TotalRequestsByDay[%s] = %d, want 5258", dayKey, got)
+	}
+	// The headline success-only total must NOT include the failure.
+	if got := snap.RequestsByDay[dayKey]; got != 5107 {
+		t.Fatalf("RequestsByDay[%s] = %d, want 5107", dayKey, got)
+	}
+	payload := stats.SnapshotPayload()
+	if got := payload.SuccessCountByDay[dayKey]; got != 5107 {
+		t.Fatalf("payload SuccessCountByDay[%s] = %d, want 5107", dayKey, got)
+	}
+	if got := payload.TotalRequestsByDay[dayKey]; got != 5258 {
+		t.Fatalf("payload TotalRequestsByDay[%s] = %d, want 5258", dayKey, got)
+	}
+}
